@@ -200,17 +200,26 @@ build_geth() {
     check_go
     ensure_gopath_link
 
+    # IMPORTANT: build from the canonical import path
+    # ($GOPATH/src/github.com/ethereum/go-ethereum) instead of $GETH_SRC.
+    # Otherwise cmd/geth is compiled as "github.com/PFAP/go-ethereum/cmd/geth"
+    # and its vendor tree becomes a different identity than the vendor tree
+    # of "github.com/ethereum/go-ethereum/cmd/utils", causing duplicate-type
+    # errors (e.g. two cli.Context types).
+    local geth_build_dir
+    geth_build_dir="$(go env GOPATH)/src/github.com/ethereum/go-ethereum"
+
     if command -v go-bindata &>/dev/null || [ -x "$GOPATH_BIN/go-bindata" ]; then
         info "Regenerating JS bindings (bindata)..."
-        cd "$GETH_SRC/internal/jsre/deps"
+        cd "$geth_build_dir/internal/jsre/deps"
         go-bindata -nometadata -pkg deps -o bindata.go bignumber.js web3.js
     else
         warn "go-bindata not found, skipping JS binding regeneration."
         warn "If web3.js was modified, install go-bindata: go get -u github.com/kevinburke/go-bindata/go-bindata"
     fi
 
-    cd "$GETH_SRC"
-    info "Running: go install -v ./cmd/geth"
+    cd "$geth_build_dir"
+    info "Running: go install -v ./cmd/geth  (from $geth_build_dir)"
     go install -v ./cmd/geth
 
     if [ ! -f "$GOPATH_BIN/geth" ]; then
