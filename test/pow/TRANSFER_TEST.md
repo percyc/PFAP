@@ -6,14 +6,31 @@
 
 ## Preparation
 
-### 1. Clean old data
+### 1. Clean old data (including keystore)
+
+The `signerX/` directories only ship with `passwd.txt`. For a fresh end-to-end
+run we wipe the whole `data/` directory (keystore included) so the addresses
+created below are guaranteed to match what we unlock later.
 
 ```bash
 cd ~/go/src/github.com/PFAP/test/pow
-rm -rf signer1/data/geth signer1/data/SN signer2/data/geth signer2/data/SN *.log
+rm -rf signer1/data signer2/data *.log
 ```
 
-### 2. Initialize both nodes
+### 2. Create an account in each datadir
+
+```bash
+geth --datadir signer1/data account new --password signer1/passwd.txt
+# => Address: {aaaa...}   <-- this is <signer1_addr>
+
+geth --datadir signer2/data account new --password signer2/passwd.txt
+# => Address: {bbbb...}   <-- this is <signer2_addr>
+```
+
+Write both addresses down — you will paste them into the `--unlock` flags
+below. They will be different from the placeholders shown in this document.
+
+### 3. Initialize both nodes
 
 ```bash
 geth --datadir signer1/data init pow.json
@@ -24,12 +41,15 @@ geth --datadir signer2/data init pow.json
 
 ## Step 1: Start both nodes
 
+> Replace `<signer1_addr>` / `<signer2_addr>` with the addresses printed in
+> the previous step. Do **not** copy the hex literals shown here verbatim.
+
 ### Terminal 1 (signer1 - payer)
 
 ```bash
 cd ~/go/src/github.com/PFAP/test/pow
 geth --datadir signer1/data --networkid 55661 --port 2007 \
-  --unlock 0x6d8712972e34f76cc1d51f4a4edde56fe03597a0 \
+  --unlock <signer1_addr> \
   --password signer1/passwd.txt console 2>> signer1.log
 ```
 
@@ -38,7 +58,7 @@ geth --datadir signer1/data --networkid 55661 --port 2007 \
 ```bash
 cd ~/go/src/github.com/PFAP/test/pow
 geth --datadir signer2/data --networkid 55661 --port 2008 \
-  --unlock 0x811430c8ccdf25c31182b5ae57c31644113432af \
+  --unlock <signer2_addr> \
   --password signer2/passwd.txt console 2>> signer2.log
 ```
 

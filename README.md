@@ -101,25 +101,43 @@ Note: any change to circuit structure invalidates (pk, vk); all nodes must be re
 
 ## 3. Running nodes
 
-Using `test/pow` as the example (`test/clique` for PoA, same flow):
+Using `test/pow` as the example (`test/clique` for PoA, same flow). The
+`signerX/` directories only ship with `passwd.txt`; you must create a fresh
+account in each datadir and then unlock that exact address.
 
 ```bash
 cd test/pow
 
-# Terminal 1
-rm -rf signer1/data/geth signer1/data/SN signer1.log
+# Terminal 1 -------------------------------------------------------------
+# Wipe any previous run (including the keystore) and start from scratch
+rm -rf signer1/data signer1.log
+
+# Create an account in signer1/data/keystore; record the printed address
+geth --datadir signer1/data account new --password signer1/passwd.txt
+# => Address: {abcd...}    <-- use THIS address below as <signer1_addr>
+
+# Initialize the genesis block
 geth --datadir signer1/data init pow.json
+
+# Start the node (replace <signer1_addr> with the address printed above)
 geth --datadir signer1/data --networkid 55661 --port 2007 \
     --unlock <signer1_addr> --password signer1/passwd.txt \
     console 2>> signer1.log
 
-# Terminal 2
-rm -rf signer2/data/geth signer2/data/SN signer2.log
+# Terminal 2 -------------------------------------------------------------
+rm -rf signer2/data signer2.log
+geth --datadir signer2/data account new --password signer2/passwd.txt
+# => Address: {efgh...}    <-- use THIS address below as <signer2_addr>
 geth --datadir signer2/data init pow.json
 geth --datadir signer2/data --networkid 55661 --port 2008 \
     --unlock <signer2_addr> --password signer2/passwd.txt \
     console 2>> signer2.log
 ```
+
+> Note: deleting only `signer1/data/geth` (keeping `keystore/`) also works
+> for repeated runs, but the addresses above must always match whatever is
+> currently in `signer1/data/keystore`. The two are independent — `account new`
+> writes to `keystore/`, while `init` / chain data live under `geth/`.
 
 Connect the two nodes:
 
