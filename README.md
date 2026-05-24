@@ -44,6 +44,7 @@ Make sure `GOPATH` and `LD_LIBRARY_PATH` are exported:
 ```bash
 export PATH=$(go env GOPATH)/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/lib
+export GOPATH=$(go env GOPATH)
 ```
 
 ## 2. Build
@@ -51,7 +52,8 @@ export LD_LIBRARY_PATH=/usr/local/lib
 ### 2.1 One-shot build (recommended)
 
 ```bash
-git clone <this-repo> $GOPATH/src/github.com/PFAP
+mkdir -p  $GOPATH/src/github.com/
+git clone https://github.com/percyc/PFAP.git $GOPATH/src/github.com/PFAP
 cd $GOPATH/src/github.com/PFAP
 ./build.sh all
 ```
