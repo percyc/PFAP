@@ -26,6 +26,45 @@ check_go() {
     info "Go: $(go version)"
 }
 
+# Ensure $GOPATH/src/github.com/ethereum/go-ethereum points at this repo's
+# go-ethereum directory. Required because all Go source files import
+# "github.com/ethereum/go-ethereum/..." but the repo lives under PFAP/.
+ensure_gopath_link() {
+    local gopath
+    gopath="$(go env GOPATH)"
+    [ -n "$gopath" ] || error "GOPATH is empty. Set GOPATH or install Go properly."
+
+    local target_dir="$gopath/src/github.com/ethereum"
+    local target_link="$target_dir/go-ethereum"
+
+    mkdir -p "$target_dir"
+
+    if [ -L "$target_link" ]; then
+        local current
+        current="$(readlink -f "$target_link")"
+        local expected
+        expected="$(readlink -f "$GETH_SRC")"
+        if [ "$current" = "$expected" ]; then
+            info "GOPATH symlink OK: $target_link -> $expected"
+            return 0
+        fi
+        warn "Symlink $target_link points to $current, relinking to $expected"
+        rm -f "$target_link"
+        ln -s "$GETH_SRC" "$target_link"
+        info "Relinked: $target_link -> $GETH_SRC"
+        return 0
+    fi
+
+    if [ -e "$target_link" ]; then
+        error "$target_link already exists and is not a symlink.
+  Please back it up and remove it, then re-run this script:
+    mv \"$target_link\" \"${target_link}.bak\""
+    fi
+
+    ln -s "$GETH_SRC" "$target_link"
+    info "Created symlink: $target_link -> $GETH_SRC"
+}
+
 check_deps() {
     local missing=()
     for cmd in cmake make g++; do
@@ -159,6 +198,7 @@ install_keys() {
 build_geth() {
     step "Building geth..."
     check_go
+    ensure_gopath_link
 
     if command -v go-bindata &>/dev/null || [ -x "$GOPATH_BIN/go-bindata" ]; then
         info "Regenerating JS bindings (bindata)..."
