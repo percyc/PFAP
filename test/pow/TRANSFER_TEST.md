@@ -9,7 +9,7 @@
 ### 1. Clean old data
 
 ```bash
-cd /home/percy/go/src/github.com/PFAP/test/pow
+cd ~/go/src/github.com/PFAP/test/pow
 rm -rf signer1/data/geth signer1/data/SN signer2/data/geth signer2/data/SN *.log
 ```
 
@@ -27,7 +27,7 @@ geth --datadir signer2/data init pow.json
 ### Terminal 1 (signer1 - payer)
 
 ```bash
-cd /home/percy/go/src/github.com/PFAP/test/pow
+cd ~/go/src/github.com/PFAP/test/pow
 geth --datadir signer1/data --networkid 55661 --port 2007 \
   --unlock 0x6d8712972e34f76cc1d51f4a4edde56fe03597a0 \
   --password signer1/passwd.txt console 2>> signer1.log
@@ -36,7 +36,7 @@ geth --datadir signer1/data --networkid 55661 --port 2007 \
 ### Terminal 2 (signer2 - receiver)
 
 ```bash
-cd /home/percy/go/src/github.com/PFAP/test/pow
+cd ~/go/src/github.com/PFAP/test/pow
 geth --datadir signer2/data --networkid 55661 --port 2008 \
   --unlock 0x811430c8ccdf25c31182b5ae57c31644113432af \
   --password signer2/passwd.txt console 2>> signer2.log
