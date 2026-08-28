@@ -17,9 +17,14 @@ func TestEmbeddedWebAssets(t *testing.T) {
 	}
 	b, _ := web.ReadFile("web/index.html")
 	html := string(b)
-	for _, id := range []string{"serverForm", "experimentForm", "transactionForm", "workloadForm", "consoleForm", "nodeConsole", "metrics"} {
+	for _, id := range []string{"serverForm", "experimentForm", "transactionForm", "workloadForm", "consoleForm", "consolePreset", "nodeConsole", "overviewExperiment", "metrics"} {
 		if !strings.Contains(html, `id="`+id+`"`) {
 			t.Fatalf("missing UI element %s", id)
+		}
+	}
+	for _, command := range []string{"eth.blockNumber", "admin.peers", "txpool.status", "eth.getAccountState()", "miner.start(1)"} {
+		if !strings.Contains(html, command) {
+			t.Fatalf("missing console preset %s", command)
 		}
 	}
 }

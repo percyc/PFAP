@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -511,6 +513,10 @@ func nextPortBase(start, count int, experiments []model.Experiment, rpc bool) in
 
 func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) == 3 && r.Method == http.MethodDelete {
+		a.deleteExperiment(w, parts[2])
+		return
+	}
 	if len(parts) == 6 && parts[3] == "nodes" && parts[5] == "state" && (r.Method == "GET" || r.Method == "POST") {
 		a.nodeState(w, r, parts[2], parts[4])
 		return
@@ -586,6 +592,66 @@ func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		fail(w, 404, errors.New("unknown action"))
 	}
+}
+
+func (a *API) deleteExperiment(w http.ResponseWriter, experimentID string) {
+	err := a.store.Update(func(s *model.State) error {
+		index := -1
+		for i := range s.Experiments {
+			if s.Experiments[i].ID == experimentID {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return os.ErrNotExist
+		}
+		exp := s.Experiments[index]
+		if exp.Status == "running" || exp.Status == "deploying" || exp.Status == "stopping" {
+			return errors.New("stop the experiment before deleting it")
+		}
+		for _, tx := range s.Transactions {
+			if tx.ExperimentID == experimentID && (tx.Status == "queued" || tx.Status == "proving" || tx.Status == "submitted") {
+				return errors.New("experiment still has active transactions")
+			}
+		}
+		for _, workload := range s.Workloads {
+			if workload.ExperimentID == experimentID && (workload.Status == "running" || workload.Status == "draining") {
+				return errors.New("experiment still has an active workload")
+			}
+		}
+		s.Experiments = append(s.Experiments[:index], s.Experiments[index+1:]...)
+		s.Transactions = deleteTransactionsForExperiment(s.Transactions, experimentID)
+		s.Workloads = deleteWorkloadsForExperiment(s.Workloads, experimentID)
+		s.AccountSnapshots = deleteSnapshotsForExperiment(s.AccountSnapshots, experimentID)
+		s.Events = deleteEventsForExperiment(s.Events, experimentID)
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		fail(w, http.StatusNotFound, errors.New("experiment not found"))
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusConflict, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func deleteTransactionsForExperiment(items []model.Transaction, experimentID string) []model.Transaction {
+	return slices.DeleteFunc(items, func(item model.Transaction) bool { return item.ExperimentID == experimentID })
+}
+
+func deleteWorkloadsForExperiment(items []model.Workload, experimentID string) []model.Workload {
+	return slices.DeleteFunc(items, func(item model.Workload) bool { return item.ExperimentID == experimentID })
+}
+
+func deleteSnapshotsForExperiment(items []model.AccountSnapshot, experimentID string) []model.AccountSnapshot {
+	return slices.DeleteFunc(items, func(item model.AccountSnapshot) bool { return item.ExperimentID == experimentID })
+}
+
+func deleteEventsForExperiment(items []model.Event, experimentID string) []model.Event {
+	return slices.DeleteFunc(items, func(item model.Event) bool { return item.ExperimentID == experimentID })
 }
 
 func (a *API) nodeState(w http.ResponseWriter, r *http.Request, experimentID, nodeID string) {

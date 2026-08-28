@@ -23,8 +23,8 @@
   <section class="hero">
 <div>
 <p class="eyebrow">EXPERIMENT CONTROL PLANE</p>
-<h1>把数小时的多节点实验，变成一次可复现的运行。</h1>
-<p>集中部署 PFAP 节点、编排隐私交易，并实时观察网络与性能。</p>
+<h1>PFAP 多节点实验控制台</h1>
+<p>部署、交易与性能观测。</p>
 </div>
 <div class="summary">
 <div>
@@ -48,6 +48,7 @@
 <button data-tab="transactions">交易</button>
 </nav>
   <section id="overview" class="tab active">
+<div class="scope-bar"><div><b>总览范围</b><span id="overviewScopeHint">全部实验的聚合统计</span></div><select id="overviewExperiment" aria-label="选择总览实验"><option value="">全部实验</option></select></div>
 <div id="metrics" class="metrics">
 </div>
 <div class="grid">
@@ -126,13 +127,13 @@
 </section>
   <section id="transactions" class="tab">
 <article class="account-workspace" style="margin-bottom:20px">
-<div class="section-head"><div><h2>账户与交易状态</h2><p>跟随下方实验选择显示；交易确认后自动刷新双方账户，也可随时手动查询。</p></div></div>
+<div class="section-head"><div><h2>实验交易工作区</h2><p>账户、交易记录和自动规则统一跟随当前实验。</p></div><select id="experimentSelect" aria-label="选择交易工作区实验"></select></div>
 <div id="accountCards" class="account-grid"></div>
 <details class="history-details"><summary>查看账户状态变更历史</summary><div id="accountHistory" class="history"></div></details>
 </article>
 <div class="split">
 <article>
-<h2>交易记录</h2>
+<div class="section-head"><div><h2>交易记录</h2><p id="transactionScope">仅显示当前所选实验</p></div></div>
 <div id="transactionRows">
 </div>
 </article>
@@ -140,9 +141,7 @@
 <article>
 <div class="section-head"><div><h2>发送预设交易</h2><p>常用 PFAP 操作会进入交易队列并持续跟踪结果。</p></div><button id="openConsole" type="button" class="action secondary">节点控制台</button></div>
 <form id="transactionForm">
-<label>运行中的实验<select name="experimentId" id="experimentSelect" required>
-</select>
-</label>
+<input type="hidden" name="experimentId" id="transactionExperimentId">
 <label>发送节点<select name="fromNode" id="nodeSelect" required>
 </select>
 </label>
@@ -160,16 +159,14 @@
 </div>
 <label>目标节点（Transfer/Public）<select name="toNode" id="toNodeSelect"></select></label>
 <div class="command-preview"><span>实际执行指令</span><pre id="transactionCommand"></pre></div>
-<button type="submit" class="primary">加入交易队列</button>
+<button id="queueTransaction" type="submit" class="primary">加入交易队列</button>
 </form>
 </article>
 <article class="spaced">
 <h2>自动交易规则</h2>
 <div id="workloadRows"></div>
 <form id="workloadForm">
-<label>实验<select name="experimentId" id="workloadExperiment" required>
-</select>
-</label>
+<input type="hidden" name="experimentId" id="workloadExperiment">
 <div class="pair">
 <label>类型<select name="type">
 <option value="mint">Mint</option>
@@ -188,7 +185,7 @@
 <label>持续秒数<input name="durationSeconds" type="number" min="1" value="60">
 </label>
 </div>
-<button type="submit" class="primary">启动 Round-robin 负载</button>
+<button id="startWorkload" type="submit" class="primary">启动 Round-robin 负载</button>
 </form>
 </article>
 </div>
@@ -200,8 +197,57 @@
 <div class="dialog-head"><div><h2>节点控制台</h2><p>偶发调试工具。命令会直接在所选节点的 geth console 中执行。</p></div><button id="closeConsole" type="button" class="icon-button" aria-label="关闭">×</button></div>
 <label>运行中的实验<select name="experimentId" id="consoleExperiment" required></select></label>
 <label>执行节点<select name="nodeId" id="consoleNode" required></select></label>
+<label>常用指令
+<select id="consolePreset">
+<option value="">选择一条指令填入编辑框…</option>
+<optgroup label="链与网络">
+<option value="eth.blockNumber">当前区块高度</option>
+<option value="eth.syncing">同步状态</option>
+<option value="net.peerCount">Peer 数量</option>
+<option value="net.listening">P2P 监听状态</option>
+<option value="net.version">Network ID</option>
+<option value="admin.nodeInfo">本节点信息</option>
+<option value="admin.peers">已连接 Peer 详情</option>
+</optgroup>
+<optgroup label="账户与余额">
+<option value="eth.accounts">节点账户列表</option>
+<option value="eth.coinbase">Coinbase 账户</option>
+<option value="eth.getBalance(eth.accounts[0])">首个账户公开余额</option>
+<option value="web3.fromWei(eth.getBalance(eth.accounts[0]), 'ether')">首个账户余额（Ether）</option>
+<option value="eth.getTransactionCount(eth.accounts[0])">首个账户 Nonce</option>
+<option value="personal.listAccounts">Personal 账户列表</option>
+</optgroup>
+<optgroup label="区块、交易与交易池">
+<option value="eth.getBlock('latest')">最新区块详情</option>
+<option value="eth.getBlock('pending')">Pending 区块详情</option>
+<option value="eth.getBlockTransactionCount('latest')">最新区块交易数</option>
+<option value="eth.getTransaction('0x&lt;transaction-hash&gt;')">按哈希查询交易（模板）</option>
+<option value="eth.getTransactionReceipt('0x&lt;transaction-hash&gt;')">按哈希查询 Receipt（模板）</option>
+<option value="txpool.status">交易池状态</option>
+<option value="txpool.inspect">交易池摘要</option>
+<option value="txpool.content">交易池完整内容</option>
+</optgroup>
+<optgroup label="PFAP 隐私账户">
+<option value="eth.getAccountState()">当前隐私账户状态</option>
+<option value="JSON.stringify(eth.getAccountState())">隐私账户状态（JSON）</option>
+<option value="eth.sendCreateAccountTransaction({from:eth.accounts[0]})">创建隐私账户</option>
+<option value="eth.sendMintTransaction({from:eth.accounts[0],value:'0x1'})">Mint（修改 value 后执行）</option>
+<option value="eth.sendRedeemTransaction({from:eth.accounts[0],value:'0x1'})">Redeem（修改 value 后执行）</option>
+<option value="JSON.stringify(eth.getPayerNextState('0x01','0x1'))">生成 Transfer 付款方证明</option>
+<option value="eth.revertTransferState()">回滚暂存的 Transfer 状态</option>
+</optgroup>
+<optgroup label="挖矿与管理（会改变节点状态）">
+<option value="eth.mining">挖矿状态</option>
+<option value="eth.hashrate">当前 Hashrate</option>
+<option value="miner.start(1)">启动 1 线程挖矿</option>
+<option value="miner.stop()">停止挖矿</option>
+<option value="admin.startRPC()">启动 RPC</option>
+<option value="admin.stopRPC()">停止 RPC</option>
+</optgroup>
+</select>
+</label>
 <label>JavaScript 表达式<textarea name="command" id="consoleCommand" rows="7" required spellcheck="false" placeholder="eth.blockNumber"></textarea></label>
-<div class="console-examples"><span>示例</span><button type="button" data-command="eth.blockNumber">区块高度</button><button type="button" data-command="net.peerCount">Peer 数</button><button type="button" data-command="eth.getAccountState()">隐私账户状态</button></div>
+<div class="console-examples"><span>快捷</span><button type="button" data-command="eth.blockNumber">区块高度</button><button type="button" data-command="net.peerCount">Peer 数</button><button type="button" data-command="eth.getAccountState()">隐私账户状态</button><button type="button" data-command="txpool.status">交易池</button></div>
 <button id="executeConsole" type="submit" class="primary">执行命令</button>
 <section class="console-result" aria-live="polite"><div><span>执行结果</span><small id="consoleMeta"></small></div><pre id="consoleOutput">尚未执行命令</pre></section>
 </form>
