@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,18 @@ import (
 )
 
 type Runner struct{}
+
+func (Runner) ScanHostKey(ctx context.Context, s model.Server) (string, error) {
+	cmd := exec.CommandContext(ctx, "ssh-keyscan", "-p", strconv.Itoa(s.Port), "-T", "10", s.Host)
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(b), fmt.Errorf("ssh-keyscan: %w: %s", err, bytes.TrimSpace(b))
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return "", errors.New("ssh-keyscan returned no host keys")
+	}
+	return string(b), nil
+}
 
 func sshArgs(s model.Server) []string {
 	args := []string{"-p", strconv.Itoa(s.Port), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"}

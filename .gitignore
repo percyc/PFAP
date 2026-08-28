@@ -2,4 +2,5 @@
 /bin/
 /.gopath/
 /.gocache/
+/.compat-build/
 /prfKey/

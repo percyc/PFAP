@@ -73,6 +73,19 @@ cd PFAP
 ./build.sh all
 ```
 
+For a runtime that can be deployed to Ubuntu 22.04-or-newer amd64 workers,
+prefer the reproducible compatibility builder:
+
+```bash
+./scripts/build-compatible-runtime.sh
+```
+
+It compiles the C/C++ runtime in an Ubuntu 22.04 Docker image, mounts the
+controller's Go 1.24 toolchain read-only, and creates
+`dist/pfap-runtime.tar.gz`. Worker nodes run the resulting binaries natively;
+they do not need Docker or a compiler. See [lab/README.md](lab/README.md) for
+controller and new-worker provisioning instructions.
+
 `build.sh all` performs, in order:
 
 1. Compile `libsnark-vnt`.

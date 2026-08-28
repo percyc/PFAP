@@ -94,14 +94,22 @@ init_network() {
         mkdir -p "$dir"
         if ! compgen -G "$dir/keystore/*" >/dev/null; then
             info "Creating account for node $node"
-            "$GETH_BIN" --datadir "$dir" account new --password "$PASSWORD_FILE" >"$dir/account-create.log" 2>&1
+            if ! "$GETH_BIN" --datadir "$dir" account new --password "$PASSWORD_FILE" >"$dir/account-create.log" 2>&1; then
+                printf '[ERROR] geth account creation failed for node %s:\n' "$node" >&2
+                sed -n '1,80p' "$dir/account-create.log" >&2
+                die "Cannot create account for node $node"
+            fi
         fi
         address="$(find "$dir/keystore" -maxdepth 1 -type f -printf '%f\n' | sed -n 's/.*--\([0-9a-fA-F]\{40\}\)$/\1/p' | head -1)"
         [ -n "$address" ] || die "Cannot determine account for node $node"
         printf '%s\n' "$address" >"$dir/address"
         if [ ! -d "$dir/geth/chaindata" ]; then
             info "Initializing node $node"
-            "$GETH_BIN" --datadir "$dir" init "$GENESIS" >"$dir/init.log" 2>&1
+            if ! "$GETH_BIN" --datadir "$dir" init "$GENESIS" >"$dir/init.log" 2>&1; then
+                printf '[ERROR] geth initialization failed for node %s:\n' "$node" >&2
+                sed -n '1,80p' "$dir/init.log" >&2
+                die "Cannot initialize node $node"
+            fi
         fi
     done
     info "Initialized $NODE_COUNT nodes in $NETWORK_ROOT"

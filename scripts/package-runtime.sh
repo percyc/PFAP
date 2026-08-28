@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LIB_BUILD="$REPO_ROOT/libsnark-vnt/build"
+LIB_BUILD="${LIBSNARK_BUILD:-$REPO_ROOT/libsnark-vnt/build}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/dist}"
 GETH_BIN="${GETH_BIN:-$REPO_ROOT/bin/geth}"
 
@@ -26,7 +26,19 @@ package="$stage/pfap-runtime"
 mkdir -p "$package/bin" "$package/lib" "$package/prfKey" "$package/pow" "$package/scripts" "$OUTPUT_DIR"
 cp "$GETH_BIN" "$package/bin/geth"
 cp "${libraries[@]}" "$package/lib/"
+
+# Keep the runtime independent from optional host packages and from a newer
+# host C++ runtime.  We intentionally do not bundle glibc: the compatible
+# builder defines that minimum platform baseline.
+if [ "${BUNDLE_COMPAT_LIBS:-1}" = "1" ]; then
+    for soname in libgmpxx.so.4 libgmp.so.10 libstdc++.so.6 libgcc_s.so.1; do
+        dependency="$(ldconfig -p | awk -v name="$soname" '$1 == name { print $NF; exit }')"
+        [ -n "$dependency" ] || { printf 'missing runtime dependency %s\n' "$soname" >&2; exit 1; }
+        cp -L "$dependency" "$package/lib/$soname"
+    done
+fi
 cp "$REPO_ROOT"/prfKey/*.txt "$package/prfKey/"
+[ ! -f "$OUTPUT_DIR/build-profile.json" ] || cp "$OUTPUT_DIR/build-profile.json" "$package/build-profile.json"
 cp "$REPO_ROOT/test/pow/network.sh" "$REPO_ROOT/test/pow/pow.json" "$REPO_ROOT/test/pow/network.env.example" "$package/pow/"
 cp "$REPO_ROOT/scripts/install-runtime.sh" "$package/scripts/"
 

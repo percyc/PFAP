@@ -29,7 +29,10 @@ printf 'host=%s\n' "$(hostname)"
 printf 'kernel=%s\n' "$(uname -sr)"
 printf 'cpus=%s\n' "$(getconf _NPROCESSORS_ONLN)"
 printf 'memory_kb=%s\n' "$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-printf 'disk_kb=%s\n' "$(df -Pk . | awk 'NR==2{print $4}')"
+printf 'memory_available_kb=%s\n' "$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+printf 'load1=%s\n' "$(awk '{print $1}' /proc/loadavg)"
+printf 'disk_total_kb=%s\n' "$(df -Pk . | awk 'NR==2{print $2}')"
+printf 'disk_available_kb=%s\n' "$(df -Pk . | awk 'NR==2{print $4}')"
 command -v tar >/dev/null
 command -v sha256sum >/dev/null
 command -v setsid >/dev/null
@@ -96,6 +99,10 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 			}
 		}
 		runtime := artifactDir + "/pfap-runtime"
+		preflight := "set -eu\nruntime=" + shell(runtime) + "\nLD_LIBRARY_PATH=\"$runtime/lib\" \"$runtime/bin/geth\" version >/dev/null\n"
+		if out, err := o.Remote.Run(ctx, s, preflight); err != nil {
+			return nil, fmt.Errorf("runtime incompatible on %s: %w (%s); rebuild the runtime on an OS/toolchain compatible with this worker", s.Name, err, strings.TrimSpace(out))
+		}
 		runtimeDir := base + "/experiments/" + exp.ID + "/" + s.ID
 		portOffset := global - 1
 		env := fmt.Sprintf("NODE_COUNT=%d NETWORK_ID=%d P2P_PORT_BASE=%d HTTP_PORT_BASE=%d RUNTIME_DIR=%s GETH_BIN=%s PFAP_PRFKEY_DIR=%s LD_LIBRARY_PATH=%s ENABLE_HTTP=false MINE=%t", p.Count, exp.NetworkID, exp.P2PPortBase+portOffset, exp.RPCPortBase+portOffset, shell(runtimeDir), shell(runtime+"/bin/geth"), shell(runtime+"/prfKey"), shell(runtime+"/lib"), global == 1)
@@ -235,6 +242,48 @@ func ParseHash(out string) string {
 }
 
 var proofTimeRE = regexp.MustCompile(`(?m)(gen|verify)\s+\w+\s+proof\s+Use Time:\s*([0-9.]+)s`)
+var txCreateTimeRE = regexp.MustCompile(`Create .+ transaction Cost Time \(ms\):\s*([0-9]+)`)
+var txVerifyTimeRE = regexp.MustCompile(`Verify .+ transaction Cost Time \(ms\):\s*([0-9]+)`)
+
+func (o Orchestrator) TransactionPhaseTimings(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, hash string) (generationUs, verificationUs int64, err error) {
+	base := strings.TrimRight(server.WorkDir, "/")
+	logPath := base + "/experiments/" + exp.ID + "/" + server.ID + "/node" + strconv.Itoa(node.LocalIndex) + "/geth.log"
+	out, err := o.Remote.Run(ctx, server, "tail -n 4000 "+shell(logPath)+"\n")
+	if err != nil {
+		return 0, 0, err
+	}
+	generationUs, verificationUs, ok := ExtractTransactionPhaseTimings(out, hash)
+	if !ok {
+		return 0, 0, errors.New("transaction phase timing markers not found")
+	}
+	return generationUs, verificationUs, nil
+}
+
+func ExtractTransactionPhaseTimings(logText, hash string) (generationUs, verificationUs int64, ok bool) {
+	lines := strings.Split(logText, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "Submitted transaction") && strings.Contains(strings.ToLower(line), strings.ToLower(hash)) {
+			// The API prints the create marker immediately after the submission
+			// log. Prefer that small forward window so an earlier transaction's
+			// marker cannot be associated with this hash.
+			end := i + 10
+			if end >= len(lines) {
+				end = len(lines) - 1
+			}
+			if match := txCreateTimeRE.FindStringSubmatch(strings.Join(lines[i:end+1], "\n")); len(match) == 2 {
+				ms, _ := strconv.ParseInt(match[1], 10, 64)
+				generationUs = ms * 1000
+			}
+		}
+		if strings.Contains(strings.ToLower(line), strings.ToLower(hash)) {
+			if match := txVerifyTimeRE.FindStringSubmatch(line); len(match) == 2 {
+				ms, _ := strconv.ParseInt(match[1], 10, 64)
+				verificationUs = ms * 1000
+			}
+		}
+	}
+	return generationUs, verificationUs, generationUs > 0 || verificationUs > 0
+}
 
 func ParseProofTimes(out string) (proofMs, verifyMs int64) {
 	proofUs, verifyUs := ParseProofTimesMicros(out)

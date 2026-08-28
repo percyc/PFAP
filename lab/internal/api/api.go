@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -84,7 +85,38 @@ func New(s *store.Store) *API {
 		go a.monitor(experimentID)
 	}
 	go a.backfillTransactionTimings()
+	go a.monitorServers()
 	return a
+}
+
+func (a *API) monitorServers() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		var servers []model.Server
+		a.store.View(func(s model.State) { servers = s.Servers })
+		for _, server := range servers {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			out, err := a.orch.Check(ctx, server)
+			cancel()
+			status := "online"
+			if err != nil {
+				status = "error"
+				out = err.Error()
+			}
+			_ = a.store.Update(func(s *model.State) error {
+				for i := range s.Servers {
+					if s.Servers[i].ID == server.ID {
+						s.Servers[i].Status = status
+						s.Servers[i].SystemInfo = out
+						s.Servers[i].LastCheck = time.Now()
+					}
+				}
+				return nil
+			})
+		}
+		<-ticker.C
+	}
 }
 
 func (a *API) backfillTransactionTimings() {
@@ -182,6 +214,20 @@ func (a *API) Handler(static http.Handler) http.Handler {
 		}
 		if r.URL.Path == "/api/state" && r.Method == "GET" {
 			a.store.View(func(s model.State) { jsonOut(w, 200, s) })
+			return
+		}
+		if r.URL.Path == "/api/build-profile" && r.Method == http.MethodGet {
+			b, err := os.ReadFile("dist/build-profile.json")
+			if errors.Is(err, os.ErrNotExist) {
+				jsonOut(w, 200, map[string]any{})
+				return
+			}
+			if err != nil {
+				fail(w, 500, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(b)
 			return
 		}
 		if r.URL.Path == "/api/events/stream" {
@@ -322,6 +368,9 @@ func (a *API) servers(w http.ResponseWriter, r *http.Request) {
 	if v.WorkDir == "" {
 		v.WorkDir = "/opt/pfap-lab"
 	}
+	if v.Host != "local" && v.Host != "localhost-local" && v.KnownHostsFile == "" {
+		v.KnownHostsFile = filepath.Join(a.store.DataDir(), "known_hosts")
+	}
 	v.ID = id("srv")
 	v.Status = "unknown"
 	v.CreatedAt = time.Now()
@@ -377,6 +426,48 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOut(w, 200, map[string]string{"status": status, "info": out})
+		return
+	}
+	if len(parts) == 4 && parts[3] == "trust-host-key" && r.Method == http.MethodPost {
+		if server.Host == "local" || server.Host == "localhost-local" {
+			fail(w, http.StatusBadRequest, errors.New("local server does not use SSH host keys"))
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		keys, err := a.orch.Remote.ScanHostKey(ctx, server)
+		if err != nil {
+			fail(w, http.StatusBadGateway, err)
+			return
+		}
+		path := server.KnownHostsFile
+		if path == "" {
+			path = filepath.Join(a.store.DataDir(), "known_hosts")
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			fail(w, 500, err)
+			return
+		}
+		knownHosts, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			fail(w, 500, err)
+			return
+		}
+		_, writeErr := knownHosts.WriteString(keys)
+		closeErr := knownHosts.Close()
+		if writeErr != nil || closeErr != nil {
+			fail(w, 500, errors.Join(writeErr, closeErr))
+			return
+		}
+		_ = a.store.Update(func(s *model.State) error {
+			for i := range s.Servers {
+				if s.Servers[i].ID == sid {
+					s.Servers[i].KnownHostsFile = path
+				}
+			}
+			return nil
+		})
+		jsonOut(w, http.StatusOK, map[string]string{"status": "trusted", "knownHostsFile": path})
 		return
 	}
 	if len(parts) == 3 && r.Method == "DELETE" {
@@ -929,12 +1020,40 @@ func (a *API) transactions(w http.ResponseWriter, r *http.Request) {
 	t.ID = id("tx")
 	t.Status = "queued"
 	t.SubmittedAt = time.Now()
-	if err := a.store.Update(func(s *model.State) error { s.Transactions = append(s.Transactions, t); return nil }); err != nil {
-		fail(w, 500, err)
+	if err := a.enqueueTransaction(t); err != nil {
+		fail(w, http.StatusConflict, err)
 		return
 	}
 	go a.runTransaction(t)
 	jsonOut(w, 202, t)
+}
+
+func activeTransaction(status string) bool {
+	return status == "queued" || status == "proving" || status == "submitted"
+}
+
+var errNodeBusy = errors.New("node already has an active transaction")
+
+func transactionNodesBusy(transactions []model.Transaction, fromNode, toNode string) bool {
+	for _, tx := range transactions {
+		if !activeTransaction(tx.Status) {
+			continue
+		}
+		if tx.FromNode == fromNode || tx.ToNode == fromNode || (toNode != "" && (tx.FromNode == toNode || tx.ToNode == toNode)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *API) enqueueTransaction(t model.Transaction) error {
+	return a.store.Update(func(s *model.State) error {
+		if transactionNodesBusy(s.Transactions, t.FromNode, t.ToNode) {
+			return errors.New("selected node already has an active transaction; wait for it to finish")
+		}
+		s.Transactions = append(s.Transactions, t)
+		return nil
+	})
 }
 
 func (a *API) runTransaction(t model.Transaction) {
@@ -1019,6 +1138,7 @@ func (a *API) runTransaction(t model.Transaction) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	out, err := a.orch.Attach(ctx, exp, node, server, expr)
+	rpcWallUs := time.Since(started).Microseconds()
 	if err != nil {
 		a.finishTx(t.ID, "failed", "", fmt.Errorf("%w: %s", err, out))
 		return
@@ -1041,6 +1161,11 @@ func (a *API) runTransaction(t model.Transaction) {
 	if parsedProofUs > 0 {
 		proofUs = parsedProofUs
 	}
+	txGenerationUs := rpcWallUs - proofUs - parsedVerifyUs
+	if txGenerationUs < 0 {
+		txGenerationUs = 0
+	}
+	a.setTransactionBreakdown(t.ID, map[string]int64{"txGenerationUs": txGenerationUs})
 	proofMs = proofUs / 1000
 	a.updateTx(t.ID, "submitted", hash, "")
 	a.emit(t.ExperimentID, "info", "transaction", "transaction submitted", map[string]any{"id": t.ID, "hash": hash, "proofDurationMs": proofMs})
@@ -1048,6 +1173,12 @@ func (a *API) runTransaction(t model.Transaction) {
 		out, err = a.orch.Attach(ctx, exp, node, server, "JSON.stringify(eth.getTransactionReceipt("+strconv.Quote(hash)+"))")
 		if err == nil {
 			if receipt, block, receiptStatus, ok := parseReceipt(out); ok {
+				if _, verificationUs, timingErr := a.orch.TransactionPhaseTimings(ctx, exp, node, server, hash); timingErr == nil {
+					// Generation is measured from the RPC wall time with proof and
+					// proof verification removed. The node's legacy Create marker
+					// includes proof generation, so it must not overwrite that value.
+					a.setTransactionBreakdown(t.ID, map[string]int64{"txVerificationUs": verificationUs})
+				}
 				a.confirmTx(t.ID, hash, receipt, block, receiptStatus, proofUs, parsedVerifyUs)
 				a.refreshTransactionNodes(exp, node, toNode, server, t.ID)
 				if t.Type != "public" {
@@ -1115,6 +1246,7 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 	a.updateTx(t.ID, "proving", "", "")
 	started := time.Now()
 	out, err := a.orch.Attach(ctx, exp, payer, payerServer, "JSON.stringify(eth.getPayerNextState('0x01',"+strconv.Quote(value)+"))")
+	payerWallUs := time.Since(started).Microseconds()
 	if err != nil {
 		a.finishTx(t.ID, "failed", "", fmt.Errorf("payer proof: %w: %s", err, out))
 		return
@@ -1137,7 +1269,9 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 	}
 	expr := "eth.sendTransferTransaction({from:eth.accounts[0],value:" + strconv.Quote(value) + ",rs:'0x01',cmtANew:" + strconv.Quote(proof.CMT) + ",snAOld:" + strconv.Quote(proof.SN) + ",proofA:" + strconv.Quote(proof.Proof) + "})"
 	payerProofUs, payerVerifyUs := orchestrator.ParseProofTimesMicros(out)
+	receiverStarted := time.Now()
 	out, err = a.orch.Attach(ctx, exp, receiver, receiverServer, expr)
+	receiverWallUs := time.Since(receiverStarted).Microseconds()
 	if err != nil {
 		_, _ = a.orch.Attach(ctx, exp, payer, payerServer, "eth.revertTransferState()")
 		a.finishTx(t.ID, "failed", "", fmt.Errorf("receiver submit: %w: %s", err, out))
@@ -1162,11 +1296,29 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		proofUs = time.Since(started).Microseconds()
 	}
 	verifyUs := payerVerifyUs + receiverVerifyUs
+	payerTxGenerationUs := payerWallUs - payerProofUs - payerVerifyUs
+	receiverTxGenerationUs := receiverWallUs - receiverProofUs - receiverVerifyUs
+	if payerTxGenerationUs < 0 {
+		payerTxGenerationUs = 0
+	}
+	if receiverTxGenerationUs < 0 {
+		receiverTxGenerationUs = 0
+	}
+	a.setTransactionBreakdown(t.ID, map[string]int64{"payerProofGenerationUs": payerProofUs, "payerProofVerificationUs": payerVerifyUs, "payerTxGenerationUs": payerTxGenerationUs, "receiverProofGenerationUs": receiverProofUs, "receiverProofVerificationUs": receiverVerifyUs, "receiverTxGenerationUs": receiverTxGenerationUs, "txGenerationUs": payerTxGenerationUs + receiverTxGenerationUs})
 	a.updateTx(t.ID, "submitted", hash, "")
 	for i := 0; i < 600; i++ {
 		out, err = a.orch.Attach(ctx, exp, receiver, receiverServer, "JSON.stringify(eth.getTransactionReceipt("+strconv.Quote(hash)+"))")
 		if err == nil {
 			if receipt, block, receiptStatus, ok := parseReceipt(out); ok {
+				phaseValues := map[string]int64{}
+				if _, verificationUs, timingErr := a.orch.TransactionPhaseTimings(ctx, exp, receiver, receiverServer, hash); timingErr == nil {
+					phaseValues["receiverTxVerificationUs"] = verificationUs
+					phaseValues["txVerificationUs"] = verificationUs
+				}
+				if _, verificationUs, timingErr := a.orch.TransactionPhaseTimings(ctx, exp, payer, payerServer, hash); timingErr == nil {
+					phaseValues["payerTxVerificationUs"] = verificationUs
+				}
+				a.setTransactionBreakdown(t.ID, phaseValues)
 				a.confirmTx(t.ID, hash, receipt, block, receiptStatus, proofUs, verifyUs)
 				a.refreshTransactionNodes(exp, payer, receiver, payerServer, t.ID)
 				a.waitForNextBlock(ctx, exp, receiver, receiverServer, block)
@@ -1264,6 +1416,48 @@ func (a *API) confirmTx(id, hash, receipt, block, receiptStatus string, proofUs,
 	})
 }
 
+func (a *API) setTransactionBreakdown(id string, values map[string]int64) {
+	_ = a.store.Update(func(s *model.State) error {
+		for i := range s.Transactions {
+			tx := &s.Transactions[i]
+			if tx.ID != id {
+				continue
+			}
+			if v, ok := values["txGenerationUs"]; ok {
+				tx.TxGenerationUs = v
+			}
+			if v, ok := values["txVerificationUs"]; ok {
+				tx.TxVerificationUs = v
+			}
+			if v, ok := values["payerProofGenerationUs"]; ok {
+				tx.PayerProofGenerationUs = v
+			}
+			if v, ok := values["payerProofVerificationUs"]; ok {
+				tx.PayerProofVerificationUs = v
+			}
+			if v, ok := values["payerTxGenerationUs"]; ok {
+				tx.PayerTxGenerationUs = v
+			}
+			if v, ok := values["payerTxVerificationUs"]; ok {
+				tx.PayerTxVerificationUs = v
+			}
+			if v, ok := values["receiverProofGenerationUs"]; ok {
+				tx.ReceiverProofGenerationUs = v
+			}
+			if v, ok := values["receiverProofVerificationUs"]; ok {
+				tx.ReceiverProofVerificationUs = v
+			}
+			if v, ok := values["receiverTxGenerationUs"]; ok {
+				tx.ReceiverTxGenerationUs = v
+			}
+			if v, ok := values["receiverTxVerificationUs"]; ok {
+				tx.ReceiverTxVerificationUs = v
+			}
+		}
+		return nil
+	})
+}
+
 func (a *API) refreshTransactionNodes(exp model.Experiment, from, to model.Node, fromServer model.Server, txID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1351,6 +1545,7 @@ func (a *API) runWorkload(v model.Workload) {
 	deadline := time.NewTimer(time.Duration(v.DurationSeconds) * time.Second)
 	defer deadline.Stop()
 	submitted := 0
+	routeCursor := 0
 	for {
 		select {
 		case <-deadline.C:
@@ -1359,17 +1554,21 @@ func (a *API) runWorkload(v model.Workload) {
 			a.drainWorkload(v, submitted)
 			return
 		case <-ticker.C:
-			node := exp.Nodes[submitted%len(exp.Nodes)]
+			node := exp.Nodes[routeCursor%len(exp.Nodes)]
 			toNode := ""
 			if v.Type == "transfer" || v.Type == "public" {
 				if len(exp.Nodes) < 2 {
 					a.finishWorkload(v.ID, "failed", "transfer/public workload requires at least two nodes")
 					return
 				}
-				toNode = exp.Nodes[(submitted+1)%len(exp.Nodes)].ID
+				toNode = exp.Nodes[(routeCursor+1)%len(exp.Nodes)].ID
 			}
+			routeCursor++
 			tx := model.Transaction{ID: id("tx"), WorkloadID: v.ID, Sequence: submitted + 1, ExperimentID: v.ExperimentID, Type: v.Type, FromNode: node.ID, ToNode: toNode, Value: v.Value, Status: "queued", SubmittedAt: time.Now()}
 			if err := a.store.Update(func(s *model.State) error {
+				if transactionNodesBusy(s.Transactions, tx.FromNode, tx.ToNode) {
+					return errNodeBusy
+				}
 				s.Transactions = append(s.Transactions, tx)
 				for i := range s.Workloads {
 					if s.Workloads[i].ID == v.ID {
@@ -1378,6 +1577,9 @@ func (a *API) runWorkload(v model.Workload) {
 				}
 				return nil
 			}); err != nil {
+				if errors.Is(err, errNodeBusy) {
+					continue
+				}
 				a.finishWorkload(v.ID, "failed", err.Error())
 				return
 			}

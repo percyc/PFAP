@@ -158,6 +158,13 @@ func TestPrivateStateOnChain(t *testing.T) {
 	}
 }
 
+func TestTransactionNodesBusy(t *testing.T) {
+	txs := []model.Transaction{{FromNode: "a", ToNode: "b", Status: "submitted"}, {FromNode: "c", Status: "confirmed"}}
+	if !transactionNodesBusy(txs, "a", "") || !transactionNodesBusy(txs, "b", "d") || transactionNodesBusy(txs, "c", "d") {
+		t.Fatal("active node detection is incorrect")
+	}
+}
+
 func TestParseBlockValue(t *testing.T) {
 	for input, want := range map[string]uint64{`"42"`: 42, "0x2a": 42, " 1061 ": 1061} {
 		got, ok := parseBlockValue(input)

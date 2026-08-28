@@ -22,6 +22,40 @@ cd /home/percy/pfap/PFAP
 
 `run-lan.sh` 默认监听 `0.0.0.0:8090`，首次启动会生成随机 Web 密码到 `lab/data/password`。密码不会写入项目文档，该文件权限应保持 `0600`。控制服务重启后登录 Cookie 会失效，需要重新登录。
 
+### 新控制机首次安装（推荐）
+
+控制机负责编译 runtime、运行 Web 控制面并通过 SSH 管理 worker。兼容 runtime 的 C/C++ 部分在 Ubuntu 22.04 Docker 镜像中编译；Go 1.24 工具链从控制机只读挂载到容器。控制机需要 `docker`、`go 1.24`、`git`、`bash` 和 `sha256sum`，不要求宿主机安装 libsnark 的 C++ 依赖。
+
+```bash
+git clone <PFAP repository URL>
+cd PFAP
+
+# 首次会构建 Ubuntu 22.04 编译镜像；之后复用 Docker 和增量编译缓存
+./scripts/build-compatible-runtime.sh
+
+# 构建并启动 Web 控制面
+./build.sh lab
+./lab/run-lan.sh
+```
+
+成功后应存在 `dist/pfap-runtime.tar.gz` 和对应的 `.sha256` 文件。可在相同基线容器中做启动检查：
+
+```bash
+docker run --rm -v "$PWD/dist:/dist:ro" pfap-runtime-builder:ubuntu22 \
+  bash -lc 'mkdir /tmp/pfap && tar -xzf /dist/pfap-runtime.tar.gz -C /tmp/pfap && \
+  LD_LIBRARY_PATH=/tmp/pfap/pfap-runtime/lib /tmp/pfap/pfap-runtime/bin/geth version'
+```
+
+不要在普通更新中执行 `./build.sh keys`：重新生成 pk/vk 会改变证明参数。只有电路约束改变并计划创建全新实验网络时才应重新生成密钥。
+
+需要明确轮换密钥时，先停止所有使用旧 runtime 的实验，再执行：
+
+```bash
+./scripts/build-compatible-runtime.sh --generate-keys
+```
+
+该命令会在兼容容器中生成四类交易的 pk/vk、写入 `dist/build-profile.json`、重新构建并打包 runtime。Lab 部署时按 runtime SHA 将同一套密钥分发给实验的所有节点。
+
 可参考 [`lab.env.example`](lab.env.example) 设置自定义端口和数据路径。直接以 loopback 方式运行：
 
 ```bash
@@ -67,6 +101,29 @@ cd /home/percy/pfap/PFAP
 - 实验前完成时钟同步；
 - 防火墙允许实验使用的 P2P 端口。
 
+推荐的 worker 基线是 `x86_64/amd64`、Ubuntu 22.04 或更新版本（glibc 不低于 2.35）。worker 不需要 Docker、Go、GCC、CMake、libsnark 源码或 GMP 开发包；geth 和所需的 C++/GMP 运行库都包含在 runtime 中。ARM64 或 glibc 低于 2.35 的机器需要单独的构建产物，不能直接混入当前实验。
+
+新增一台 worker 的参考准备命令（用户名和路径可自行替换）：
+
+```bash
+sudo useradd --create-home --shell /bin/bash pfap
+sudo install -d -o pfap -g pfap /opt/pfap-worker
+sudo apt-get update
+sudo apt-get install -y openssh-server bash tar coreutils util-linux iproute2
+```
+
+将控制机公钥加入 worker 的 `/home/pfap/.ssh/authorized_keys`，并确认可非交互登录：
+
+```bash
+ssh -i /path/to/private_key pfap@WORKER_IP 'uname -m; getconf GNU_LIBC_VERSION; command -v bash tar sha256sum setsid ss'
+```
+
+随后在 Lab“服务器”页面添加：主机地址、SSH 端口、用户 `pfap`、私钥路径、工作目录 `/opt/pfap-worker`，以及其他节点能访问的 P2P 公告地址。点击“信任 SSH 主机密钥”，通过可信渠道核对指纹后再保存；然后点击“检查连接”。控制面会在正式上传和创建账户前检查架构、glibc、动态库及命令依赖。
+
+防火墙至少需要允许控制机访问 SSH，并允许实验节点之间访问所分配的 P2P TCP/UDP 端口。RPC 默认只供控制面使用，不应直接暴露到公网。
+
+首次连接采用 TOFU 保存主机密钥，控制面不会关闭 `StrictHostKeyChecking`。更换或重装服务器后若主机密钥变化，必须先核对新指纹，不能直接绕过告警。
+
 runtime 缓存在 `<workDir>/artifacts/<sha256>`；实验位于 `<workDir>/experiments/<experiment-id>`。同一主机的多个节点使用不同 datadir、P2P/RPC 端口，共享只读 runtime、证明密钥和 Ethash DAG。
 
 P2P/RPC 起始端口填 `0` 时自动分配。部署前通过 `ss` 检查冲突；失败实验再次部署时也会重新选择端口。
@@ -84,6 +141,8 @@ P2P/RPC 起始端口填 `0` 时自动分配。部署前通过 `ss` 检查冲突�
 9. 导出实验 JSON 报告。
 
 不要在同一个隐私账户上并发执行 ZK 状态交易。控制面为每个节点维护互斥锁；Transfer 会同时锁住付款方与接收方。Receipt 确认后还会等待新区块，避免下一笔交易在节点隐私序列状态尚未稳定时启动。
+
+入队时还会检查所有参与节点：存在 `queued / proving / submitted` 交易时，手动请求返回冲突，自动负载跳过本次投递并等待后续周期，不会在节点锁后无限堆积。
 
 ## 交易与执行指令
 
@@ -153,6 +212,8 @@ PFAP 证明通常远慢于投递间隔。自动规则是开放式投递器，节
 - 端到端：`confirmedAt - submittedAt`
 
 原始精度使用 `proofDurationUs` / `verifyDurationUs` 保存。页面按量级显示 `µs`、`ms` 或 `s`，不会把亚毫秒值截断为 `0 ms`。控制面通过交易哈希在对应节点 `geth.log` 中定位计时边界，并在启动时为历史单节点 ZK 交易回填微秒数据。
+
+新版 runtime 还记录交易构造和交易验证标记。Transfer 分别保存付款端和收款端的证明生成、证明验证、交易/状态包生成及交易验证；旧 runtime 没有带交易哈希的验证标记时显示为空，不使用 Receipt 等待时间代替。执行 `./build.sh keys` 或 `./build.sh all` 会生成 `dist/build-profile.json`，记录密钥耗时、pk/vk 大小以及构建主机和工具链。生成新密钥会改变证明参数，不能为了补历史数据在运行中的网络上随意执行。
 
 总览 TPS 是整个已保存历史区间的平均值，已标为“历史平均 TPS”；它不等同于某次负载的稳态吞吐。正式结论应按实验、交易类型和 workload 分组，报告样本数、成功率、排队/证明/验证/链上确认的 p50/p95/p99。
 

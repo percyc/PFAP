@@ -94,6 +94,7 @@
 </div>
 </section>
   <section id="experiments" class="tab">
+<article class="build-profile-card"><div class="section-head"><div><h2>构建与密钥档案</h2><p>记录一次性电路编译、密钥生成、文件大小及构建主机环境。</p></div></div><div id="buildProfile"></div></article>
 <div class="split">
 <article>
 <h2>实验列表</h2>
@@ -130,6 +131,7 @@
 <div><b>实验交易工作区</b><span id="transactionContextHint">选择实验后查看账户、交易和负载</span></div>
 <select id="experimentSelect" aria-label="选择交易工作区实验"></select>
 </div>
+<details class="timing-method"><summary>性能指标统计口径</summary><div><b>证明生成 / 验证</b><span>直接解析各节点 C++ 日志中的 <code>gen/verify ... proof Use Time</code>，原始精度为微秒。</span><b>交易生成</b><span>geth RPC 调用墙钟时间扣除同一调用内的证明生成与证明验证时间，表示状态准备、交易构造、签名和提交等开销。</span><b>交易验证</b><span>必须由 geth 交易池或区块执行路径新增独立埋点；当前无法从 Receipt 准确反推，未采集时显示“—”，不会用链上确认时间冒充。</span><b>Transfer</b><span>付款节点与收款节点分别采集。付款阶段是 getPayerNextState；收款阶段是校验付款证明、生成收款证明并构造广播交易。</span><b>链上确认</b><span>从获得交易哈希到观察到 Receipt，与上述 CPU 阶段分开统计。</span></div></details>
 <div class="transaction-primary">
 <article>
 <div class="section-head"><div><h2>发送预设交易</h2><p>常用 PFAP 操作会进入交易队列并持续跟踪结果。</p></div><button id="openConsole" type="button" class="action secondary">节点控制台</button></div>

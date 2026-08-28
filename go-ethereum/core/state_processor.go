@@ -117,7 +117,7 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 		}
 		statedb.CreateAccount(common.BytesToAddress(tx.ZKSN().Bytes()))
 		statedb.SetNonce(common.BytesToAddress(tx.ZKSN().Bytes()), 1)
-		fmt.Println("***** Verify mint transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size())
+		fmt.Println("***** Verify mint transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size(), " Tx Hash: ", tx.Hash().Hex())
 	} else if tx.TxCode() == types.RedeemTx {
 		txVerifyStart := time.Now()
 		if exist := statedb.Exist(common.BytesToAddress(tx.ZKSN().Bytes())); exist == true && (*(tx.ZKSN()) != *(initSN)) {
@@ -130,7 +130,7 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 		}
 		statedb.CreateAccount(common.BytesToAddress(tx.ZKSN().Bytes()))
 		statedb.SetNonce(common.BytesToAddress(tx.ZKSN().Bytes()), 1)
-		fmt.Println("***** Verify redeem transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size())
+		fmt.Println("***** Verify redeem transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size(), " Tx Hash: ", tx.Hash().Hex())
 	} else if tx.TxCode() == types.TransferTx {
 		txVerifyStart := time.Now()
 		if exist := statedb.Exist(common.BytesToAddress(tx.ZKSN().Bytes())); exist == true && (*(tx.ZKSN()) != *(initSN)) {
@@ -149,14 +149,14 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 		}
 		statedb.CreateAccount(common.BytesToAddress(tx.ZKSN().Bytes()))
 		statedb.SetNonce(common.BytesToAddress(tx.ZKSN().Bytes()), 1)
-		fmt.Println("***** Verify transfer transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size())
+		fmt.Println("***** Verify transfer transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size(), " Tx Hash: ", tx.Hash().Hex())
 	} else if tx.TxCode() == types.CreateAccountTx {
 		txVerifyStart := time.Now()
 		if err = zktx.VerifyCreateAccountProof(tx.ZKCMT(), tx.ZKProof()); err != nil {
 			fmt.Println("invalid zk createAccount proof: ", err)
 			return nil, 0, err
 		}
-		fmt.Println("***** Verify createAccount transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size())
+		fmt.Println("***** Verify createAccount transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size(), " Tx Hash: ", tx.Hash().Hex())
 	}
 
 	// Update the global Poseidon state Merkle tree with the new commitment(s)

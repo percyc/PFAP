@@ -16,6 +16,8 @@ type Store struct {
 	data model.State
 }
 
+func (s *Store) DataDir() string { return filepath.Dir(s.path) }
+
 func Open(path string) (*Store, error) {
 	s := &Store{path: path, data: model.State{Servers: []model.Server{}, Experiments: []model.Experiment{}, Events: []model.Event{}, Transactions: []model.Transaction{}, Workloads: []model.Workload{}, AccountSnapshots: []model.AccountSnapshot{}}}
 	b, err := os.ReadFile(path)
@@ -49,7 +51,9 @@ func (s *Store) Update(fn func(*model.State) error) error {
 	if len(s.data.Events) > 5000 {
 		s.data.Events = s.data.Events[len(s.data.Events)-5000:]
 	}
-	if len(s.data.AccountSnapshots)>5000{s.data.AccountSnapshots=s.data.AccountSnapshots[len(s.data.AccountSnapshots)-5000:]}
+	if len(s.data.AccountSnapshots) > 5000 {
+		s.data.AccountSnapshots = s.data.AccountSnapshots[len(s.data.AccountSnapshots)-5000:]
+	}
 	return s.save()
 }
 

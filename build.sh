@@ -7,12 +7,14 @@ BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 GETH_SRC="$REPO_ROOT/go-ethereum"
 LIBSNARK_SRC="$REPO_ROOT/libsnark-vnt"
-LIBSNARK_BUILD="$LIBSNARK_SRC/build"
+LIBSNARK_BUILD="${LIBSNARK_BUILD:-$LIBSNARK_SRC/build}"
 PRFKEY_DIR="$REPO_ROOT/prfKey"
 PFAP_GOPATH="${PFAP_GOPATH:-$REPO_ROOT/.gopath}"
 PFAP_GOCACHE="${PFAP_GOCACHE:-$REPO_ROOT/.gocache}"
 GOPATH_BIN="$PFAP_GOPATH/bin"
 GETH_OUTPUT="${GETH_OUTPUT:-$REPO_ROOT/bin/geth}"
+BUILD_PROFILE="$REPO_ROOT/dist/build-profile.json"
+LIBSNARK_BUILD_DURATION_MS=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -84,6 +86,8 @@ check_deps() {
 # Step 1: Build libsnark-vnt (zero-knowledge proof library)
 # ============================================================
 build_libsnark() {
+	local started_ns
+	started_ns="$(date +%s%N)"
     step "Building libsnark-vnt (ZK proof library)..."
     check_deps
 
@@ -94,10 +98,11 @@ build_libsnark() {
     # are picked up. A stale cache can silently drop targets like transfer_key.
     info "Running cmake..."
     # shellcheck disable=SC2086
-    cmake ${CMAKE_EXTRA_FLAGS} ..
+    cmake ${CMAKE_EXTRA_FLAGS} "$LIBSNARK_SRC"
 
     info "Compiling..."
     make -j"$BUILD_JOBS"
+	LIBSNARK_BUILD_DURATION_MS=$(( ($(date +%s%N) - started_ns) / 1000000 ))
 
     info "libsnark-vnt build complete."
 }
@@ -106,6 +111,8 @@ build_libsnark() {
 # Step 2: Generate proving/verification keys
 # ============================================================
 generate_keys() {
+	local keys_started_ns
+	keys_started_ns="$(date +%s%N)"
     step "Generating proving/verification keys..."
 
     if [ ! -f "$LIBSNARK_BUILD/src/mint_key" ]; then
@@ -120,6 +127,7 @@ generate_keys() {
         "redeem:redeem"
         "transfer:transfer"
     )
+	local key_timings=""
 
     for pair in "${key_generators[@]}"; do
         local IFS=":"
@@ -130,7 +138,10 @@ generate_keys() {
         fi
         info "Generating $name keys..."
         cd "$LIBSNARK_BUILD"
+		local key_started_ns
+		key_started_ns="$(date +%s%N)"
         "$key_bin"
+		key_timings="${key_timings}\"${name}\":$(( ($(date +%s%N) - key_started_ns) / 1000000 )),"
     done
 
     info "Moving keys to $PRFKEY_DIR..."
@@ -143,6 +154,20 @@ generate_keys() {
     done
 
     info "Keys generated: $(find "$PRFKEY_DIR" -maxdepth 1 -type f -name '*.txt' | wc -l) files"
+	mkdir -p "$(dirname "$BUILD_PROFILE")"
+	local total_key_ms host kernel cpu_model cpus memory_kb compiler cmake_version
+	total_key_ms=$(( ($(date +%s%N) - keys_started_ns) / 1000000 ))
+	host="$(hostname)"; kernel="$(uname -sr)"; cpu_model="$(awk -F: '/model name/{gsub(/^[ \t]+/,"",$2);print $2;exit}' /proc/cpuinfo)"
+	cpus="$(getconf _NPROCESSORS_ONLN)"; memory_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+	compiler="$(g++ --version | head -1)"; cmake_version="$(cmake --version | head -1)"
+	printf '{\n  "recordedAt":"%s",\n  "host":"%s",\n  "kernel":"%s",\n  "cpuModel":"%s",\n  "cpus":%s,\n  "memoryKb":%s,\n  "compiler":"%s",\n  "cmake":"%s",\n  "libsnarkBuildDurationMs":%s,\n  "keyGenerationDurationMs":%s,\n  "keyDurationsMs":{%s},\n  "keys":{\n' "$(date -Iseconds)" "$host" "$kernel" "$cpu_model" "$cpus" "$memory_kb" "$compiler" "$cmake_version" "$LIBSNARK_BUILD_DURATION_MS" "$total_key_ms" "${key_timings%,}" >"$BUILD_PROFILE"
+	local first=true f
+	for f in "$PRFKEY_DIR"/*.txt; do
+		$first || printf ',\n' >>"$BUILD_PROFILE"; first=false
+		printf '    "%s":{"bytes":%s}' "$(basename "$f")" "$(stat -c %s "$f")" >>"$BUILD_PROFILE"
+	done
+	printf '\n  }\n}\n' >>"$BUILD_PROFILE"
+	info "Build/key profile written to $BUILD_PROFILE"
 }
 
 # ============================================================
@@ -331,6 +356,14 @@ build_quick() {
     echo ""
 }
 
+build_runtime_bundle() {
+    check_go
+    build_libsnark
+    generate_keys
+    build_geth
+    package_runtime
+}
+
 # ============================================================
 # Clean
 # ============================================================
@@ -429,6 +462,7 @@ Build Commands:
   keys           Generate proving/verification keys only
   geth           Build geth only (output: ./bin/geth)
   lab            Build and test the PFAP Lab Web control plane
+  runtime-bundle Build libsnark, rotate keys, build geth and package runtime
 
 Install Commands:
   install-libs   Install .so files to /usr/local/lib
@@ -456,6 +490,7 @@ case "$CMD" in
     keys)          generate_keys ;;
     geth)          check_go; build_geth ;;
     lab)           build_lab ;;
+    runtime-bundle) build_runtime_bundle ;;
     install-libs)  install_libs ;;
     install-keys)  install_keys ;;
     tests)         install_tests ;;
