@@ -58,6 +58,15 @@ func TestExtractTransactionTimingsUsesHashBoundary(t *testing.T) {
 	}
 }
 
+func TestExtractRecentProofTimingsUsesLastGeneration(t *testing.T) {
+	logText := "gen mint proof Use Time:9s\nverify mint proof Use Time:1s\nnoise\n" +
+		"gen transfer proof Use Time:0.031234s\nverify transfer proof Use Time:0.000421s\n"
+	p, v, ok := ExtractRecentProofTimings(logText)
+	if !ok || p != 31234 || v != 421 {
+		t.Fatalf("proof=%d verify=%d ok=%v", p, v, ok)
+	}
+}
+
 func TestExtractJSONString(t *testing.T) {
 	got, err := ExtractJSONString("native log\n\"{\\\"proofA\\\":\\\"0x1\\\"}\"\n")
 	if err != nil || got != `{"proofA":"0x1"}` {

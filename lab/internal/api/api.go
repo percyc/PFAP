@@ -1155,10 +1155,16 @@ func (a *API) runTransaction(t model.Transaction) {
 	proofMs := time.Since(started).Milliseconds()
 	proofUs := time.Since(started).Microseconds()
 	parsedProofUs, parsedVerifyUs := orchestrator.ParseProofTimesMicros(out)
-	if logProofUs, logVerifyUs, timingErr := a.orch.TransactionTimings(ctx, exp, node, server, hash); timingErr == nil {
+	if t.Type == "public" {
+		// A public transfer has no ZK proof stage. Its entire RPC wall time is
+		// transaction generation and must not leak into proof metrics.
+		proofUs, parsedVerifyUs = 0, 0
+	} else if logProofUs, logVerifyUs, timingErr := a.orch.TransactionTimings(ctx, exp, node, server, hash); timingErr == nil {
 		parsedProofUs, parsedVerifyUs = logProofUs, logVerifyUs
-	}
-	if parsedProofUs > 0 {
+		if parsedProofUs > 0 {
+			proofUs = parsedProofUs
+		}
+	} else if parsedProofUs > 0 {
 		proofUs = parsedProofUs
 	}
 	txGenerationUs := rpcWallUs - proofUs - parsedVerifyUs
@@ -1269,6 +1275,9 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 	}
 	expr := "eth.sendTransferTransaction({from:eth.accounts[0],value:" + strconv.Quote(value) + ",rs:'0x01',cmtANew:" + strconv.Quote(proof.CMT) + ",snAOld:" + strconv.Quote(proof.SN) + ",proofA:" + strconv.Quote(proof.Proof) + "})"
 	payerProofUs, payerVerifyUs := orchestrator.ParseProofTimesMicros(out)
+	if logProofUs, logVerifyUs, timingErr := a.orch.RecentProofTimings(ctx, exp, payer, payerServer); timingErr == nil {
+		payerProofUs, payerVerifyUs = logProofUs, logVerifyUs
+	}
 	receiverStarted := time.Now()
 	out, err = a.orch.Attach(ctx, exp, receiver, receiverServer, expr)
 	receiverWallUs := time.Since(receiverStarted).Microseconds()
@@ -1288,8 +1297,8 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		return
 	}
 	receiverProofUs, receiverVerifyUs := orchestrator.ParseProofTimesMicros(out)
-	if _, logVerifyUs, timingErr := a.orch.TransactionTimings(ctx, exp, receiver, receiverServer, hash); timingErr == nil {
-		receiverVerifyUs = logVerifyUs
+	if logProofUs, logVerifyUs, timingErr := a.orch.TransactionTimings(ctx, exp, receiver, receiverServer, hash); timingErr == nil {
+		receiverProofUs, receiverVerifyUs = logProofUs, logVerifyUs
 	}
 	proofUs := payerProofUs + receiverProofUs
 	if proofUs == 0 {
@@ -1698,10 +1707,10 @@ func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 			if verifyUs == 0 {
 				verifyUs = t.VerifyDurationMs * 1000
 			}
-			if proofUs > 0 {
+			if t.Type != "public" && proofUs > 0 {
 				proofsUs = append(proofsUs, proofUs)
 			}
-			if verifyUs > 0 {
+			if t.Type != "public" && verifyUs > 0 {
 				verifiesUs = append(verifiesUs, verifyUs)
 			}
 			if !t.BroadcastAt.IsZero() {

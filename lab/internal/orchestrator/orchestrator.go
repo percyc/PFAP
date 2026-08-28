@@ -201,6 +201,40 @@ func (o Orchestrator) TransactionTimings(ctx context.Context, exp model.Experime
 	return proofUs, verifyUs, nil
 }
 
+func (o Orchestrator) RecentProofTimings(ctx context.Context, exp model.Experiment, node model.Node, server model.Server) (proofUs, verifyUs int64, err error) {
+	base := strings.TrimRight(server.WorkDir, "/")
+	logPath := base + "/experiments/" + exp.ID + "/" + server.ID + "/node" + strconv.Itoa(node.LocalIndex) + "/geth.log"
+	out, err := o.Remote.Run(ctx, server, "tail -n 200 "+shell(logPath)+"\n")
+	if err != nil {
+		return 0, 0, err
+	}
+	proofUs, verifyUs, ok := ExtractRecentProofTimings(out)
+	if !ok {
+		return 0, 0, errors.New("recent proof timing markers not found")
+	}
+	return proofUs, verifyUs, nil
+}
+
+func ExtractRecentProofTimings(logText string) (proofUs, verifyUs int64, ok bool) {
+	lines := strings.Split(logText, "\n")
+	start := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Contains(lines[i], "gen ") && strings.Contains(lines[i], " proof Use Time:") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return 0, 0, false
+	}
+	end := start + 8
+	if end > len(lines) {
+		end = len(lines)
+	}
+	proofUs, verifyUs = ParseProofTimesMicros(strings.Join(lines[start:end], "\n"))
+	return proofUs, verifyUs, proofUs > 0
+}
+
 func ExtractTransactionTimings(logText, hash string) (proofUs, verifyUs int64, ok bool) {
 	lines := strings.Split(logText, "\n")
 	end := -1
