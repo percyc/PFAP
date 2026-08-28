@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="/accounts.css">
 <link rel="stylesheet" href="/workloads.css">
 <link rel="stylesheet" href="/transactions.css">
+<link rel="stylesheet" href="/console.css">
 </head>
 <body>
 <header>
@@ -137,7 +138,7 @@
 </article>
 <div>
 <article>
-<h2>发送预设交易</h2>
+<div class="section-head"><div><h2>发送预设交易</h2><p>常用 PFAP 操作会进入交易队列并持续跟踪结果。</p></div><button id="openConsole" type="button" class="action secondary">节点控制台</button></div>
 <form id="transactionForm">
 <label>运行中的实验<select name="experimentId" id="experimentSelect" required>
 </select>
@@ -194,6 +195,17 @@
 </div>
 </section>
 </main>
+<dialog id="nodeConsole" class="console-dialog">
+<form id="consoleForm" method="dialog">
+<div class="dialog-head"><div><h2>节点控制台</h2><p>偶发调试工具。命令会直接在所选节点的 geth console 中执行。</p></div><button id="closeConsole" type="button" class="icon-button" aria-label="关闭">×</button></div>
+<label>运行中的实验<select name="experimentId" id="consoleExperiment" required></select></label>
+<label>执行节点<select name="nodeId" id="consoleNode" required></select></label>
+<label>JavaScript 表达式<textarea name="command" id="consoleCommand" rows="7" required spellcheck="false" placeholder="eth.blockNumber"></textarea></label>
+<div class="console-examples"><span>示例</span><button type="button" data-command="eth.blockNumber">区块高度</button><button type="button" data-command="net.peerCount">Peer 数</button><button type="button" data-command="eth.getAccountState()">隐私账户状态</button></div>
+<button id="executeConsole" type="submit" class="primary">执行命令</button>
+<section class="console-result" aria-live="polite"><div><span>执行结果</span><small id="consoleMeta"></small></div><pre id="consoleOutput">尚未执行命令</pre></section>
+</form>
+</dialog>
 <div id="toast">
 </div>
 <script src="/app.js">

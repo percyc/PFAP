@@ -1,0 +1,16 @@
+textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:#09120f;color:var(--ink);outline:none;resize:vertical;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+textarea:focus{border-color:var(--green)}
+.action.secondary{background:transparent;color:var(--green);border:1px solid #34745b;margin:0}
+.console-dialog{width:min(720px,calc(100vw - 28px));max-height:calc(100vh - 40px);overflow:auto;color:var(--ink);background:#0d1714;border:1px solid #345247;border-radius:16px;padding:0;box-shadow:0 28px 90px #000b}
+.console-dialog::backdrop{background:#020806c7;backdrop-filter:blur(4px)}
+.console-dialog form{padding:24px}
+.dialog-head,.console-result>div{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}
+.dialog-head h2{margin-bottom:6px}.dialog-head p{margin:0 0 8px;color:var(--muted);font-size:12px}
+.icon-button{border:0;background:transparent;color:var(--muted);font-size:28px;line-height:1;cursor:pointer}
+.console-examples{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:11px}
+.console-examples button{border:1px solid var(--line);border-radius:99px;background:#111f1a;color:var(--ink);padding:6px 9px;cursor:pointer}
+.console-result{border:1px solid var(--line);border-radius:10px;background:#07100d;padding:12px;min-height:135px}
+.console-result span,.console-result small{font-size:11px;color:var(--muted)}
+.console-result pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:10px 0 0;max-height:300px;overflow:auto;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+.console-result.error{border-color:#7a3340}.console-result.error pre{color:#ff9aaa}
+button:disabled{opacity:.55;cursor:wait}#toast{z-index:20}

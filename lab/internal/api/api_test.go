@@ -65,6 +65,26 @@ func TestMetricsAndWorkloadValidation(t *testing.T) {
 	}
 }
 
+func TestConsoleValidation(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	h := New(s).Handler(http.NotFoundHandler())
+	for _, test := range []struct {
+		body string
+		want int
+	}{
+		{`{}`, http.StatusBadRequest},
+		{`{"experimentId":"missing","nodeId":"missing","command":"eth.blockNumber"}`, http.StatusNotFound},
+		{`{"experimentId":"missing","nodeId":"missing","command":"` + strings.Repeat("x", 16*1024+1) + `"}`, http.StatusBadRequest},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/console/execute", strings.NewReader(test.body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != test.want {
+			t.Fatalf("status=%d want=%d body=%s", rec.Code, test.want, rec.Body.String())
+		}
+	}
+}
+
 func TestNextPortBaseAvoidsActiveRange(t *testing.T) {
 	experiments := []model.Experiment{{P2PPortBase: 30000, RPCPortBase: 40000, Nodes: []model.Node{{}, {}}}}
 	if got := nextPortBase(30000, 2, experiments, false); got != 30100 {

@@ -210,6 +210,10 @@ func (a *API) Handler(static http.Handler) http.Handler {
 			a.workloads(w, r)
 			return
 		}
+		if r.URL.Path == "/api/console/execute" {
+			a.executeConsole(w, r)
+			return
+		}
 		if r.URL.Path == "/api/metrics" && r.Method == "GET" {
 			a.metrics(w, r)
 			return
@@ -220,6 +224,76 @@ func (a *API) Handler(static http.Handler) http.Handler {
 		}
 		static.ServeHTTP(w, r)
 	})
+}
+
+func (a *API) executeConsole(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var request struct {
+		ExperimentID string `json:"experimentId"`
+		NodeID       string `json:"nodeId"`
+		Command      string `json:"command"`
+	}
+	if err := decode(r, &request); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	request.Command = strings.TrimSpace(request.Command)
+	if request.ExperimentID == "" || request.NodeID == "" || request.Command == "" {
+		fail(w, http.StatusBadRequest, errors.New("experimentId, nodeId and command are required"))
+		return
+	}
+	if len(request.Command) > 16*1024 {
+		fail(w, http.StatusBadRequest, errors.New("command exceeds 16 KiB limit"))
+		return
+	}
+
+	var exp model.Experiment
+	var node model.Node
+	var server model.Server
+	a.store.View(func(s model.State) {
+		for _, candidate := range s.Experiments {
+			if candidate.ID == request.ExperimentID {
+				exp = candidate
+				for _, candidateNode := range candidate.Nodes {
+					if candidateNode.ID == request.NodeID {
+						node = candidateNode
+					}
+				}
+			}
+		}
+		for _, candidate := range s.Servers {
+			if candidate.ID == node.ServerID {
+				server = candidate
+			}
+		}
+	})
+	if exp.ID == "" || node.ID == "" || server.ID == "" {
+		fail(w, http.StatusNotFound, errors.New("experiment, node or server not found"))
+		return
+	}
+	if exp.Status != "running" || node.Status != "running" {
+		fail(w, http.StatusConflict, errors.New("experiment and node must be running"))
+		return
+	}
+
+	lockAny, _ := a.nodeLocks.LoadOrStore(node.ID, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	output, err := a.orch.Attach(ctx, exp, node, server, request.Command)
+	result := map[string]any{"experimentId": exp.ID, "nodeId": node.ID, "nodeName": node.Name, "output": output, "durationMs": time.Since(started).Milliseconds()}
+	if err != nil {
+		result["error"] = err.Error()
+		jsonOut(w, http.StatusUnprocessableEntity, result)
+		return
+	}
+	jsonOut(w, http.StatusOK, result)
 }
 
 func (a *API) servers(w http.ResponseWriter, r *http.Request) {
