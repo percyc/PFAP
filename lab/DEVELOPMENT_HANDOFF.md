@@ -1,11 +1,5 @@
 # PFAP 开发交接（2026-08-28）
 
-本文用于在新的 Codex 窗口中继续开发，不依赖旧对话上下文。工作目录固定为：
-
-```text
-/home/percy/pfap/PFAP
-```
-
 ## 先读
 
 1. 根目录 [`README.md`](../README.md)：PFAP/geth/libsnark 的构建和 RPC。
