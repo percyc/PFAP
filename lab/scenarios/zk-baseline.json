@@ -1,0 +1,20 @@
+{
+  "name": "zk-baseline",
+  "description": "A conservative round-robin ZK workload for establishing a reproducible baseline.",
+  "setup": [
+    {"type": "createAccount", "target": "all", "maxInflightPerNode": 1},
+    {"type": "mint", "target": "all", "value": "0x100", "maxInflightPerNode": 1}
+  ],
+  "workload": {
+    "type": "transfer",
+    "value": "0x1",
+    "ratePerSecond": 0.1,
+    "durationSeconds": 600,
+    "strategy": "round-robin",
+    "maxInflightPerNode": 1
+  },
+  "assertions": {
+    "minimumSuccessRate": 0.99,
+    "maximumLatencyP95Ms": 120000
+  }
+}

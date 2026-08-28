@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <iostream>
+#include <cstdlib>
 
 #include<sys/time.h>
 
@@ -25,6 +26,12 @@ using namespace libsnark;
 using namespace libff;
 using namespace std;
 
+static std::string prfKeyPath(const char *name)
+{
+    const char *dir = std::getenv("PFAP_PRFKEY_DIR");
+    return std::string(dir && *dir ? dir : "/usr/local/prfKey") + "/" + name;
+}
+
 #include "circuit/gadget.tcc"
 
 int convertFromAscii(uint8_t ch)
@@ -37,6 +44,7 @@ int convertFromAscii(uint8_t ch)
     {
         return ch - 'a' + 10;
     }
+    return 0;
 }
 
 libff::bigint<libff::alt_bn128_r_limbs> libsnarkBigintFromBytes(const uint8_t *_x)
@@ -379,7 +387,7 @@ alt_bn128_pp::init_public_params();
     static r1cs_gg_ppzksnark_proving_key<alt_bn128_pp> cached_pk;
     static bool pk_loaded = false;
     if (!pk_loaded) {
-        cached_pk = deserializeProvingKeyFromFile("/usr/local/prfKey/transferpk.txt");
+        cached_pk = deserializeProvingKeyFromFile(prfKeyPath("transferpk.txt").c_str());
         pk_loaded = true;
     }
 r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
@@ -419,6 +427,7 @@ r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
 
 bool verifyTransferproof(char *data, char *cmtS_string, char *sn_old_string, char *cmtA_string, char *rt_string, uint64_t value_s, uint8_t type_val)
 {
+    (void)value_s;
     uint256 cmtS = uint256S(cmtS_string);
     uint256 sn_old = uint256S(sn_old_string);
     uint256 cmtA = uint256S(cmtA_string);
@@ -430,7 +439,7 @@ bool verifyTransferproof(char *data, char *cmtS_string, char *sn_old_string, cha
     static r1cs_gg_ppzksnark_verification_key<alt_bn128_pp> cached_vk;
     static bool vk_loaded = false;
     if (!vk_loaded) {
-        cached_vk = deserializevkFromFile("/usr/local/prfKey/transfervk.txt");
+        cached_vk = deserializevkFromFile(prfKeyPath("transfervk.txt").c_str());
         vk_loaded = true;
     }
     r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;

@@ -413,7 +413,8 @@ func (s *PrivateAccountAPI) SignTransaction(ctx context.Context, args SendTxArgs
 // safely used to calculate a signature from.
 //
 // The hash is calulcated as
-//   keccak256("\x19Ethereum Signed Message:\n"${message length}${message}).
+//
+//	keccak256("\x19Ethereum Signed Message:\n"${message length}${message}).
 //
 // This gives context to the signed message and prevents signing of transactions.
 func signHash(data []byte) []byte {
@@ -537,16 +538,16 @@ func (s *PublicBlockChainAPI) GetBlockByNumber(ctx context.Context, blockNr rpc.
 	return nil, err
 }
 
-/////////////////////////////////////////////
+// ///////////////////////////////////////////
 // GetBlockByNumber returns the requested block. When blockNr is -1 the chain head is returned. When fullTx is true all
 // transactions in the block are returned in full detail, otherwise only the transaction hash is returned.
-func (s *PublicBlockChainAPI) PrintAllBlockByNumber(ctx context.Context, blockFromNr, blockNr rpc.BlockNumber) (error) {
+func (s *PublicBlockChainAPI) PrintAllBlockByNumber(ctx context.Context, blockFromNr, blockNr rpc.BlockNumber) error {
 	if blockFromNr > blockNr {
 		return errors.New("StartBlock > EncBlock")
 	}
 
 	if blockNr > (rpc.BlockNumber)(s.b.CurrentBlock().NumberU64()) {
-        return errors.New("EndBlock > MaxBlock")
+		return errors.New("EndBlock > MaxBlock")
 	}
 
 	if blockFromNr != 0 {
@@ -554,7 +555,7 @@ func (s *PublicBlockChainAPI) PrintAllBlockByNumber(ctx context.Context, blockFr
 	}
 
 	for i := blockFromNr; i < blockNr; i++ {
-		b, err1 := s.b.BlockByNumber(ctx, i+1) 
+		b, err1 := s.b.BlockByNumber(ctx, i+1)
 		if err1 != nil {
 			return err1
 		}
@@ -563,13 +564,13 @@ func (s *PublicBlockChainAPI) PrintAllBlockByNumber(ctx context.Context, blockFr
 		if err2 != nil {
 			return err2
 		}
-		
+
 		cntPubTx, cntMintTx, cntRedeemTx := countPubTransaction(b), countMintTransaction(b), countRedeemTransaction(b)
 		cntZKTX := cntMintTx + cntRedeemTx
 		allTx := cntPubTx + cntZKTX
 		prop := 0.0
 		if allTx != 0 {
-			prop = (float64)(cntZKTX*1.0/allTx)
+			prop = (float64)(cntZKTX * 1.0 / allTx)
 		}
 
 		context := []interface{}{
@@ -588,7 +589,9 @@ func (s *PublicBlockChainAPI) PrintAllBlockByNumber(ctx context.Context, blockFr
 func countPubTransaction(b *types.Block) int {
 	var cnt int = 0
 	for _, tx := range b.Transactions() {
-		if tx.Code() == types.PublicTx {cnt ++}
+		if tx.Code() == types.PublicTx {
+			cnt++
+		}
 	}
 	return cnt
 }
@@ -596,7 +599,9 @@ func countPubTransaction(b *types.Block) int {
 func countMintTransaction(b *types.Block) int {
 	var cnt int = 0
 	for _, tx := range b.Transactions() {
-		if tx.Code() == types.MintTx {cnt ++}
+		if tx.Code() == types.MintTx {
+			cnt++
+		}
 	}
 	return cnt
 }
@@ -604,10 +609,13 @@ func countMintTransaction(b *types.Block) int {
 func countRedeemTransaction(b *types.Block) int {
 	var cnt int = 0
 	for _, tx := range b.Transactions() {
-		if tx.Code() == types.RedeemTx {cnt ++}
+		if tx.Code() == types.RedeemTx {
+			cnt++
+		}
 	}
 	return cnt
 }
+
 ////////////////////////////////////////////////
 
 // GetBlockByHash returns the requested block. When fullTx is true all transactions in the block are returned in full
@@ -1311,14 +1319,14 @@ func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (c
 	return tx.Hash(), nil
 }
 
-//////////////////////////////
+// ////////////////////////////
 // SendBatchPublicTransaction creates a transaction for the given argument, sign it and submit it to the
 // transaction pool.
-func (s *PublicTransactionPoolAPI) SendBatchPublicTransaction(ctx context.Context, args SendTxArgs, ntxs hexutil.Uint) (error) {
+func (s *PublicTransactionPoolAPI) SendBatchPublicTransaction(ctx context.Context, args SendTxArgs, ntxs hexutil.Uint) error {
 	var err error
 	log.Info("Transactions number", "number", ntxs)
 	var i hexutil.Uint
-	for i = 0; i < ntxs; i ++ {
+	for i = 0; i < ntxs; i++ {
 		//time.Sleep(1 * time.Second)
 		_, err = s.SendPublicTransaction(ctx, args)
 		if err != nil {
@@ -1328,6 +1336,7 @@ func (s *PublicTransactionPoolAPI) SendBatchPublicTransaction(ctx context.Contex
 
 	return err
 }
+
 //////////////////////////////
 
 // SendPublicTransaction creates a transaction for the given argument, sign it and submit it to the
@@ -1366,7 +1375,7 @@ func (s *PublicTransactionPoolAPI) SendPublicTransaction(ctx context.Context, ar
 	}
 
 	//fmt.Println("***** public transaction size: ", signed.Size())
-	
+
 	return submitTransaction(ctx, s.b, signed)
 }
 
@@ -1453,7 +1462,7 @@ func (s *PublicTransactionPoolAPI) SendMintTransaction(ctx context.Context, args
 	// Obtaining SK should be done as follows:
 	// key, err := s.GetKey(ctx, address, passwd)
 	// SK := key.PrivateKey
-	
+
 	SK := zktx.AccountSK
 	if SK == nil {
 		SK_addr := zktx.ZKTxAddress.Hash()
@@ -1481,7 +1490,7 @@ func (s *PublicTransactionPoolAPI) SendMintTransaction(ctx context.Context, args
 	zkProof := zktx.GenMintProof(SN.Value, SN.Random, newSN, newRandom, SN.CMT, SN.SN, newCMT, newValue, SK, CMTSForMerkle, RTcmtBytes)
 	tx.SetRTcmt(RTcmt)
 	tx.SetCMTBlocks(CMTBlockNumbers)
-	
+
 	if string(zkProof[0:10]) == "0000000000" {
 		return common.Hash{}, errors.New("can't generate proof")
 	}
@@ -1517,9 +1526,9 @@ func (s *PublicTransactionPoolAPI) SendMintTransaction(ctx context.Context, args
 		wt.WriteString("\n") //write a line
 		wt.Flush()
 	}
-	
+
 	fmt.Println("***** Create mint transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
-	
+
 	return hash, err
 }
 
@@ -1553,7 +1562,6 @@ func (s *PublicTransactionPoolAPI) GetPubKeyRLP(ctx context.Context, address com
 
 	return common.ToHex(pp), err
 }
-
 
 // SendRedeemTransaction creates a Redeem transaction for the given argument, sign it and submit it to the
 // transaction pool.
@@ -1683,9 +1691,9 @@ func (s *PublicTransactionPoolAPI) SendRedeemTransaction(ctx context.Context, ar
 		wt.WriteString("\n") //write a line
 		wt.Flush()
 	}
-	
+
 	fmt.Println("***** Create redeem transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
-	
+
 	return hash, err
 }
 
@@ -1797,7 +1805,7 @@ func (s *PublicTransactionPoolAPI) SendTransferTransaction(ctx context.Context, 
 
 // sendTransferPayer implements type=0 (payer A) flow: subtracts value_s, generates proof_A
 func (s *PublicTransactionPoolAPI) sendTransferPayer(ctx context.Context, args SendTxArgs) (common.Hash, error) {
-if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
+	if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
 		fmt.Println("SequenceNumber or SequenceNumberAfter nil")
 		return common.Hash{}, nil
 	}
@@ -1932,7 +1940,7 @@ if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
 // sendTransferReceiver implements type=1 (receiver B) flow: payer A's creds already on-chain,
 // B verifies proof_A, generates proof_B, creates tx with both proofs.
 func (s *PublicTransactionPoolAPI) sendTransferReceiver(ctx context.Context, args SendTxArgs, txPayer *types.Transaction) (common.Hash, error) {
-if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
+	if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
 		fmt.Println("SequenceNumber or SequenceNumberAfter nil")
 		return common.Hash{}, nil
 	}
@@ -2017,17 +2025,17 @@ if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
 	newCMTB := zktx.GenCMT(newValueB, newSNb.Bytes(), newRandomB.Bytes())
 
 	// Set both payer's and receiver's data in the tx
-	tx.SetZKCMTS(cmtS)         // cmt_S (shared)
-	tx.SetZKCMT(cmtANew)       // cmt_A_new (payer's new cmt)
-	tx.SetZKCMT2(newCMTB)      // cmt_B_new (receiver's new cmt)
-	tx.SetZKSN(snAold)         // sn_A_old (payer's old sn)
-	tx.SetZKSNS(SNb.SN)        // sn_B_old (receiver's old sn)
-	tx.SetZKProof(proofA)      // proof_A (payer's proof) in Proof2
-	tx.SetZKProof2(nil)        // will be set below
+	tx.SetZKCMTS(cmtS)    // cmt_S (shared)
+	tx.SetZKCMT(cmtANew)  // cmt_A_new (payer's new cmt)
+	tx.SetZKCMT2(newCMTB) // cmt_B_new (receiver's new cmt)
+	tx.SetZKSN(snAold)    // sn_A_old (payer's old sn)
+	tx.SetZKSNS(SNb.SN)   // sn_B_old (receiver's old sn)
+	tx.SetZKProof(proofA) // proof_A (payer's proof) in Proof2
+	tx.SetZKProof2(nil)   // will be set below
 	tx.SetZKValue(valueS)
 	tx.SetRTcmt(rtCmt)
 	tx.SetCMTBlocks(nil)
-	tx.SetZKNounce(1)          // type=1 (receiver)
+	tx.SetZKNounce(1) // type=1 (receiver)
 
 	// Generate proof_B (type=1)
 	rS := zktx.NewRandomHash()
@@ -2240,7 +2248,7 @@ func (s *PublicTransactionPoolAPI) GetAccountState(ctx context.Context) (map[str
 	blockNumber := uint64(0)
 	currentBlock := s.b.CurrentBlock().Number().Uint64()
 	for i := uint64(0); i <= currentBlock && blockNumber == 0; i++ {
-		block, err := s.b.BlockByNumber(ctx, rpc.BlockNumber(currentBlock - i))
+		block, err := s.b.BlockByNumber(ctx, rpc.BlockNumber(currentBlock-i))
 		if err != nil || block == nil {
 			continue
 		}
@@ -2331,6 +2339,12 @@ func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hex
 		Random: zktx.SequenceNumber.Random,
 		Value:  zktx.SequenceNumber.Value,
 	}
+	zktx.SequenceNumberAfterBackup = &zktx.Sequence{
+		SN: zktx.SequenceNumberAfter.SN, CMT: zktx.SequenceNumberAfter.CMT,
+		Random: zktx.SequenceNumberAfter.Random, Value: zktx.SequenceNumberAfter.Value,
+		Valid: zktx.SequenceNumberAfter.Valid,
+	}
+	zktx.StageBackup = zktx.Stage
 
 	// Update local state (payer's node)
 	zktx.SequenceNumber = zktx.SequenceNumberAfter
@@ -2357,11 +2371,14 @@ func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hex
 }
 
 func (s *PublicTransactionPoolAPI) RevertTransferState(ctx context.Context) (string, error) {
-	if zktx.SequenceNumberBackup == nil {
+	if zktx.SequenceNumberBackup == nil || zktx.SequenceNumberAfterBackup == nil {
 		return "", errors.New("no backup state to revert")
 	}
 	zktx.SequenceNumber = zktx.SequenceNumberBackup
+	zktx.SequenceNumberAfter = zktx.SequenceNumberAfterBackup
+	zktx.Stage = zktx.StageBackup
 	zktx.SequenceNumberBackup = nil
+	zktx.SequenceNumberAfterBackup = nil
 
 	SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Stage}
 	SNSBytes, err := rlp.EncodeToBytes(SNS)

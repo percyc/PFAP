@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PFAP Lab</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/accounts.css">
+<link rel="stylesheet" href="/workloads.css">
+<link rel="stylesheet" href="/transactions.css">
+</head>
+<body>
+<header>
+<div>
+<span class="mark">P</span>
+<strong>PFAP Lab</strong>
+<small>多节点隐私交易实验平台</small>
+</div>
+<div><span id="health" class="pill">连接中</span><button id="logout" class="action">退出</button></div>
+</header>
+<main>
+  <section class="hero">
+<div>
+<p class="eyebrow">EXPERIMENT CONTROL PLANE</p>
+<h1>把数小时的多节点实验，变成一次可复现的运行。</h1>
+<p>集中部署 PFAP 节点、编排隐私交易，并实时观察网络与性能。</p>
+</div>
+<div class="summary">
+<div>
+<b id="serverCount">0</b>
+<span>服务器</span>
+</div>
+<div>
+<b id="nodeCount">0</b>
+<span>节点</span>
+</div>
+<div>
+<b id="txCount">0</b>
+<span>交易</span>
+</div>
+</div>
+</section>
+  <nav>
+<button class="active" data-tab="overview">总览</button>
+<button data-tab="servers">服务器</button>
+<button data-tab="experiments">实验</button>
+<button data-tab="transactions">交易</button>
+</nav>
+  <section id="overview" class="tab active">
+<div id="metrics" class="metrics">
+</div>
+<div class="grid">
+<article>
+<h2>实验状态</h2>
+<div id="experimentCards" class="cards empty">尚无实验</div>
+</article>
+<article>
+<h2>实时事件</h2>
+<div id="events" class="events">
+</div>
+</article>
+</div>
+</section>
+  <section id="servers" class="tab">
+<div class="split">
+<article>
+<h2>SSH 服务器</h2>
+<div id="serverRows">
+</div>
+</article>
+<article>
+<h2>添加服务器</h2>
+<form id="serverForm">
+<label>名称<input name="name" required placeholder="worker-hk-1">
+</label>
+<label>主机<input name="host" required placeholder="10.0.0.11">
+</label>
+<label>P2P 公告地址（默认同 SSH 主机）<input name="p2pHost" placeholder="10.0.0.11"></label>
+<div class="pair">
+<label>SSH 用户<input name="user" required value="pfap">
+</label>
+<label>端口<input name="port" type="number" value="22">
+</label>
+</div>
+<label>私钥路径<input name="identityFile" placeholder="/home/user/.ssh/id_ed25519">
+</label>
+<label>远端工作目录<input name="workDir" value="/opt/pfap-lab">
+</label>
+<button type="submit" class="primary">保存服务器</button>
+</form>
+</article>
+</div>
+</section>
+  <section id="experiments" class="tab">
+<div class="split">
+<article>
+<h2>实验列表</h2>
+<div id="experimentRows">
+</div>
+</article>
+<article>
+<h2>新建实验</h2>
+<form id="experimentForm">
+<label>实验名称<input name="name" required placeholder="transfer-baseline">
+</label>
+<label>Runtime 包路径<input name="artifactPath" required value="dist/pfap-runtime.tar.gz">
+</label>
+<div class="pair">
+<label>Network ID<input name="networkId" type="number" value="55661">
+</label>
+<label>每台节点数<input name="count" type="number" min="1" value="1">
+</label>
+</div>
+<div class="pair">
+<label>P2P 起始端口（0 自动）<input name="p2pPortBase" type="number" min="0" max="65535" value="0"></label>
+<label>RPC 起始端口（0 自动）<input name="rpcPortBase" type="number" min="0" max="65535" value="0"></label>
+</div>
+<label>部署服务器（可多选）<select name="serverId" id="serverSelect" multiple size="5" required>
+</select>
+</label>
+<button type="submit" class="primary">创建实验</button>
+</form>
+</article>
+</div>
+</section>
+  <section id="transactions" class="tab">
+<article class="account-workspace" style="margin-bottom:20px">
+<div class="section-head"><div><h2>账户与交易状态</h2><p>跟随下方实验选择显示；交易确认后自动刷新双方账户，也可随时手动查询。</p></div></div>
+<div id="accountCards" class="account-grid"></div>
+<details class="history-details"><summary>查看账户状态变更历史</summary><div id="accountHistory" class="history"></div></details>
+</article>
+<div class="split">
+<article>
+<h2>交易记录</h2>
+<div id="transactionRows">
+</div>
+</article>
+<div>
+<article>
+<h2>发送预设交易</h2>
+<form id="transactionForm">
+<label>运行中的实验<select name="experimentId" id="experimentSelect" required>
+</select>
+</label>
+<label>发送节点<select name="fromNode" id="nodeSelect" required>
+</select>
+</label>
+<div class="pair">
+<label>类型<select name="type">
+<option value="createAccount">CreateAccount</option>
+<option value="mint">Mint</option>
+<option value="transfer">Transfer</option>
+<option value="redeem">Redeem</option>
+<option value="public">Public</option>
+</select>
+</label>
+<label>数值<input name="value" value="0x1">
+</label>
+</div>
+<label>目标节点（Transfer/Public）<select name="toNode" id="toNodeSelect"></select></label>
+<div class="command-preview"><span>实际执行指令</span><pre id="transactionCommand"></pre></div>
+<button type="submit" class="primary">加入交易队列</button>
+</form>
+</article>
+<article class="spaced">
+<h2>自动交易规则</h2>
+<div id="workloadRows"></div>
+<form id="workloadForm">
+<label>实验<select name="experimentId" id="workloadExperiment" required>
+</select>
+</label>
+<div class="pair">
+<label>类型<select name="type">
+<option value="mint">Mint</option>
+<option value="transfer">Transfer</option>
+<option value="redeem">Redeem</option>
+<option value="createAccount">CreateAccount</option>
+<option value="public">Public</option>
+</select>
+</label>
+<label>数值<input name="value" value="0x1">
+</label>
+</div>
+<div class="pair">
+<label>每秒交易数<input name="ratePerSecond" type="number" min="0.01" step="0.01" value="0.1">
+</label>
+<label>持续秒数<input name="durationSeconds" type="number" min="1" value="60">
+</label>
+</div>
+<button type="submit" class="primary">启动 Round-robin 负载</button>
+</form>
+</article>
+</div>
+</div>
+</section>
+</main>
+<div id="toast">
+</div>
+<script src="/app.js">
+</script>
+</body>
+</html>

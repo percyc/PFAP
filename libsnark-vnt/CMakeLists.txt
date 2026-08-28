@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
+add_compile_options(-Wno-deprecated-declarations)
 
 project(libsnark-hdsnark)
 
@@ -34,7 +35,7 @@ option(
 
 option(
   WITH_PROCPS
-  "Use procps for memory profiling"
+  "Use libproc2 for memory profiling"
   ON
 )
 
@@ -76,7 +77,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OPT_FLAGS}")
 
 include(FindPkgConfig)
 if("${WITH_PROCPS}")
-  pkg_check_modules(PROCPS REQUIRED libprocps)
+  pkg_check_modules(PROCPS REQUIRED libproc2)
 else()
   add_definitions(-DNO_PROCPS)
 endif()

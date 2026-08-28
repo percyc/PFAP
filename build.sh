@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+CMAKE_EXTRA_FLAGS="${CMAKE_EXTRA_FLAGS:-}"
+BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
+
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 GETH_SRC="$REPO_ROOT/go-ethereum"
 LIBSNARK_SRC="$REPO_ROOT/libsnark-vnt"
 LIBSNARK_BUILD="$LIBSNARK_SRC/build"
 PRFKEY_DIR="$REPO_ROOT/prfKey"
-GOPATH_BIN="$(go env GOPATH)/bin"
+PFAP_GOPATH="${PFAP_GOPATH:-$REPO_ROOT/.gopath}"
+PFAP_GOCACHE="${PFAP_GOCACHE:-$REPO_ROOT/.gocache}"
+GOPATH_BIN="$PFAP_GOPATH/bin"
+GETH_OUTPUT="${GETH_OUTPUT:-$REPO_ROOT/bin/geth}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -21,7 +27,7 @@ step()  { echo -e "${BLUE}[STEP]${NC} $*"; }
 
 check_go() {
     if ! command -v go &>/dev/null; then
-        error "Go is not installed. Install Go >= 1.10 and add to PATH."
+        error "Go is not installed. Install a current supported Go release and add it to PATH."
     fi
     info "Go: $(go version)"
 }
@@ -31,8 +37,7 @@ check_go() {
 # "github.com/ethereum/go-ethereum/..." but the repo lives under PFAP/.
 ensure_gopath_link() {
     local gopath
-    gopath="$(go env GOPATH)"
-    [ -n "$gopath" ] || error "GOPATH is empty. Set GOPATH or install Go properly."
+    gopath="$PFAP_GOPATH"
 
     local target_dir="$gopath/src/github.com/ethereum"
     local target_link="$target_dir/go-ethereum"
@@ -71,7 +76,7 @@ check_deps() {
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        error "Missing build dependencies: ${missing[*]}\n  sudo apt-get install build-essential cmake git libgmp3-dev libboost-all-dev libssl-dev pkg-config"
+        error "Missing build dependencies: ${missing[*]}\n  sudo apt-get install build-essential cmake git libgmp-dev libboost-all-dev libssl-dev libproc2-dev pkg-config"
     fi
 }
 
@@ -88,10 +93,11 @@ build_libsnark() {
     # Always re-run cmake so CMakeLists.txt changes (added/removed targets)
     # are picked up. A stale cache can silently drop targets like transfer_key.
     info "Running cmake..."
-    cmake ..
+    # shellcheck disable=SC2086
+    cmake ${CMAKE_EXTRA_FLAGS} ..
 
     info "Compiling..."
-    make -j$(nproc)
+    make -j"$BUILD_JOBS"
 
     info "libsnark-vnt build complete."
 }
@@ -117,7 +123,7 @@ generate_keys() {
 
     for pair in "${key_generators[@]}"; do
         local IFS=":"
-        read -r name dir <<< "$pair"
+        read -r name _dir <<< "$pair"
         local key_bin="$LIBSNARK_BUILD/src/${name}_key"
         if [ ! -x "$key_bin" ]; then
             error "Key generator not found: $key_bin"
@@ -136,7 +142,7 @@ generate_keys() {
         [ -f "$f" ] && mv -f "$f" "$PRFKEY_DIR/"
     done
 
-    info "Keys generated: $(ls "$PRFKEY_DIR"/*.txt | wc -l) files"
+    info "Keys generated: $(find "$PRFKEY_DIR" -maxdepth 1 -type f -name '*.txt' | wc -l) files"
 }
 
 # ============================================================
@@ -172,7 +178,7 @@ install_libs() {
     sudo ldconfig
     info "Shared libraries installed to /usr/local/lib/"
 
-    if ! echo "$LD_LIBRARY_PATH" | grep -q "/usr/local/lib"; then
+    if ! echo "${LD_LIBRARY_PATH:-}" | grep -q "/usr/local/lib"; then
         warn "LD_LIBRARY_PATH does not include /usr/local/lib"
         warn "Add this to ~/.bashrc:"
         warn "  export LD_LIBRARY_PATH=/usr/local/lib"
@@ -188,7 +194,7 @@ install_keys() {
 
     sudo rm -rf /usr/local/prfKey
     sudo cp -r "$PRFKEY_DIR" /usr/local/prfKey
-    info "Keys installed to /usr/local/prfKey/ ($(ls /usr/local/prfKey/*.txt | wc -l) files)"
+    info "Keys installed to /usr/local/prfKey/ ($(find /usr/local/prfKey -maxdepth 1 -type f -name '*.txt' | wc -l) files)"
 }
 
 # ============================================================
@@ -206,25 +212,32 @@ build_geth() {
     # of "github.com/ethereum/go-ethereum/cmd/utils", causing duplicate-type
     # errors (e.g. two cli.Context types).
     local geth_build_dir
-    geth_build_dir="$(go env GOPATH)/src/github.com/ethereum/go-ethereum"
+    geth_build_dir="$PFAP_GOPATH/src/github.com/ethereum/go-ethereum"
 
     if command -v go-bindata &>/dev/null || [ -x "$GOPATH_BIN/go-bindata" ]; then
         info "Regenerating JS bindings (bindata)..."
         cd "$geth_build_dir/internal/jsre/deps"
-        go-bindata -nometadata -pkg deps -o bindata.go bignumber.js web3.js
+        GOPATH="$PFAP_GOPATH" GOCACHE="$PFAP_GOCACHE" GO111MODULE=off go-bindata -nometadata -pkg deps -o bindata.go bignumber.js web3.js
     else
         warn "go-bindata not found, skipping JS binding regeneration."
         warn "If web3.js was modified, install go-bindata: go get -u github.com/kevinburke/go-bindata/go-bindata"
     fi
 
     cd "$geth_build_dir"
-    info "Running: go install -v ./cmd/geth  (from $geth_build_dir)"
-    go install -v ./cmd/geth
+    mkdir -p "$(dirname "$GETH_OUTPUT")"
+    info "Running: GO111MODULE=off go build -tags generic -o $GETH_OUTPUT ./cmd/geth"
+    local zk_lib_dir="$LIBSNARK_BUILD/src"
+    local snark_lib_dir="$LIBSNARK_BUILD/depends/libsnark/libsnark"
+    local ff_lib_dir="$LIBSNARK_BUILD/depends/libsnark/depends/libff/libff"
+    [ -d "$zk_lib_dir" ] || error "Native ZK libraries are not built. Run './build.sh libsnark' first."
+    local native_ldflags="-L$zk_lib_dir -L$snark_lib_dir -L$ff_lib_dir -Wl,-rpath,$zk_lib_dir -Wl,-rpath,$snark_lib_dir -Wl,-rpath,$ff_lib_dir"
+    GOPATH="$PFAP_GOPATH" GOCACHE="$PFAP_GOCACHE" CGO_LDFLAGS="$native_ldflags ${CGO_LDFLAGS:-}" \
+        GO111MODULE=off go build -tags generic -o "$GETH_OUTPUT" ./cmd/geth
 
-    if [ ! -f "$GOPATH_BIN/geth" ]; then
-        error "geth not found at $GOPATH_BIN/geth after build."
+    if [ ! -x "$GETH_OUTPUT" ]; then
+        error "geth not found at $GETH_OUTPUT after build."
     fi
-    info "geth installed to $GOPATH_BIN/geth ($(du -h "$GOPATH_BIN/geth" | cut -f1))"
+    info "geth built at $GETH_OUTPUT ($(du -h "$GETH_OUTPUT" | cut -f1))"
 }
 
 # ============================================================
@@ -247,6 +260,23 @@ install_tests() {
     uv sync
     chmod +x "$test_dir/watch_nodes.sh" 2>/dev/null || true
     info "Python test environment ready."
+}
+
+package_runtime() {
+    step "Packaging deployable PFAP runtime..."
+    "$REPO_ROOT/scripts/package-runtime.sh"
+}
+
+build_lab() {
+    step "Building PFAP Lab Web control plane..."
+    check_go
+    local lab_dir="$REPO_ROOT/lab"
+    [ -f "$lab_dir/go.mod" ] || error "PFAP Lab source not found: $lab_dir"
+    mkdir -p "$lab_dir/.cache" "$lab_dir/.gopath" "$REPO_ROOT/bin"
+    cd "$lab_dir"
+    GOCACHE="$lab_dir/.cache" GOPATH="$lab_dir/.gopath" go test ./...
+    GOCACHE="$lab_dir/.cache" GOPATH="$lab_dir/.gopath" go build -o "$REPO_ROOT/bin/pfap-lab" ./cmd/pfap-lab
+    info "PFAP Lab built at $REPO_ROOT/bin/pfap-lab"
 }
 
 # ============================================================
@@ -273,7 +303,7 @@ build_all() {
     echo "  Build Complete!"
     echo "========================================="
     echo ""
-    echo "  geth:          $GOPATH_BIN/geth"
+    echo "  geth:          $GETH_OUTPUT"
     echo "  Shared libs:   /usr/local/lib/libzk_*.so libsnark.so libff.so"
     echo "  Keys:          /usr/local/prfKey/"
     echo "  LD_LIBRARY:    /usr/local/lib"
@@ -281,7 +311,7 @@ build_all() {
     echo "  Quick test:    cd test/pow && uv run quick_test.py"
     echo "  Node monitor:  ./test/pow/watch_nodes.sh"
     echo ""
-    echo "  Add to PATH:   export PATH=\"$GOPATH_BIN:\$PATH\""
+    echo "  Add to PATH:   export PATH=\"$REPO_ROOT/bin:\$PATH\""
     echo ""
 }
 
@@ -296,7 +326,7 @@ build_quick() {
     build_geth
 
     echo ""
-    info "geth updated: $GOPATH_BIN/geth"
+    info "geth updated: $GETH_OUTPUT"
     info "Run './build.sh all' for full setup including libsnark + keys."
     echo ""
 }
@@ -333,9 +363,9 @@ show_status() {
     echo ""
 
     # geth
-    if [ -f "$GOPATH_BIN/geth" ]; then
-        info "geth:         $GOPATH_BIN/geth ($(du -h "$GOPATH_BIN/geth" | cut -f1))"
-        "$GOPATH_BIN/geth" version 2>/dev/null | head -3 | sed 's/^/              /'
+    if [ -f "$GETH_OUTPUT" ]; then
+        info "geth:         $GETH_OUTPUT ($(du -h "$GETH_OUTPUT" | cut -f1))"
+        "$GETH_OUTPUT" version 2>/dev/null | head -3 | sed 's/^/              /'
     else
         warn "geth:         not built"
     fi
@@ -343,13 +373,11 @@ show_status() {
     # libsnark .so
     echo ""
     echo "--- Shared Libraries (/usr/local/lib) ---"
-    local all_found=true
     for name in libzk_smt libzk_createaccount libzk_mint libzk_redeem libzk_transfer libsnark libff; do
         if [ -f "/usr/local/lib/${name}.so" ]; then
             info "  ${name}.so  ($(du -h "/usr/local/lib/${name}.so" | cut -f1))"
         else
             warn "  ${name}.so  MISSING"
-            all_found=false
         fi
     done
 
@@ -373,7 +401,8 @@ show_status() {
     echo ""
     echo "--- Environment ---"
     echo "  Go:      $(go version 2>/dev/null || echo 'not found')"
-    echo "  GOPATH:  $(go env GOPATH 2>/dev/null || echo '?')"
+    echo "  Build GOPATH: $PFAP_GOPATH"
+    echo "  Build cache:  $PFAP_GOCACHE"
     echo "  LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-<not set>}"
 
     # Python
@@ -398,12 +427,14 @@ Build Commands:
   quick          Quick build: geth only (assumes libsnark+keys already installed)
   libsnark       Build libsnark-vnt only
   keys           Generate proving/verification keys only
-  geth           Build geth only (go install -> \$GOPATH/bin)
+  geth           Build geth only (output: ./bin/geth)
+  lab            Build and test the PFAP Lab Web control plane
 
 Install Commands:
   install-libs   Install .so files to /usr/local/lib
   install-keys   Install prfKey to /usr/local/prfKey
   tests          Setup Python test environment (uv sync)
+  bundle         Package geth, libraries, keys and network tooling into dist/
 
 Other:
   clean          Remove build artifacts (libsnark build, geth build)
@@ -424,9 +455,11 @@ case "$CMD" in
     libsnark)      check_deps; build_libsnark ;;
     keys)          generate_keys ;;
     geth)          check_go; build_geth ;;
+    lab)           build_lab ;;
     install-libs)  install_libs ;;
     install-keys)  install_keys ;;
     tests)         install_tests ;;
+    bundle)        package_runtime ;;
     clean)         clean ;;
     status)        show_status ;;
     help|-h|--help) usage ;;

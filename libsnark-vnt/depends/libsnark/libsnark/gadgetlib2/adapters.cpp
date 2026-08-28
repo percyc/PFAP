@@ -19,7 +19,7 @@ typedef GadgetLibAdapter GLA;
 GLA::linear_term_t GLA::convert(const LinearTerm& lt) const {
     const variable_index_t var = lt.variable_.index_;
     const Fp_elem_t coeff = convert(lt.coeff_);
-    return{ var, coeff };
+    return std::make_pair(var, coeff);
 }
 
 GLA::linear_combination_t GLA::convert(const LinearCombination& lc) const {
@@ -29,12 +29,12 @@ GLA::linear_combination_t GLA::convert(const LinearCombination& lc) const {
         sparse_vec.emplace_back(convert(lt));
     }
     const Fp_elem_t offset = convert(lc.constant_);
-    return{ sparse_vec, offset };
+    return std::make_pair(sparse_vec, offset);
 }
 
 GLA::constraint_t GLA::convert(const Constraint& constraint) const {
     const auto rank1_constraint = dynamic_cast<const Rank1Constraint&>(constraint);
-    return constraint_t(convert(rank1_constraint.a()),
+    return std::make_tuple(convert(rank1_constraint.a()),
         convert(rank1_constraint.b()),
         convert(rank1_constraint.c()));
 }
@@ -50,7 +50,7 @@ GLA::constraint_sys_t GLA::convert(const ConstraintSystem& constraint_sys) const
 
 GLA::assignment_t GLA::convert(const VariableAssignment& assignment) const {
     assignment_t retval;
-    for (const auto assignmentPair : assignment) {
+    for (const auto& assignmentPair : assignment) {
         const variable_index_t var = assignmentPair.first.index_;
         const Fp_elem_t elem = convert(assignmentPair.second);
         retval[var] = elem;
@@ -74,7 +74,7 @@ If you are sure you know what you are doing, you can comment out the ASSERT line
 */
 GLA::protoboard_t GLA::convert(const Protoboard& pb) const {
 	//GADGETLIB_ASSERT(pb.numVars()==getNextFreeIndex(), "Some Variables were created and not used, or, more than one protoboard was used.");
-    return protoboard_t(convert(pb.constraintSystem()), convert(pb.assignment()));
+    return std::make_pair(convert(pb.constraintSystem()), convert(pb.assignment()));
 }
 
 GLA::Fp_elem_t GLA::convert(FElem fElem) const {
@@ -88,7 +88,7 @@ bool operator==(const GLA::linear_combination_t& lhs,
     const GLA::linear_term_t& rhs) {
     return lhs.first.size() == 1 &&
         lhs.first.at(0) == rhs &&
-        lhs.second == Fp(0);
+        lhs.second == GLA::Fp_elem_t(0);
 }
 
 }

@@ -45,6 +45,7 @@ knowledge_commitment<T1, T2> kc_multi_exp_with_mixed_addition(const knowledge_co
     size_t num_other = 0;
 
     const size_t scalar_length = std::distance(scalar_start, scalar_end);
+    (void)scalar_length;
 
     while (index_it != vec.indices.end() && *index_it < max_idx)
     {

@@ -14,18 +14,17 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <list>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
 #include <libff/common/default_types/ec_pp.hpp>
 #include <libff/common/profiling.hpp>
 #include <libff/common/utils.hpp>
-
-#ifndef NO_PROCPS
-#include <proc/readproc.h>
-#endif
 
 namespace libff {
 
@@ -332,20 +331,35 @@ void leave_block(const std::string &msg, const bool indent)
 
 void print_mem(const std::string &s)
 {
-#ifndef NO_PROCPS
-    struct proc_t usage;
-    look_up_our_self(&usage);
+    unsigned long vsize_bytes = 0;
+    FILE *status_file = std::fopen("/proc/self/status", "r");
+    if (status_file != nullptr)
+    {
+        char line[512];
+        while (std::fgets(line, sizeof(line), status_file) != nullptr)
+        {
+            if (std::strncmp(line, "VmSize:", 7) != 0) continue;
+            char *cursor = line + 7;
+            while (*cursor == ' ' || *cursor == '\t') ++cursor;
+            vsize_bytes = std::strtoul(cursor, nullptr, 10) * 1024UL;
+            break;
+        }
+        std::fclose(status_file);
+    }
+
+    if (vsize_bytes == 0)
+    {
+        printf("* Memory profiling unavailable%s%s\n", s.empty() ? "" : ": ", s.c_str());
+        return;
+    }
     if (s.empty())
     {
-        printf("* Peak vsize (physical memory+swap) in mebibytes: %lu\n", usage.vsize >> 20);
+        printf("* Virtual memory size in mebibytes: %lu\n", vsize_bytes >> 20);
     }
     else
     {
-        printf("* Peak vsize (physical memory+swap) in mebibytes (%s): %lu\n", s.c_str(), usage.vsize >> 20);
+        printf("* Virtual memory size in mebibytes (%s): %lu\n", s.c_str(), vsize_bytes >> 20);
     }
-#else
-    printf("* Memory profiling not supported in NO_PROCPS mode\n");
-#endif
 }
 
 void print_compilation_info()

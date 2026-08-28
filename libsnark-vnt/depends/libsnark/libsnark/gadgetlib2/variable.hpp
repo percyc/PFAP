@@ -180,6 +180,7 @@ private:
     long contents_;
     explicit FConst(const long n) : contents_(n) {}
 public:
+    FConst(const FConst&) = default;
     virtual FConst& operator=(const long n) {contents_ = n; return *this;}
     virtual FConst& operator=(const FConst& src) {contents_ = src.contents_; return *this;}
     virtual ::std::string asString() const {return GADGETLIB2_FMT("%ld",contents_);}

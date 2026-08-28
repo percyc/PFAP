@@ -1,0 +1,7 @@
+/.cache/
+/.gopath/
+/bin/
+/data/
+/worker/
+/lab.env
+/lab/

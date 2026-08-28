@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
+add_compile_options(-Wno-deprecated-declarations)
 
 project(libfqfft)
 
@@ -18,7 +19,7 @@ option(
 
 option(
   WITH_PROCPS
-  "Use procps for memory profiling"
+  "Use libproc2 for memory profiling"
   ON
 )
 
@@ -93,7 +94,7 @@ if("${WITH_PROCPS}")
     PROCPS
     REQUIRED
 
-    libprocps
+    libproc2
   )
 else()
   add_definitions(

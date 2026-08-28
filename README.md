@@ -1,5 +1,12 @@
 # PFAP
 
+## PFAP Lab
+
+The repository includes a Web control plane for repeatable multi-server
+experiments. It deploys the runtime bundle over SSH, runs multiple nodes per
+host, orchestrates preset PFAP transactions, streams events, and stores results.
+See [`lab/README.md`](lab/README.md) for setup and API documentation.
+
 PFAP is an anonymous payment scheme built on Ethereum and a geth fork. It provides four privacy-preserving transaction circuits — **CreateAccount**, **Mint**, **Redeem**, and **Transfer** — where account balances are hidden inside commitments and secretly spending is authorized with zk-SNARK proofs.
 
 Existence of a spent commitment `cmt_old` is proven against a single **global depth-256 sparse Poseidon Merkle tree (the state Merkle tree)**, shared by Mint / Redeem / Transfer. Inside the circuit the leaf is `path = Poseidon(cmt_old)` and all tree nodes use Poseidon, while the commitment `cmt` itself is computed with SHA-256. The membership witness (path + 256 siblings + root `rt_cmt`) is generated on the C++ side from the global tree.
@@ -10,11 +17,18 @@ Existence of a spent commitment `cmt_old` is proven against a single **global de
 PFAP/
 ├── go-ethereum/    geth fork (based on 040dd5bd) with ZK tx types and RPCs
 ├── libsnark-vnt/   libsnark gadgets: createAccount / mint / redeem / transfer
+├── lab/            Web control plane for multi-server deployment and experiments
 ├── prfKey/         generated (pk, vk) files (produced after build)
 ├── test/
 │   ├── pow/        PoW test environment (includes Transfer walkthrough)
+├── scripts/        runtime packaging and deployment helpers
 └── build.sh        one-shot build/install script
 ```
+
+To continue development in a new Codex window, open this repository as the
+workspace and start with [`lab/DEVELOPMENT_HANDOFF.md`](lab/DEVELOPMENT_HANDOFF.md).
+It records the current running environment, verification commands, code map,
+known limitations, and recommended next work.
 
 ## Circuits and transaction types
 
@@ -29,23 +43,24 @@ PFAP/
 
 ## 1. Prerequisites
 
-> ⚠️ **Tested environment**: Ubuntu **18.04.1 LTS** (x86_64) + Go **1.10.8**.
-> Other Ubuntu versions or Go versions are **not** verified and may fail to build (libsnark in particular is sensitive to compiler / boost / OpenSSL versions). Use a matching environment if possible.
+The build is prepared for current Linux toolchains. The historic geth fork
+still uses its vendored GOPATH layout internally; `build.sh` creates that link
+automatically and selects the portable Go BN256 implementation. The intended
+baseline is Go 1.20+, CMake 3.10+, and a C++11-capable GCC or Clang.
 
 ```bash
 sudo apt-get install build-essential cmake git \
-    libgmp3-dev libprocps-dev libboost-all-dev libssl-dev pkg-config
+    libgmp-dev libproc2-dev libboost-all-dev libssl-dev pkg-config
 ```
 
-- Go **1.10.x** (tested with 1.10.8)
+- A current Go release
 - Optional: [`uv`](https://github.com/astral-sh/uv) for the multi-node Python test scripts
 
-Make sure `GOPATH` and `LD_LIBRARY_PATH` are exported:
+After the full build, expose the local geth binary and installed libraries:
 
 ```bash
-export PATH=$(go env GOPATH)/bin:$PATH
+export PATH="$PWD/bin:$PATH"
 export LD_LIBRARY_PATH=/usr/local/lib
-export GOPATH=$(go env GOPATH)
 ```
 
 ## 2. Build
@@ -53,9 +68,8 @@ export GOPATH=$(go env GOPATH)
 ### 2.1 One-shot build (recommended)
 
 ```bash
-mkdir -p  $GOPATH/src/github.com/
-git clone https://github.com/percyc/PFAP.git $GOPATH/src/github.com/PFAP
-cd $GOPATH/src/github.com/PFAP
+git clone https://github.com/percyc/PFAP.git
+cd PFAP
 ./build.sh all
 ```
 
@@ -65,7 +79,7 @@ cd $GOPATH/src/github.com/PFAP
 2. Run `createaccount_key / mint_key / redeem_key / transfer_key` to produce (pk, vk).
 3. Copy the 8 generated `*.txt` keys into `/usr/local/prfKey/`.
 4. Install `libzk_*.so`, `libsnark.so`, `libff.so` into `/usr/local/lib/` and run `ldconfig`.
-5. `go install ./cmd/geth` → outputs to `$GOPATH/bin/geth`.
+5. Build geth from vendored dependencies → outputs to `./bin/geth`.
 6. If `uv` is installed, initialize the Python test environment.
 
 ### 2.2 Sub-commands
@@ -76,10 +90,17 @@ cd $GOPATH/src/github.com/PFAP
 ./build.sh keys          # Regenerate (pk, vk) only
 ./build.sh install-libs  # Install .so files to /usr/local/lib only
 ./build.sh install-keys  # Install prfKey to /usr/local/prfKey only
-./build.sh geth          # go install geth only
+./build.sh geth          # Build geth into ./bin/geth
+./build.sh bundle        # Package a deployable runtime into ./dist
 ./build.sh status        # Show current build/install status
 ./build.sh clean         # Clean build artifacts (system-installed files kept)
 ./build.sh help          # Full help
+```
+
+Build concurrency and CMake options are configurable:
+
+```bash
+BUILD_JOBS=8 CMAKE_EXTRA_FLAGS='-DWITH_PROCPS=OFF' ./build.sh libsnark
 ```
 
 > ⚠️ All geth nodes on the same network MUST share the **same** `prfKey`; otherwise proof verification will fail.
@@ -101,6 +122,22 @@ Note: any change to circuit structure invalidates (pk, vk); all nodes must be re
 ![Build](docs/images/Build.gif)
 
 ## 3. Running nodes
+
+For repeatable local multi-node tests, use the lifecycle manager instead of
+creating datadirs and peers manually:
+
+```bash
+cd test/pow
+cp network.env.example network.env
+GETH_BIN=../../bin/geth ./network.sh start
+./network.sh status
+./network.sh attach 1
+./network.sh stop
+```
+
+It supports configurable node counts and ports and keeps generated state under
+`test/pow/.network/`. See [test/pow/README.md](test/pow/README.md) for runtime
+bundles and multi-machine deployment.
 
 Using `test/pow` as the example. The
 `signerX/` directories only ship with `passwd.txt`; you must create a fresh

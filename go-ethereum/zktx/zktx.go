@@ -73,6 +73,8 @@ var ZKTxAddress = common.HexToAddress("ffffffffffffffffffffffffffffffffffffffff"
 var SequenceNumber = InitializeSN()                //--zy
 var SequenceNumberAfter *Sequence = InitializeSN() //--zy
 var SequenceNumberBackup *Sequence = nil           //--zy (saved before getPayerNextState modifies state)
+var SequenceNumberAfterBackup *Sequence = nil      // exact second half of the pre-transfer state
+var StageBackup uint8
 var SNS *Sequence = nil
 
 var ZKCMTNODES = 32 // max is 32  because of merkle leaves in libnsark is 32
@@ -176,7 +178,7 @@ func VerifyDepositSIG(x *big.Int, y *big.Int, sig []byte) error {
 	return nil
 }
 
-//GenCMT生成CMT 调用c的sha256函数  （go的sha256函数与c有一些区别）
+// GenCMT生成CMT 调用c的sha256函数  （go的sha256函数与c有一些区别）
 func GenCMT(value uint64, sn []byte, r []byte) *common.Hash {
 	//sn_old_c := C.CString(common.ToHex(SNold[:]))
 	value_c := C.ulong(value)
@@ -195,7 +197,7 @@ func GenCMT(value uint64, sn []byte, r []byte) *common.Hash {
 	return &reshash
 }
 
-//ComputePRF生成sn 调用c的sha256函数  （go的sha256函数与c有一些区别）
+// ComputePRF生成sn 调用c的sha256函数  （go的sha256函数与c有一些区别）
 func ComputePRF(sk []byte, r []byte) *common.Hash {
 	addr_string := common.ToHex(sk[:])
 	addr_c := C.CString(addr_string)
@@ -213,7 +215,7 @@ func ComputePRF(sk []byte, r []byte) *common.Hash {
 	return &reshash
 }
 
-//GenRT 返回merkel树的hash  --zy
+// GenRT 返回merkel树的hash  --zy
 func GenRT(CMTSForMerkle []*common.Hash) common.Hash {
 	var cmtArray string
 	for i := 0; i < len(CMTSForMerkle); i++ {
@@ -276,8 +278,8 @@ func Decrypt(pub *ecdsa.PublicKey, ct []byte) ([]byte, error) {
 type AUX struct {
 	Value uint64
 	//SNs   *common.Hash
-	Rs    *common.Hash
-	SNa   *common.Hash
+	Rs  *common.Hash
+	SNa *common.Hash
 }
 
 type AUXTransfer struct {

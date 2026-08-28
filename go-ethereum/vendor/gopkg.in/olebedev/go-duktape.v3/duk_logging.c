@@ -135,7 +135,7 @@ static duk_ret_t duk__logger_prototype_log_shared(duk_context *ctx) {
 	duk_size_t arg_len;
 	duk_uint8_t *buf, *p;
 	const duk_uint8_t *q;
-	duk_uint8_t date_buf[32];  /* maximum format length is 24+1 (NUL), round up. */
+	duk_uint8_t date_buf[96];  /* Leave room for abnormal platform date values. */
 	duk_size_t date_len;
 	duk_small_int_t rc;
 
@@ -181,7 +181,7 @@ static duk_ret_t duk__logger_prototype_log_shared(duk_context *ctx) {
 
 	now = duk_get_now(ctx);
 	duk_time_to_components(ctx, now, &comp);
-	sprintf((char *) date_buf, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+	snprintf((char *) date_buf, sizeof(date_buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
 	        (int) comp.year, (int) comp.month + 1, (int) comp.day,
 	        (int) comp.hours, (int) comp.minutes, (int) comp.seconds,
 	        (int) comp.milliseconds);

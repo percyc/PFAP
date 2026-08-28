@@ -1,0 +1,21 @@
+[Unit]
+Description=PFAP Lab experiment control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pfap
+Group=pfap
+WorkingDirectory=/opt/pfap-lab
+ExecStart=/opt/pfap-lab/bin/pfap-lab -listen 127.0.0.1:8090 -data /opt/pfap-lab/data/lab.json -password-file /opt/pfap-lab/data/password
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/pfap-lab/data
+
+[Install]
+WantedBy=multi-user.target

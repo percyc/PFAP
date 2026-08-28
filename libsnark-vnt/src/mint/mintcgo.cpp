@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <iostream>
+#include <cstdlib>
 
 #include<sys/time.h>
 
@@ -24,6 +25,12 @@
 using namespace libsnark;
 using namespace libff;
 using namespace std;
+
+static std::string prfKeyPath(const char *name)
+{
+    const char *dir = std::getenv("PFAP_PRFKEY_DIR");
+    return std::string(dir && *dir ? dir : "/usr/local/prfKey") + "/" + name;
+}
 
 #include "circuit/gadget.tcc"
 
@@ -60,6 +67,7 @@ int convertFromAscii(uint8_t ch)
     {
         return ch - 'a' + 10;
     }
+    return 0;
 }
 
 libff::bigint<libff::alt_bn128_r_limbs> libsnarkBigintFromBytes(const uint8_t *_x)
@@ -361,7 +369,7 @@ char *genMintproof(uint64_t value,
     static r1cs_gg_ppzksnark_proving_key<alt_bn128_pp> cached_pk;
     static bool pk_loaded = false;
     if (!pk_loaded) {
-        cached_pk = deserializeProvingKeyFromFile("/usr/local/prfKey/mintpk.txt");
+        cached_pk = deserializeProvingKeyFromFile(prfKeyPath("mintpk.txt").c_str());
         pk_loaded = true;
     }
     r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
@@ -398,7 +406,7 @@ bool verifyMintproof(char *data, char *sn_old_string, char *rt_string, char *cmt
     static r1cs_gg_ppzksnark_verification_key<alt_bn128_pp> cached_vk;
     static bool vk_loaded = false;
     if (!vk_loaded) {
-        cached_vk = deserializevkFromFile("/usr/local/prfKey/mintvk.txt");
+        cached_vk = deserializevkFromFile(prfKeyPath("mintvk.txt").c_str());
         vk_loaded = true;
     }
 r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;

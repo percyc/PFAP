@@ -7,25 +7,28 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
-	"unsafe"
 )
 
-// Scan traverses all objects reachable from v and counts how much memory
-// is used per type. The value must be a non-nil pointer to any value.
+// Scan returns a conservative shallow size for v.
+//
+// Older versions of this package stopped the Go runtime through unsupported
+// go:linkname hooks. Those hooks no longer exist in current Go releases and
+// were only used by geth's optional debug HTTP page. Keeping the endpoint with
+// a shallow, race-free result is preferable to tying the node to runtime
+// internals.
 func Scan(v interface{}) Sizes {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		panic("value to scan must be non-nil pointer")
 	}
-
-	stopTheWorld("memsize scan")
-	defer startTheWorld()
-
-	ctx := newContext()
-	ctx.scan(invalidAddr, rv, false)
-	ctx.s.BitmapSize = ctx.seen.size()
-	ctx.s.BitmapUtilization = ctx.seen.utilization()
-	return *ctx.s
+	typ := rv.Elem().Type()
+	size := typ.Size()
+	return Sizes{
+		Total: size,
+		ByType: map[reflect.Type]*TypeSize{
+			typ: {Total: size, Count: 1},
+		},
+	}
 }
 
 // Sizes is the result of a scan.
@@ -158,18 +161,7 @@ func (c *context) scanContent(addr address, v reflect.Value) uintptr {
 
 func (c *context) scanChan(v reflect.Value) uintptr {
 	etyp := v.Type().Elem()
-	extra := uintptr(0)
-	if c.tc.needScan(etyp) {
-		// Scan the channel buffer. This is unsafe but doesn't race because
-		// the world is stopped during scan.
-		hchan := unsafe.Pointer(v.Pointer())
-		for i := uint(0); i < uint(v.Cap()); i++ {
-			addr := chanbuf(hchan, i)
-			elem := reflect.NewAt(etyp, addr).Elem()
-			extra += c.scanContent(address(addr), elem)
-		}
-	}
-	return uintptr(v.Cap())*etyp.Size() + extra
+	return uintptr(v.Cap()) * etyp.Size()
 }
 
 func (c *context) scanStruct(base address, v reflect.Value) uintptr {

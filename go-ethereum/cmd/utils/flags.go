@@ -683,7 +683,15 @@ func setBootstrapNodesV5(ctx *cli.Context, cfg *p2p.Config) {
 // line flags.
 func setListenAddress(ctx *cli.Context, cfg *p2p.Config) {
 	if ctx.GlobalIsSet(ListenPortFlag.Name) {
-		cfg.ListenAddr = fmt.Sprintf(":%d", ctx.GlobalInt(ListenPortFlag.Name))
+		port := ctx.GlobalInt(ListenPortFlag.Name)
+		if port < 0 {
+			// A negative port explicitly disables the TCP listener. This is
+			// useful for isolated single-node transaction tests where only IPC
+			// is required (for example in a restricted CI sandbox).
+			cfg.ListenAddr = ""
+			return
+		}
+		cfg.ListenAddr = fmt.Sprintf(":%d", port)
 	}
 }
 
