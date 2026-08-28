@@ -27,4 +27,15 @@ func TestEmbeddedWebAssets(t *testing.T) {
 			t.Fatalf("missing console preset %s", command)
 		}
 	}
+	js, _ := web.ReadFile("web/app.js")
+	for _, marker := range []string{"experimentSummary", "experimentDetail", "showExperiment", "newestFirst", "transactionExperimentId"} {
+		if !strings.Contains(string(js), marker) {
+			t.Fatalf("missing experiment UI behavior %s", marker)
+		}
+	}
+	for _, className := range []string{"transaction-context", "transaction-primary", "transaction-secondary"} {
+		if !strings.Contains(html, `class="`+className+`"`) {
+			t.Fatalf("missing transaction layout %s", className)
+		}
+	}
 }

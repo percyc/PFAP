@@ -54,7 +54,7 @@
 <div class="grid">
 <article>
 <h2>实验状态</h2>
-<div id="experimentCards" class="cards empty">尚无实验</div>
+<div id="experimentCards" class="cards">尚无实验</div>
 </article>
 <article>
 <h2>实时事件</h2>
@@ -126,18 +126,11 @@
 </div>
 </section>
   <section id="transactions" class="tab">
-<article class="account-workspace" style="margin-bottom:20px">
-<div class="section-head"><div><h2>实验交易工作区</h2><p>账户、交易记录和自动规则统一跟随当前实验。</p></div><select id="experimentSelect" aria-label="选择交易工作区实验"></select></div>
-<div id="accountCards" class="account-grid"></div>
-<details class="history-details"><summary>查看账户状态变更历史</summary><div id="accountHistory" class="history"></div></details>
-</article>
-<div class="split">
-<article>
-<div class="section-head"><div><h2>交易记录</h2><p id="transactionScope">仅显示当前所选实验</p></div></div>
-<div id="transactionRows">
+<div class="transaction-context">
+<div><b>实验交易工作区</b><span id="transactionContextHint">选择实验后查看账户、交易和负载</span></div>
+<select id="experimentSelect" aria-label="选择交易工作区实验"></select>
 </div>
-</article>
-<div>
+<div class="transaction-primary">
 <article>
 <div class="section-head"><div><h2>发送预设交易</h2><p>常用 PFAP 操作会进入交易队列并持续跟踪结果。</p></div><button id="openConsole" type="button" class="action secondary">节点控制台</button></div>
 <form id="transactionForm">
@@ -162,7 +155,18 @@
 <button id="queueTransaction" type="submit" class="primary">加入交易队列</button>
 </form>
 </article>
-<article class="spaced">
+<article class="account-workspace">
+<div class="section-head"><div><h2>节点账户状态</h2><p>交易确认后自动刷新，也可手动查询。</p></div></div>
+<div id="accountCards" class="account-grid"></div>
+<details class="history-details"><summary>查看账户状态变更历史</summary><div id="accountHistory" class="history"></div></details>
+</article>
+</div>
+<div class="transaction-secondary">
+<article class="transaction-history">
+<div class="section-head"><div><h2>交易记录</h2><p id="transactionScope">仅显示当前所选实验</p></div></div>
+<div id="transactionRows"></div>
+</article>
+<article class="workload-panel">
 <h2>自动交易规则</h2>
 <div id="workloadRows"></div>
 <form id="workloadForm">
@@ -188,7 +192,6 @@
 <button id="startWorkload" type="submit" class="primary">启动 Round-robin 负载</button>
 </form>
 </article>
-</div>
 </div>
 </section>
 </main>
