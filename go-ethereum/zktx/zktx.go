@@ -48,7 +48,7 @@ type WriteSn struct {
 type SequenceS struct {
 	Suquence1 Sequence
 	Suquence2 Sequence
-	SNS       *Sequence
+	SNS       *Sequence `rlp:"nil"`
 	PKBX      *big.Int
 	PKBY      *big.Int
 	Stage     uint8
@@ -252,6 +252,22 @@ func GetSMTRoot() common.Hash {
 // ResetSMT clears the global state Merkle tree (fresh chain / tests).
 func ResetSMT() {
 	C.smtReset()
+}
+
+// ContainsCMT checks the process-local tree without exposing a membership path
+// or secret state through RPC. The native proof buffer must use smtFree.
+func ContainsCMT(cmt *common.Hash) bool {
+	if cmt == nil {
+		return false
+	}
+	encoded := C.CString(cmt.Hex())
+	defer C.free(unsafe.Pointer(encoded))
+	proof := C.smtProve(encoded)
+	if proof == nil {
+		return false
+	}
+	defer C.smtFree(proof)
+	return *proof == C.char('1')
 }
 
 func ComputeR(sk *big.Int) *ecdsa.PublicKey {

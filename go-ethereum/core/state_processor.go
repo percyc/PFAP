@@ -162,18 +162,8 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 	// Update the global Poseidon state Merkle tree with the new commitment(s)
 	// produced by this ZK transaction, setting their leaves (path=Poseidon(cmt))
 	// to 1. This keeps every node's SMT in sync as blocks are processed.
-	switch tx.TxCode() {
-	case types.MintTx, types.RedeemTx, types.CreateAccountTx:
-		if tx.ZKCMT() != nil {
-			zktx.InsertCMT(tx.ZKCMT())
-		}
-	case types.TransferTx:
-		if tx.ZKCMT() != nil {
-			zktx.InsertCMT(tx.ZKCMT())
-		}
-		if tx.ZKProof2() != nil && len(tx.ZKProof2()) > 0 && tx.ZKCMT2() != nil {
-			zktx.InsertCMT(tx.ZKCMT2())
-		}
+	for _, commitment := range transactionCommitments(tx) {
+		zktx.InsertCMT(commitment)
 	}
 
 	// Apply the transaction to the current state (included in the env)

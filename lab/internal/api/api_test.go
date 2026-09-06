@@ -1,12 +1,14 @@
 package api
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pfap/lab/internal/model"
 	"github.com/pfap/lab/internal/store"
@@ -46,6 +48,117 @@ func TestRejectsInvalidServer(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d", rec.Code)
 	}
+}
+
+func TestBatchEditAndDeleteServers(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	h := New(s).Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/batch", strings.NewReader(`{"hosts":["10.0.0.11","10.0.0.12"],"namePrefix":"worker","user":"pfap","port":22,"workDir":"/opt/pfap"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("batch status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var servers []model.Server
+	s.View(func(state model.State) { servers = state.Servers })
+	if len(servers) != 2 || servers[0].Name != "worker-01" || servers[1].P2PHost != "10.0.0.12" {
+		t.Fatalf("servers=%+v", servers)
+	}
+	req = httptest.NewRequest(http.MethodPut, "/api/servers/"+servers[0].ID, strings.NewReader(`{"name":"renamed","host":"10.0.0.21","user":"pfap","port":2222,"workDir":"/srv/pfap"}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"name":"renamed"`) {
+		t.Fatalf("edit status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/servers/batch/delete", strings.NewReader(fmt.Sprintf(`{"ids":[%q,%q]}`, servers[0].ID, servers[1].ID)))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"deleted":2`) {
+		t.Fatalf("delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	s.View(func(state model.State) {
+		if len(state.Servers) != 0 {
+			t.Fatalf("servers remain after batch delete: %+v", state.Servers)
+		}
+	})
+}
+
+func TestBatchDeleteServersIsAtomicWhenOneIsLocked(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	_ = s.Update(func(state *model.State) error {
+		state.Servers = []model.Server{{ID: "srv-free", Name: "free"}, {ID: "srv-locked", Name: "locked"}}
+		state.Experiments = []model.Experiment{{ID: "exp", Name: "draft", Status: "draft", Placements: []model.Placement{{ServerID: "srv-locked", Count: 1}}}}
+		return nil
+	})
+	h := New(s).Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/batch/delete", strings.NewReader(`{"ids":["srv-free","srv-locked"]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	s.View(func(state model.State) {
+		if len(state.Servers) != 2 {
+			t.Fatalf("batch delete was partial: %+v", state.Servers)
+		}
+	})
+}
+
+func TestBatchTrustRejectsLocalServer(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	_ = s.Update(func(state *model.State) error {
+		state.Servers = []model.Server{{ID: "srv-local", Name: "controller", Host: "local"}}
+		return nil
+	})
+	h := New(s).Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/batch/trust-host-keys", strings.NewReader(`{"ids":["srv-local"]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestServerMutationBlockedByActiveExperiment(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	_ = s.Update(func(state *model.State) error {
+		state.Servers = []model.Server{{ID: "srv-active", Name: "worker", Host: "10.0.0.1", Port: 22, User: "pfap", WorkDir: "/opt/pfap"}}
+		state.Experiments = []model.Experiment{{ID: "exp", Name: "active", Status: "running", Placements: []model.Placement{{ServerID: "srv-active", Count: 1}}}}
+		return nil
+	})
+	h := New(s).Handler(http.NotFoundHandler())
+	for _, test := range []struct{ method, body string }{
+		{http.MethodPut, `{"name":"worker","host":"10.0.0.2","user":"pfap","port":22,"workDir":"/opt/pfap"}`},
+		{http.MethodDelete, ""},
+	} {
+		req := httptest.NewRequest(test.method, "/api/servers/srv-active", strings.NewReader(test.body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s status=%d body=%s", test.method, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestDeleteServerReferencedOnlyByHistoricalExperiment(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	_ = s.Update(func(state *model.State) error {
+		state.Servers = []model.Server{{ID: "srv-old", Name: "old", Host: "10.0.0.1", Port: 22, User: "pfap", WorkDir: "/opt/pfap"}}
+		state.Experiments = []model.Experiment{{ID: "exp-old", Name: "history", Status: "stopped", Placements: []model.Placement{{ServerID: "srv-old", Count: 1}}}}
+		return nil
+	})
+	h := New(s).Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodDelete, "/api/servers/srv-old", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	s.View(func(state model.State) {
+		if len(state.Servers) != 0 || len(state.Experiments) != 1 {
+			t.Fatalf("unexpected state: %+v", state)
+		}
+	})
 }
 
 func TestMetricsAndWorkloadValidation(t *testing.T) {
@@ -162,6 +275,82 @@ func TestTransactionNodesBusy(t *testing.T) {
 	txs := []model.Transaction{{FromNode: "a", ToNode: "b", Status: "submitted"}, {FromNode: "c", Status: "confirmed"}}
 	if !transactionNodesBusy(txs, "a", "") || !transactionNodesBusy(txs, "b", "d") || transactionNodesBusy(txs, "c", "d") {
 		t.Fatal("active node detection is incorrect")
+	}
+}
+
+func TestInitializeAccountsQueuesOnlyEligibleNodes(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	_ = s.Update(func(state *model.State) error {
+		state.Experiments = []model.Experiment{{
+			ID: "exp-init", Status: "running", Nodes: []model.Node{
+				{ID: "ready", Status: "running", LastTxBlock: "0x1"},
+				{ID: "busy", Status: "running"},
+				{ID: "offline", Status: "unreachable"},
+				{ID: "eligible", Status: "running"},
+			},
+		}}
+		state.Transactions = []model.Transaction{{ID: "active", ExperimentID: "exp-init", Type: "mint", FromNode: "busy", Status: "submitted"}}
+		return nil
+	})
+	h := New(s).Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodPost, "/api/experiments/exp-init/initialize-accounts", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"queued":1`) || !strings.Contains(rec.Body.String(), `"alreadyInitialized":1`) || !strings.Contains(rec.Body.String(), `"busy":1`) || !strings.Contains(rec.Body.String(), `"unavailable":1`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	s.View(func(state model.State) {
+		if len(state.Transactions) != 2 {
+			t.Fatalf("transactions=%+v", state.Transactions)
+		}
+		created := state.Transactions[1]
+		if created.Type != "createAccount" || created.FromNode != "eligible" || created.BatchID == "" {
+			t.Fatalf("created transaction=%+v", created)
+		}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		terminal := false
+		s.View(func(state model.State) {
+			for _, tx := range state.Transactions {
+				if tx.FromNode == "eligible" {
+					terminal = !activeTransaction(tx.Status)
+				}
+			}
+		})
+		if terminal {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("queued initialization transaction did not finish in test")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCreateAccountCannotBeRepeated(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	_ = s.Update(func(state *model.State) error {
+		state.Experiments = []model.Experiment{{ID: "exp", Status: "running", Nodes: []model.Node{{ID: "node", Status: "running", LastTxBlock: "0x2"}}}}
+		return nil
+	})
+	h := New(s).Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodPost, "/api/transactions", strings.NewReader(`{"experimentId":"exp","type":"createAccount","fromNode":"node"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateAccountIsNotARepeatingWorkload(t *testing.T) {
+	s, _ := store.Open(filepath.Join(t.TempDir(), "lab.json"))
+	h := New(s).Handler(http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodPost, "/api/workloads", strings.NewReader(`{"experimentId":"exp","type":"createAccount","ratePerSecond":1,"durationSeconds":1}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

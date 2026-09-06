@@ -60,6 +60,18 @@ is_running() {
     [[ "$cmdline" == *"--datadir $expected_dir"* ]]
 }
 
+wait_for_process() {
+    local node="$1" attempt
+    # nohup/setsid may still be replacing itself with geth when the parent
+    # shell receives $!. Do not let the readiness probe mistake that short
+    # exec transition for a node crash.
+    for ((attempt=1; attempt<=40; attempt++)); do
+        is_running "$node" && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
 datadir_locked() {
     local dir
     dir="$(node_dir "$1")"
@@ -148,6 +160,7 @@ start_network() {
             </dev/null >>"$dir/geth.log" 2>&1 &
         pid=$!
         printf '%s\n' "$pid" >"$(pid_file "$node")"
+        wait_for_process "$node" || die "Node $node failed to enter the running state; see $dir/geth.log"
     done
 
     wait_for_ipc

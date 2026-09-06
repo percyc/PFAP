@@ -78,6 +78,8 @@ docker run --rm -v "$PWD/dist:/dist:ro" pfap-runtime-builder:ubuntu22 \
 
 同一网络的所有节点必须使用完全相同的 runtime SHA 和 `prfKey`。
 
+维护中的兼容性恢复补丁是例外：必须保持电路和 pk/vk 完全一致，不改变共识规则。实验的原 `artifactSha` 不覆盖；`recoveryArtifactSha` 记录已预置的恢复包，节点只有实际重启后才记录新的 `runtimeSha`。健康进程不因配置恢复包而重启，报告会保留这些版本信息。不要用这个机制混用不同电路或重新生成的密钥。
+
 ## 服务器与部署
 
 ### 本机 worker
@@ -97,7 +99,7 @@ docker run --rm -v "$PWD/dist:/dist:ro" pfap-runtime-builder:ubuntu22 \
 - 专用非特权用户和可写工作目录；
 - 已加入 `known_hosts` 的主机密钥；
 - 非交互式密钥认证；
-- `bash`、`tar`、`sha256sum`、`setsid`、`ss`；
+- `bash`、`tar`、`sha256sum`、`setsid`、`ss`；单节点恢复还需要 `timeout`、`flock`，建议安装 `fuser`（未安装时使用 `/proc` 检查目录占用）；
 - 实验前完成时钟同步；
 - 防火墙允许实验使用的 P2P 端口。
 
@@ -109,7 +111,7 @@ docker run --rm -v "$PWD/dist:/dist:ro" pfap-runtime-builder:ubuntu22 \
 sudo useradd --create-home --shell /bin/bash pfap
 sudo install -d -o pfap -g pfap /opt/pfap-worker
 sudo apt-get update
-sudo apt-get install -y openssh-server bash tar coreutils util-linux iproute2
+sudo apt-get install -y openssh-server bash tar coreutils util-linux iproute2 psmisc
 ```
 
 将控制机公钥加入 worker 的 `/home/pfap/.ssh/authorized_keys`，并确认可非交互登录：
@@ -124,6 +126,8 @@ ssh -i /path/to/private_key pfap@WORKER_IP 'uname -m; getconf GNU_LIBC_VERSION; 
 
 首次连接采用 TOFU 保存主机密钥，控制面不会关闭 `StrictHostKeyChecking`。更换或重装服务器后若主机密钥变化，必须先核对新指纹，不能直接绕过告警。
 
+服务器页面支持编辑、删除和批量添加。批量添加接受换行、逗号、空格或分号分隔的 IP/主机名列表，并为它们应用同一套 SSH 用户、端口、私钥和工作目录；后端会先完成全部校验再一次性保存，最多 100 台。活动实验使用的服务器只能修改显示名称，连接信息必须在实验停止后修改。服务器被活动或草稿实验引用时不能删除；只被已停止/失败的历史实验引用时可以删除配置，历史实验数据不会被级联删除，远端文件也不会被删除。
+
 runtime 缓存在 `<workDir>/artifacts/<sha256>`；实验位于 `<workDir>/experiments/<experiment-id>`。同一主机的多个节点使用不同 datadir、P2P/RPC 端口，共享只读 runtime、证明密钥和 Ethash DAG。
 
 P2P/RPC 起始端口填 `0` 时自动分配。部署前通过 `ss` 检查冲突；失败实验再次部署时也会重新选择端口。
@@ -132,8 +136,8 @@ P2P/RPC 起始端口填 `0` 时自动分配。部署前通过 `ss` 检查冲突�
 
 1. 构建 `dist/pfap-runtime.tar.gz`。
 2. 添加并检查所有服务器。
-3. 新建实验，选择每台服务器的节点数。
-4. 部署并确认节点为 `running`，peer 数符合预期。
+3. 新建实验，选择每台服务器的节点数和矿工数量。
+4. 部署并确认节点为 `running`，peer 数、实际挖矿数量符合预期。
 5. 对每个参与隐私交易的节点执行一次 `CreateAccount`。
 6. 对付款节点执行 `Mint`。
 7. 执行 `Transfer` / `Redeem`，或启动自动规则。
@@ -143,6 +147,41 @@ P2P/RPC 起始端口填 `0` 时自动分配。部署前通过 `ss` 检查冲突�
 不要在同一个隐私账户上并发执行 ZK 状态交易。控制面为每个节点维护互斥锁；Transfer 会同时锁住付款方与接收方。Receipt 确认后还会等待新区块，避免下一笔交易在节点隐私序列状态尚未稳定时启动。
 
 入队时还会检查所有参与节点：存在 `queued / proving / submitted` 交易时，手动请求返回冲突，自动负载跳过本次投递并等待后续周期，不会在节点锁后无限堆积。
+
+### 矿工数量与出块可用性
+
+实验可以配置 `1..节点总数` 个矿工。新实验默认 2 个（只有一个节点时为 1 个）；历史实验升级后仍保留原来的 1 个矿工，不会自动改变实验基线。选择时优先按节点序号跨服务器分配，再选择每台服务器的后续节点。服务器配置不同不一定代表物理机不同，应由实验人员确认故障隔离。
+
+“实验”详情支持保存草稿/停止实验的矿工数量，也支持对运行中实验点击“应用矿工配置”，不重启节点、不清空链、不重新发送交易。部署时先启动所有节点并建立拓扑，再启动矿工；在线调整时先启用并确认目标矿工，再停止被移出的矿工。配置中的角色与实际 `eth.mining` 分开展示，不可达或尚未采样的节点不计入在线挖矿数量。`eth.mining=true` 表示挖矿工作已启用，并非保证已经产出区块，还需观察链高度和 peer 连接。
+
+在线调整失败可能只部分生效，页面会保留目标配置、错误和实测状态，可排除故障后重试相同数量。涉及角色变化的离线节点必须先恢复；恢复、启停和矿工调整不能同时执行。控制器重启中断配置时也会明确显示未完成，不自动重试命令。配置及操作事件随实验报告导出。
+
+只有 1 个矿工时，该节点掉线会暂停出块及交易确认，但不意味着实验数据丢失。多个相互连通、正常挖矿的节点可让其余节点在一个矿工掉线后继续出块；已经故障的交易参与节点仍需单独恢复。要减少主机故障的影响，应把至少 2 个矿工放在不同物理服务器上。
+
+增加矿工也会改变 CPU/内存/DAG 开销、总算力、出块节奏及分叉概率；运行中修改会改变统计基线，严谨对比应使用不同实验并保留配置记录。本功能是出块冗余，不是完整的生产级高可用保证：网络分区、全部矿工失联、磁盘损坏仍会影响实验；当前 PFAP 全局 SMT 在运行中链重组/候选块回滚时的隔离限制仍存在，多矿工隐私交易实验需额外核对链与账户状态。
+
+API：创建实验时传 `minerCount`；调整使用 `POST /api/experiments/{id}/miners`，请求体 `{"minerCount":2}`。运行中返回 `202`，仅表示操作已接受，应继续检查 `miningStatus`、`miningError` 与节点实测 `mining`。
+
+### 实验中途节点掉线与恢复
+
+`unreachable` 表示控制面无法访问节点 IPC，不一定代表服务器离线。先查看“服务器”的连接状态；服务器关机、SSH 不通或磁盘满时，要先恢复主机条件。
+
+实验仍处于 `running` 时，可以在“实验”的节点行，或“交易”的账户卡片点击 **恢复节点**。该操作会：
+
+1. 核对原 runtime SHA、datadir、账户和端口；缺少原数据时拒绝创建新链。
+2. 只对已退出的进程执行原地启动。进程尚在但 IPC 不可用时保留进程并显示日志，不强制终止证明计算。
+3. 重建节点间连接；按照实验配置恢复矿工的出块角色，不再固定为 node-1。
+4. 查询原账户与链状态，保留交易记录，不再次执行 CreateAccount，不重发任何交易。
+
+恢复还会核对已初始化账户是否仍能查询到有效链上隐私状态；异常时显示独立错误并暂停该节点的隐私交易，Public 交易不受隐私状态检查影响。修复后的 geth 支持原 SN 文件中的空 SNS 字段，并在读取损坏的非空 SN 文件时直接报错退出，避免静默使用初始账户状态。
+
+修复版还会在开放 RPC/启动挖矿前，从已确认的规范链重建进程内承诺树（SMT），只恢复公开承诺，不重放余额、不重新广播交易。账户查询返回 `commitmentReady`；恢复后的账户若未通过此检查，将保持隐私交易保护。这里处理的是启动恢复，不解决原有全局 SMT 在运行中发生链重组、候选块回滚时的隔离问题。
+
+恢复中的节点不会接收新的手动或自动 Transfer/隐私交易；恢复失败会保留可展开的错误详情，排除问题后可重试。控制器重启中断恢复任务时会解除“恢复中”状态，允许重新检查。恢复期间不能同时停止实验。
+
+历史实验默认仍由 node-1 单独出块，可在实验详情中调整矿工数量；恢复后应检查链高度继续增长、peer 数恢复。自动负载只跳过暂不可用节点的投递，不会补发跳过的次数。已经广播但未确认的交易应先核对原 hash 的 Receipt；中途失败的 Transfer 还应核对双方状态，不要盲目重发。若控制器本身重启，原自动任务及交易等待协程不会自动续跑，不能仅凭历史 `submitted` 状态判断是否上链。
+
+**旧运行包限制：** 独立的隐私账户 `AccountSK` 只在进程内存中，`SN` 文件保存序列、随机数、承诺与余额，但不保存该秘密。原地恢复后旧代码会使用默认回退逻辑，页面会对已初始化账户显示提示。这不等于账户一定不可用，也不代表已验证隐私交易连续性；不要为此再次 CreateAccount 或删除数据。可靠的隐私账户灾难恢复还需要运行包增加秘密的原子持久化、加载与崩溃一致性处理。
 
 ## 交易与执行指令
 
@@ -217,6 +256,12 @@ PFAP 证明通常远慢于投递间隔。自动规则是开放式投递器，节
 
 总览 TPS 是整个已保存历史区间的平均值，已标为“历史平均 TPS”；它不等同于某次负载的稳态吞吐。正式结论应按实验、交易类型和 workload 分组，报告样本数、成功率、排队/证明/验证/链上确认的 p50/p95/p99。
 
+### 隐私账户初始化
+
+节点部署时创建的是普通 EOA 地址。参与 Mint、Redeem 或 Transfer 前，每个节点还需要在当前实验链上成功执行一次 CreateAccount。交易页提供“一键初始化”，只为尚未初始化、状态正常且没有活动交易的节点排入一次 CreateAccount；同一服务器上的初始化串行执行，不同服务器可并行。重复 CreateAccount 会重置节点本地隐私状态，因此单笔接口也会拒绝已初始化节点，自动交易规则不提供 CreateAccount 类型。
+
+初始化不会在部署后静默运行，因为它会产生真实交易并进入实验性能统计；Public-only 实验也不需要这一步。对于全新的隐私交易实验，应在开始 Mint/Transfer/Redeem 前显式执行一次批量初始化。同一实验停止再启动时会自动识别已有链上状态并跳过。
+
 ## Web 安全
 
 - 密码来自 password file；登录后使用 HttpOnly、SameSite Cookie；
@@ -230,7 +275,13 @@ PFAP 证明通常远慢于投递间隔。自动规则是开放式投递器，节
 | --- | --- | --- |
 | GET | `/api/state` | 完整 Dashboard 快照 |
 | POST | `/api/servers` | 添加本机或 SSH worker |
+| POST | `/api/servers/batch` | 原子批量添加最多 100 个 worker |
+| POST | `/api/servers/batch/trust-host-keys` | 批量扫描并信任 SSH 主机密钥（先全部扫描，再写入） |
+| POST | `/api/servers/batch/delete` | 原子批量删除未被活动/草稿实验使用的配置 |
+| PUT | `/api/servers/{id}` | 编辑服务器配置 |
+| DELETE | `/api/servers/{id}` | 删除未被活动/草稿实验使用的配置 |
 | POST | `/api/servers/{id}/check` | 检查连接和依赖 |
+| POST | `/api/experiments/{id}/initialize-accounts` | 为运行实验中尚未初始化且空闲的节点批量排队 CreateAccount |
 | POST | `/api/experiments` | 创建实验 manifest |
 | POST | `/api/experiments/{id}/deploy` | 异步部署/启动 |
 | POST | `/api/experiments/{id}/stop` | 停止托管节点 |

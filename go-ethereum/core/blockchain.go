@@ -190,6 +190,11 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 			}
 		}
 	}
+	// The Poseidon commitment tree is process-local, unlike the canonical chain
+	// database. Restore it before any background import, mining or RPC work.
+	if err := bc.rebuildCommitmentTree(); err != nil {
+		return nil, fmt.Errorf("restore canonical commitment tree: %v", err)
+	}
 	// Take ownership of this particular state
 	go bc.update()
 	return bc, nil
@@ -692,9 +697,9 @@ func (bc *BlockChain) procFutureBlocks() {
 		types.BlockBy(types.Number).Sort(blocks)
 
 		// Insert one by one as chain insertion needs contiguous ancestry between blocks
-		for i := range blocks {            
+		for i := range blocks {
 			bc.InsertChain(blocks[i : i+1])
-					}
+		}
 	}
 }
 
@@ -1254,18 +1259,19 @@ func (st *insertStats) report(chain []*types.Block, index int, cache common.Stor
 	}
 }
 
-///////////////////////////////////////////////////////
+// /////////////////////////////////////////////////////
 // report prints statistics if block has been processed
 // or more than a few seconds have passed since the last message.
-func (st *insertStats) report2(b, parentBlock *types.Block) { 
+func (st *insertStats) report2(b, parentBlock *types.Block) {
 
 	context := []interface{}{
-		"number", b.Number(), "size", b.Size().String(), "txs", len(b.Transactions()), 
+		"number", b.Number(), "size", b.Size().String(), "txs", len(b.Transactions()),
 		"blockTime", new(big.Int).Sub(b.Time(), parentBlock.Time()),
 		"hash", b.Hash(),
 	}
 	log.Info("ImportedNewBlock", context...)
 }
+
 //////////////////////////////////////////////////////////////////
 
 func countTransactions(chain []*types.Block) (c int) {

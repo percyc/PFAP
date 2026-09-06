@@ -18,7 +18,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +26,6 @@ import (
 	"reflect"
 	"unicode"
 
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/zktx"
 
 	cli "gopkg.in/urfave/cli.v1"
@@ -158,35 +156,26 @@ func enableWhisper(ctx *cli.Context) bool {
 func makeFullNode(ctx *cli.Context) *node.Node {
 	stack, cfg := makeConfigNode(ctx)
 
-	DBdir, _ := filepath.Abs(cfg.Node.DataDir)
+	DBdir, err := filepath.Abs(cfg.Node.DataDir)
+	if err != nil {
+		utils.Fatalf("Resolve private account state directory: %v", err)
+	}
 	SNFilePath := filepath.Join(DBdir, "SN")
 	SNfile, errOpenFile := os.OpenFile(SNFilePath, os.O_RDWR|os.O_CREATE, 0600)
 	if errOpenFile != nil {
-		fmt.Println("OpenFile error: ", errOpenFile)
+		utils.Fatalf("Open private account state %s: %v", SNFilePath, errOpenFile)
+	}
+	SNS, err := zktx.ReadSequenceState(SNfile)
+	if err != nil {
+		SNfile.Close()
+		utils.Fatalf("Restore private account state %s: %v; state file preserved, refusing to reset the account", SNFilePath, err)
 	}
 	zktx.SNfile = SNfile
-	rd := bufio.NewReader(zktx.SNfile)
-	SSNBytesString2, errReading := rd.ReadString('\n')
-
-	if errReading != nil {
-		fmt.Println("Readiong string error: ", errReading)
-	}
-	var SNS zktx.SequenceS
-	if len(SSNBytesString2) != 0 {
-		SSNBytesString := SSNBytesString2[0 : len(SSNBytesString2)-1]
-		SNSbytes, errDecodeString := hex.DecodeString(SSNBytesString)
-		if errDecodeString != nil {
-			fmt.Println("Decode string  error: ", errDecodeString)
-		}
-		errDecodeBytes := rlp.DecodeBytes(SNSbytes, &SNS)
-		if errDecodeBytes != nil {
-			fmt.Println("Decode SNSbytes error: ", errDecodeBytes)
-		} else {
-			zktx.SequenceNumber = &SNS.Suquence1
-			zktx.SequenceNumberAfter = &SNS.Suquence2
-			zktx.SNS = SNS.SNS
-			zktx.Stage = SNS.Stage
-		}
+	if SNS != nil {
+		zktx.SequenceNumber = &SNS.Suquence1
+		zktx.SequenceNumberAfter = &SNS.Suquence2
+		zktx.SNS = SNS.SNS
+		zktx.Stage = SNS.Stage
 	}
 	utils.RegisterEthService(stack, &cfg.Eth)
 

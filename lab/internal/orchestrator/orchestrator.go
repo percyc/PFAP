@@ -54,6 +54,17 @@ func fileSHA(path string) (string, error) {
 }
 
 func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers map[string]model.Server, emit EmitFunc) ([]model.Node, error) {
+	count := 0
+	for _, placement := range exp.Placements {
+		if placement.Count < 1 {
+			return nil, fmt.Errorf("server %s node count must be positive", placement.ServerID)
+		}
+		count += placement.Count
+	}
+	minerCount := model.EffectiveMinerCount(*exp)
+	if minerCount < 1 || minerCount > count {
+		return nil, fmt.Errorf("miner count must be between 1 and %d", count)
+	}
 	artifact, err := filepath.Abs(exp.ArtifactPath)
 	if err != nil {
 		return nil, err
@@ -105,7 +116,9 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 		}
 		runtimeDir := base + "/experiments/" + exp.ID + "/" + s.ID
 		portOffset := global - 1
-		env := fmt.Sprintf("NODE_COUNT=%d NETWORK_ID=%d P2P_PORT_BASE=%d HTTP_PORT_BASE=%d RUNTIME_DIR=%s GETH_BIN=%s PFAP_PRFKEY_DIR=%s LD_LIBRARY_PATH=%s ENABLE_HTTP=false MINE=%t", p.Count, exp.NetworkID, exp.P2PPortBase+portOffset, exp.RPCPortBase+portOffset, shell(runtimeDir), shell(runtime+"/bin/geth"), shell(runtime+"/prfKey"), shell(runtime+"/lib"), global == 1)
+		// Keep cached runtimes compatible: all nodes start without mining, then
+		// selected roles are enabled over IPC once the topology is connected.
+		env := fmt.Sprintf("NODE_COUNT=%d NETWORK_ID=%d P2P_PORT_BASE=%d HTTP_PORT_BASE=%d RUNTIME_DIR=%s GETH_BIN=%s PFAP_PRFKEY_DIR=%s LD_LIBRARY_PATH=%s ENABLE_HTTP=false MINE=false", p.Count, exp.NetworkID, exp.P2PPortBase+portOffset, exp.RPCPortBase+portOffset, shell(runtimeDir), shell(runtime+"/bin/geth"), shell(runtime+"/prfKey"), shell(runtime+"/lib"))
 		script := "set -eu\nmkdir -p " + shell(runtimeDir) + "\ncd " + shell(runtime+"/pow") + "\n" + env + " ./network.sh start\n"
 		if out, err := o.Remote.Run(ctx, s, script); err != nil {
 			return nil, fmt.Errorf("start %s: %w (%s)", s.Name, err, out)
@@ -161,7 +174,21 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 		}
 		emit("info", "topology", "full-mesh topology ready", map[string]any{"nodes": len(nodes)})
 	}
-	emit("info", "deploy", "all nodes started", map[string]any{"count": len(nodes), "artifactSha256": sha})
+	if err := model.AssignMiners(nodes, minerCount); err != nil {
+		return nil, err
+	}
+	exp.MinerCount = minerCount
+	for i := range nodes {
+		mining := false
+		if nodes[i].IsMiner {
+			if err := o.SetMining(ctx, *exp, nodes[i], servers[nodes[i].ServerID], true); err != nil {
+				return nil, fmt.Errorf("start configured miner: %w", err)
+			}
+			mining = true
+		}
+		nodes[i].Mining = &mining
+	}
+	emit("info", "deploy", "all nodes started", map[string]any{"count": len(nodes), "minerCount": minerCount, "artifactSha256": sha})
 	return nodes, nil
 }
 
@@ -180,10 +207,13 @@ func (o Orchestrator) Stop(ctx context.Context, exp model.Experiment, servers ma
 
 func (o Orchestrator) Attach(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, expression string) (string, error) {
 	base := strings.TrimRight(server.WorkDir, "/")
-	// Resolve the immutable runtime selected during deployment from its symlink-free artifact path.
-	find := "runtime=" + shell(base+"/artifacts/"+exp.ArtifactSHA+"/pfap-runtime") + "\n"
+	// Each node keeps its actual runtime; a configured recovery hotfix only
+	// becomes active for that node after its process is restarted.
+	find := "runtime=" + shell(base+"/artifacts/"+nodeRuntimeSHA(exp, node)+"/pfap-runtime") + "\n"
 	root := base + "/experiments/" + exp.ID + "/" + server.ID
-	script := "set -eu\n" + find + "PFAP_PRFKEY_DIR=\"$runtime/prfKey\" LD_LIBRARY_PATH=\"$runtime/lib\" \"$runtime/bin/geth\" attach " + shell(root+"/node"+strconv.Itoa(node.LocalIndex)+"/geth.ipc") + " --exec " + shell(expression) + "\n"
+	// Replace the local shell so context cancellation terminates the attach
+	// process itself instead of leaving it behind with inherited output pipes.
+	script := "set -eu\n" + find + "PFAP_PRFKEY_DIR=\"$runtime/prfKey\" LD_LIBRARY_PATH=\"$runtime/lib\" exec \"$runtime/bin/geth\" attach " + shell(root+"/node"+strconv.Itoa(node.LocalIndex)+"/geth.ipc") + " --exec " + shell(expression) + "\n"
 	return o.Remote.Run(ctx, server, script)
 }
 

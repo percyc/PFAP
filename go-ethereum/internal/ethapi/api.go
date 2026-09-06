@@ -2239,7 +2239,7 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Cont
 
 // GetAccountState returns the current private account state: (balance, commitment, lastTxBlockNumber)
 func (s *PublicTransactionPoolAPI) GetAccountState(ctx context.Context) (map[string]interface{}, error) {
-	if zktx.SequenceNumberAfter == nil {
+	if zktx.SequenceNumberAfter == nil || zktx.SequenceNumberAfter.CMT == nil || zktx.SequenceNumberAfter.SN == nil {
 		return nil, errors.New("no account state available")
 	}
 	fmt.Printf("DEBUG getAccountState: Balance=%d CMT=%x SN=%x\n", zktx.SequenceNumberAfter.Value, zktx.SequenceNumberAfter.CMT[:], zktx.SequenceNumberAfter.SN[:])
@@ -2264,6 +2264,7 @@ func (s *PublicTransactionPoolAPI) GetAccountState(ctx context.Context) (map[str
 		"balance":           hexutil.Uint64(zktx.SequenceNumberAfter.Value),
 		"commitment":        zktx.SequenceNumberAfter.CMT.Hex(),
 		"lastTxBlockNumber": hexutil.Uint64(blockNumber),
+		"commitmentReady":   zktx.ContainsCMT(zktx.SequenceNumberAfter.CMT),
 	}, nil
 }
 

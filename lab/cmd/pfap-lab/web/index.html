@@ -67,12 +67,19 @@
 <div class="split">
 <article>
 <h2>SSH 服务器</h2>
+<div class="server-batch-toolbar">
+<label class="server-select-all"><input id="selectAllServers" type="checkbox"> 全选</label>
+<span id="serverSelectionCount">已选 0 台</span>
+<button id="batchTrustServers" type="button" class="action secondary" disabled>批量信任</button>
+<button id="batchDeleteServers" type="button" class="action danger" disabled>批量删除</button>
+</div>
 <div id="serverRows">
 </div>
 </article>
 <article>
-<h2>添加服务器</h2>
+<h2 id="serverFormTitle">添加服务器</h2>
 <form id="serverForm">
+<input type="hidden" name="serverId">
 <label>名称<input name="name" required placeholder="worker-hk-1">
 </label>
 <label>主机<input name="host" required placeholder="10.0.0.11">
@@ -88,8 +95,19 @@
 </label>
 <label>远端工作目录<input name="workDir" value="/opt/pfap-lab">
 </label>
-<button type="submit" class="primary">保存服务器</button>
+<div class="form-actions"><button id="saveServer" type="submit" class="primary">保存服务器</button><button id="cancelServerEdit" type="button" class="action secondary" hidden>取消编辑</button></div>
 </form>
+<details class="batch-server-panel">
+<summary>批量添加服务器</summary>
+<form id="batchServerForm">
+<label>IP 或主机名列表<textarea name="hosts" rows="6" required placeholder="192.168.50.51&#10;192.168.50.52&#10;worker-03.internal"></textarea><small>每行一个，也支持逗号、空格或分号分隔；单次最多 100 台。</small></label>
+<label>名称前缀<input name="namePrefix" value="worker" required placeholder="worker"></label>
+<div class="pair"><label>SSH 用户<input name="user" required value="pfap"></label><label>端口<input name="port" type="number" min="1" max="65535" value="22"></label></div>
+<label>私钥路径<input name="identityFile" placeholder="/home/user/.ssh/id_ed25519"></label>
+<label>远端工作目录<input name="workDir" value="/opt/pfap-lab" required></label>
+<button type="submit" class="primary">批量创建</button>
+</form>
+</details>
 </article>
 </div>
 </section>
@@ -121,6 +139,8 @@
 <label>部署服务器（可多选）<select name="serverId" id="serverSelect" multiple size="5" required>
 </select>
 </label>
+<label>矿工节点数<input name="minerCount" id="newExperimentMinerCount" type="number" min="1" step="1" value="1" required aria-describedby="minerPlacementPreview"></label>
+<div id="minerPlacementPreview" class="miner-placement-preview" aria-live="polite">先选择部署服务器，再设置矿工节点数。</div>
 <button type="submit" class="primary">创建实验</button>
 </form>
 </article>
@@ -135,6 +155,7 @@
 <div class="transaction-primary">
 <article>
 <div class="section-head"><div><h2>发送预设交易</h2><p>常用 PFAP 操作会进入交易队列并持续跟踪结果。</p></div><button id="openConsole" type="button" class="action secondary">节点控制台</button></div>
+<div id="accountInitialization" class="account-initialization"></div>
 <form id="transactionForm">
 <input type="hidden" name="experimentId" id="transactionExperimentId">
 <label>发送节点<select name="fromNode" id="nodeSelect" required>
@@ -149,7 +170,7 @@
 <option value="public">Public</option>
 </select>
 </label>
-<label>数值<input name="value" value="0x1">
+<label id="transactionValueField">数值<input name="value" value="0x1">
 </label>
 </div>
 <label id="targetNodeField" hidden>目标节点<select name="toNode" id="toNodeSelect"></select></label>
@@ -178,7 +199,6 @@
 <option value="mint">Mint</option>
 <option value="transfer">Transfer</option>
 <option value="redeem">Redeem</option>
-<option value="createAccount">CreateAccount</option>
 <option value="public">Public</option>
 </select>
 </label>

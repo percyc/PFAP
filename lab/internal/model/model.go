@@ -25,41 +25,53 @@ type Placement struct {
 }
 
 type Experiment struct {
-	ID           string      `json:"id"`
-	Name         string      `json:"name"`
-	Status       string      `json:"status"`
-	NetworkID    int         `json:"networkId"`
-	P2PPortBase  int         `json:"p2pPortBase"`
-	RPCPortBase  int         `json:"rpcPortBase"`
-	ArtifactPath string      `json:"artifactPath"`
-	ArtifactSHA  string      `json:"artifactSha,omitempty"`
-	Topology     string      `json:"topology"`
-	Placements   []Placement `json:"placements"`
-	Nodes        []Node      `json:"nodes,omitempty"`
-	CreatedAt    time.Time   `json:"createdAt"`
-	StartedAt    time.Time   `json:"startedAt,omitempty"`
-	FinishedAt   time.Time   `json:"finishedAt,omitempty"`
-	Error        string      `json:"error,omitempty"`
+	ID                  string      `json:"id"`
+	Name                string      `json:"name"`
+	Status              string      `json:"status"`
+	NetworkID           int         `json:"networkId"`
+	P2PPortBase         int         `json:"p2pPortBase"`
+	RPCPortBase         int         `json:"rpcPortBase"`
+	ArtifactPath        string      `json:"artifactPath"`
+	ArtifactSHA         string      `json:"artifactSha,omitempty"`
+	RecoveryArtifactSHA string      `json:"recoveryArtifactSha,omitempty"`
+	Topology            string      `json:"topology"`
+	MinerCount          int         `json:"minerCount"`
+	MiningStatus        string      `json:"miningStatus,omitempty"`
+	MiningError         string      `json:"miningError,omitempty"`
+	MiningUpdatedAt     time.Time   `json:"miningUpdatedAt,omitempty"`
+	Placements          []Placement `json:"placements"`
+	Nodes               []Node      `json:"nodes,omitempty"`
+	CreatedAt           time.Time   `json:"createdAt"`
+	StartedAt           time.Time   `json:"startedAt,omitempty"`
+	FinishedAt          time.Time   `json:"finishedAt,omitempty"`
+	Error               string      `json:"error,omitempty"`
 }
 
 type Node struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	ServerID      string    `json:"serverId"`
-	Index         int       `json:"index"`
-	LocalIndex    int       `json:"localIndex"`
-	P2PPort       int       `json:"p2pPort"`
-	RPCPort       int       `json:"rpcPort"`
-	Status        string    `json:"status"`
-	Block         uint64    `json:"block"`
-	Peers         int       `json:"peers"`
-	Account       string    `json:"account,omitempty"`
-	PublicBalance string    `json:"publicBalance,omitempty"`
-	ZKBalance     string    `json:"zkBalance,omitempty"`
-	Commitment    string    `json:"commitment,omitempty"`
-	LastTxBlock   string    `json:"lastTxBlock,omitempty"`
-	StateError    string    `json:"stateError,omitempty"`
-	LastSeen      time.Time `json:"lastSeen,omitempty"`
+	ID                string    `json:"id"`
+	Name              string    `json:"name"`
+	ServerID          string    `json:"serverId"`
+	Index             int       `json:"index"`
+	LocalIndex        int       `json:"localIndex"`
+	P2PPort           int       `json:"p2pPort"`
+	RPCPort           int       `json:"rpcPort"`
+	Status            string    `json:"status"`
+	IsMiner           bool      `json:"isMiner"`
+	Mining            *bool     `json:"mining,omitempty"`
+	Block             uint64    `json:"block"`
+	Peers             int       `json:"peers"`
+	Account           string    `json:"account,omitempty"`
+	PublicBalance     string    `json:"publicBalance,omitempty"`
+	ZKBalance         string    `json:"zkBalance,omitempty"`
+	Commitment        string    `json:"commitment,omitempty"`
+	LastTxBlock       string    `json:"lastTxBlock,omitempty"`
+	StateError        string    `json:"stateError,omitempty"`
+	RecoveryError     string    `json:"recoveryError,omitempty"`
+	RecoveryWarning   string    `json:"recoveryWarning,omitempty"`
+	PrivateStateError string    `json:"privateStateError,omitempty"`
+	RuntimeSHA        string    `json:"runtimeSha,omitempty"`
+	RecoveryStartedAt time.Time `json:"recoveryStartedAt,omitempty"`
+	LastSeen          time.Time `json:"lastSeen,omitempty"`
 }
 
 type Event struct {
@@ -74,6 +86,7 @@ type Event struct {
 
 type Transaction struct {
 	ID                          string    `json:"id"`
+	BatchID                     string    `json:"batchId,omitempty"`
 	WorkloadID                  string    `json:"workloadId,omitempty"`
 	Sequence                    int       `json:"sequence,omitempty"`
 	ExperimentID                string    `json:"experimentId"`

@@ -24,18 +24,29 @@ import (
 )
 
 type API struct {
-	store       *store.Store
-	orch        orchestrator.Orchestrator
-	subscribers map[chan model.Event]struct{}
-	mu          sync.Mutex
-	nodeLocks   sync.Map
+	store            *store.Store
+	orch             orchestrator.Orchestrator
+	subscribers      map[chan model.Event]struct{}
+	mu               sync.Mutex
+	nodeLocks        sync.Map
+	serverSetupLocks sync.Map
+	lifecycleMu      sync.Mutex
+	knownHostsMu     sync.Mutex
 }
 
 func New(s *store.Store) *API {
 	a := &API{store: s, subscribers: map[chan model.Event]struct{}{}}
 	var running []string
 	_ = s.Update(func(state *model.State) error {
+		migrateMiningState(state)
 		for i := range state.Experiments {
+			for j := range state.Experiments[i].Nodes {
+				n := &state.Experiments[i].Nodes[j]
+				if n.Status == "recovering" {
+					n.Status = "unreachable"
+					n.RecoveryError = "控制器重启中断了恢复检查，请重新点击恢复节点；不会重新发送交易。"
+				}
+			}
 			if state.Experiments[i].Status == "running" {
 				state.Experiments[i].FinishedAt = time.Time{}
 			}
@@ -238,6 +249,18 @@ func (a *API) Handler(static http.Handler) http.Handler {
 			a.servers(w, r)
 			return
 		}
+		if r.URL.Path == "/api/servers/batch/trust-host-keys" {
+			a.batchTrustServerHostKeys(w, r)
+			return
+		}
+		if r.URL.Path == "/api/servers/batch/delete" {
+			a.batchDeleteServers(w, r)
+			return
+		}
+		if r.URL.Path == "/api/servers/batch" {
+			a.batchServers(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/servers/") {
 			a.serverAction(w, r)
 			return
@@ -326,6 +349,10 @@ func (a *API) executeConsole(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, errors.New("experiment and node must be running"))
 		return
 	}
+	if exp.MiningStatus == "updating" {
+		fail(w, http.StatusConflict, errors.New("矿工配置正在应用，请等待完成后再发送手动指令"))
+		return
+	}
 
 	lockAny, _ := a.nodeLocks.LoadOrStore(node.ID, &sync.Mutex{})
 	lock := lockAny.(*sync.Mutex)
@@ -358,27 +385,296 @@ func (a *API) servers(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if v.Name == "" || v.Host == "" || v.User == "" {
-		fail(w, 400, errors.New("name, host and user are required"))
+	if err := a.normalizeServer(&v); err != nil {
+		fail(w, 400, err)
 		return
-	}
-	if v.Port == 0 {
-		v.Port = 22
-	}
-	if v.WorkDir == "" {
-		v.WorkDir = "/opt/pfap-lab"
-	}
-	if v.Host != "local" && v.Host != "localhost-local" && v.KnownHostsFile == "" {
-		v.KnownHostsFile = filepath.Join(a.store.DataDir(), "known_hosts")
 	}
 	v.ID = id("srv")
 	v.Status = "unknown"
 	v.CreatedAt = time.Now()
-	if err := a.store.Update(func(s *model.State) error { s.Servers = append(s.Servers, v); return nil }); err != nil {
+	if err := a.store.Update(func(s *model.State) error {
+		if duplicateServer(s.Servers, v, "") {
+			return errors.New("a server with the same host and port already exists")
+		}
+		s.Servers = append(s.Servers, v)
+		return nil
+	}); err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			fail(w, http.StatusConflict, err)
+			return
+		}
 		fail(w, 500, err)
 		return
 	}
 	jsonOut(w, 201, v)
+}
+
+func (a *API) normalizeServer(v *model.Server) error {
+	v.Name, v.Host, v.P2PHost, v.User = strings.TrimSpace(v.Name), strings.TrimSpace(v.Host), strings.TrimSpace(v.P2PHost), strings.TrimSpace(v.User)
+	v.IdentityFile, v.WorkDir = strings.TrimSpace(v.IdentityFile), strings.TrimSpace(v.WorkDir)
+	if v.Name == "" || v.Host == "" || v.User == "" {
+		return errors.New("name, host and user are required")
+	}
+	if v.Port == 0 {
+		v.Port = 22
+	}
+	if v.Port < 1 || v.Port > 65535 {
+		return errors.New("SSH port must be between 1 and 65535")
+	}
+	if v.WorkDir == "" {
+		v.WorkDir = "/opt/pfap-lab"
+	}
+	if !filepath.IsAbs(v.WorkDir) {
+		return errors.New("work directory must be an absolute path")
+	}
+	if v.Host != "local" && v.Host != "localhost-local" && v.KnownHostsFile == "" {
+		v.KnownHostsFile = filepath.Join(a.store.DataDir(), "known_hosts")
+	}
+	return nil
+}
+
+func duplicateServer(servers []model.Server, candidate model.Server, excludeID string) bool {
+	for _, existing := range servers {
+		if existing.ID != excludeID && strings.EqualFold(existing.Host, candidate.Host) && existing.Port == candidate.Port {
+			return true
+		}
+	}
+	return false
+}
+
+func experimentUsesServer(e model.Experiment, serverID string) bool {
+	for _, placement := range e.Placements {
+		if placement.ServerID == serverID {
+			return true
+		}
+	}
+	return false
+}
+
+func activeExperimentStatus(status string) bool {
+	return status == "running" || status == "deploying" || status == "stopping"
+}
+
+type serverIDsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func (a *API) requestedServers(r *http.Request) ([]model.Server, error) {
+	var request serverIDsRequest
+	if err := decode(r, &request); err != nil {
+		return nil, err
+	}
+	if len(request.IDs) == 0 || len(request.IDs) > 100 {
+		return nil, errors.New("batch must contain between 1 and 100 server IDs")
+	}
+	seen := make(map[string]bool, len(request.IDs))
+	serversByID := map[string]model.Server{}
+	a.store.View(func(s model.State) {
+		for _, server := range s.Servers {
+			serversByID[server.ID] = server
+		}
+	})
+	servers := make([]model.Server, 0, len(request.IDs))
+	for _, rawID := range request.IDs {
+		serverID := strings.TrimSpace(rawID)
+		if serverID == "" || seen[serverID] {
+			return nil, fmt.Errorf("server ID %q is empty or duplicated", serverID)
+		}
+		seen[serverID] = true
+		server, ok := serversByID[serverID]
+		if !ok {
+			return nil, fmt.Errorf("server %s not found", serverID)
+		}
+		servers = append(servers, server)
+	}
+	return servers, nil
+}
+
+func (a *API) appendKnownHostKeys(path, keys string) error {
+	// Single-host and batch trust share this read-modify-rename lock, so one
+	// successful trust operation cannot overwrite another operation's keys.
+	a.knownHostsMu.Lock()
+	defer a.knownHostsMu.Unlock()
+	existing, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeKnownHostsAtomically(path, func(temp *os.File) error {
+		_, err := temp.Write(append(existing, []byte(keys)...))
+		return err
+	})
+}
+
+func writeKnownHostsAtomically(path string, write func(*os.File) error) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".known-hosts-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err = temp.Chmod(0o600); err == nil {
+		err = write(temp)
+	}
+	closeErr := temp.Close()
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	return os.Rename(tempName, path)
+}
+
+func (a *API) batchTrustServerHostKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	servers, err := a.requestedServers(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	keysByPath := map[string]string{}
+	pathsByID := map[string]string{}
+	// Scan every selected host before changing known_hosts. A failed scan leaves
+	// the trust store untouched, so the operator can safely retry the whole set.
+	for _, server := range servers {
+		if server.Host == "local" || server.Host == "localhost-local" {
+			fail(w, http.StatusBadRequest, fmt.Errorf("server %s is local and does not use SSH host keys", server.Name))
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		keys, scanErr := a.orch.Remote.ScanHostKey(ctx, server)
+		cancel()
+		if scanErr != nil {
+			fail(w, http.StatusBadGateway, fmt.Errorf("scan %s (%s): %w", server.Name, server.Host, scanErr))
+			return
+		}
+		path := server.KnownHostsFile
+		if path == "" {
+			path = filepath.Join(a.store.DataDir(), "known_hosts")
+		}
+		pathsByID[server.ID] = path
+		keysByPath[path] += keys
+	}
+	for path, keys := range keysByPath {
+		if err := a.appendKnownHostKeys(path, keys); err != nil {
+			fail(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if err := a.store.Update(func(s *model.State) error {
+		for i := range s.Servers {
+			if path := pathsByID[s.Servers[i].ID]; path != "" {
+				s.Servers[i].KnownHostsFile = path
+			}
+		}
+		return nil
+	}); err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonOut(w, http.StatusOK, map[string]any{"status": "trusted", "trusted": len(servers)})
+}
+
+func (a *API) batchDeleteServers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	servers, err := a.requestedServers(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	selected := make(map[string]bool, len(servers))
+	for _, server := range servers {
+		selected[server.ID] = true
+	}
+	err = a.store.Update(func(s *model.State) error {
+		for _, e := range s.Experiments {
+			if !activeExperimentStatus(e.Status) && e.Status != "draft" {
+				continue
+			}
+			for serverID := range selected {
+				if experimentUsesServer(e, serverID) {
+					return fmt.Errorf("server %s is used by %s experiment %s", serverID, e.Status, e.Name)
+				}
+			}
+		}
+		kept := s.Servers[:0]
+		for _, server := range s.Servers {
+			if !selected[server.ID] {
+				kept = append(kept, server)
+			}
+		}
+		s.Servers = kept
+		return nil
+	})
+	if err != nil {
+		fail(w, http.StatusConflict, err)
+		return
+	}
+	jsonOut(w, http.StatusOK, map[string]any{"status": "deleted", "deleted": len(servers)})
+}
+
+func (a *API) batchServers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var request struct {
+		Hosts        []string `json:"hosts"`
+		NamePrefix   string   `json:"namePrefix"`
+		User         string   `json:"user"`
+		Port         int      `json:"port"`
+		IdentityFile string   `json:"identityFile"`
+		WorkDir      string   `json:"workDir"`
+	}
+	if err := decode(r, &request); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(request.Hosts) == 0 || len(request.Hosts) > 100 {
+		fail(w, http.StatusBadRequest, errors.New("batch must contain between 1 and 100 hosts"))
+		return
+	}
+	prefix := strings.TrimSpace(request.NamePrefix)
+	if prefix == "" {
+		prefix = "worker"
+	}
+	seen := map[string]bool{}
+	created := make([]model.Server, 0, len(request.Hosts))
+	for i, host := range request.Hosts {
+		host = strings.TrimSpace(host)
+		key := strings.ToLower(host)
+		if host == "" || seen[key] {
+			fail(w, http.StatusBadRequest, fmt.Errorf("host %q is empty or duplicated", host))
+			return
+		}
+		seen[key] = true
+		candidate := model.Server{Name: fmt.Sprintf("%s-%02d", prefix, i+1), Host: host, P2PHost: host, Port: request.Port, User: request.User, IdentityFile: request.IdentityFile, WorkDir: request.WorkDir, Status: "unknown", CreatedAt: time.Now()}
+		if err := a.normalizeServer(&candidate); err != nil {
+			fail(w, http.StatusBadRequest, fmt.Errorf("%s: %w", host, err))
+			return
+		}
+		candidate.ID = id("srv")
+		created = append(created, candidate)
+	}
+	if err := a.store.Update(func(s *model.State) error {
+		for _, candidate := range created {
+			if duplicateServer(s.Servers, candidate, "") {
+				return fmt.Errorf("%s:%d already exists", candidate.Host, candidate.Port)
+			}
+		}
+		s.Servers = append(s.Servers, created...)
+		return nil
+	}); err != nil {
+		fail(w, http.StatusConflict, err)
+		return
+	}
+	jsonOut(w, http.StatusCreated, created)
 }
 
 func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
@@ -400,6 +696,51 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 	})
 	if !found {
 		fail(w, 404, errors.New("server not found"))
+		return
+	}
+	if len(parts) == 3 && r.Method == http.MethodPut {
+		var updated model.Server
+		if err := decode(r, &updated); err != nil {
+			fail(w, http.StatusBadRequest, err)
+			return
+		}
+		updated.ID, updated.CreatedAt = server.ID, server.CreatedAt
+		updated.KnownHostsFile = server.KnownHostsFile
+		updated.Labels = server.Labels
+		if err := a.normalizeServer(&updated); err != nil {
+			fail(w, http.StatusBadRequest, err)
+			return
+		}
+		criticalChanged := updated.Host != server.Host || updated.Port != server.Port || updated.User != server.User || updated.IdentityFile != server.IdentityFile || updated.WorkDir != server.WorkDir || updated.P2PHost != server.P2PHost
+		if criticalChanged {
+			updated.Status = "unknown"
+		} else {
+			updated.Status, updated.LastCheck, updated.SystemInfo = server.Status, server.LastCheck, server.SystemInfo
+		}
+		err := a.store.Update(func(s *model.State) error {
+			if duplicateServer(s.Servers, updated, sid) {
+				return errors.New("a server with the same host and port already exists")
+			}
+			if criticalChanged {
+				for _, e := range s.Experiments {
+					if activeExperimentStatus(e.Status) && experimentUsesServer(e, sid) {
+						return fmt.Errorf("server is used by active experiment %s; stop it before changing connection settings", e.Name)
+					}
+				}
+			}
+			for i := range s.Servers {
+				if s.Servers[i].ID == sid {
+					s.Servers[i] = updated
+					return nil
+				}
+			}
+			return os.ErrNotExist
+		})
+		if err != nil {
+			fail(w, http.StatusConflict, err)
+			return
+		}
+		jsonOut(w, http.StatusOK, updated)
 		return
 	}
 	if len(parts) == 4 && parts[3] == "check" && r.Method == "POST" {
@@ -444,19 +785,8 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 		if path == "" {
 			path = filepath.Join(a.store.DataDir(), "known_hosts")
 		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		if err := a.appendKnownHostKeys(path, keys); err != nil {
 			fail(w, 500, err)
-			return
-		}
-		knownHosts, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			fail(w, 500, err)
-			return
-		}
-		_, writeErr := knownHosts.WriteString(keys)
-		closeErr := knownHosts.Close()
-		if writeErr != nil || closeErr != nil {
-			fail(w, 500, errors.Join(writeErr, closeErr))
 			return
 		}
 		_ = a.store.Update(func(s *model.State) error {
@@ -473,10 +803,8 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 3 && r.Method == "DELETE" {
 		err := a.store.Update(func(s *model.State) error {
 			for _, e := range s.Experiments {
-				for _, p := range e.Placements {
-					if p.ServerID == sid {
-						return errors.New("server is referenced by an experiment")
-					}
+				if experimentUsesServer(e, sid) && (activeExperimentStatus(e.Status) || e.Status == "draft") {
+					return fmt.Errorf("server is used by %s experiment %s", e.Status, e.Name)
 				}
 			}
 			for i, x := range s.Servers {
@@ -506,11 +834,15 @@ func (a *API) experiments(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, errors.New("method not allowed"))
 		return
 	}
-	var e model.Experiment
-	if err := decode(r, &e); err != nil {
+	var request struct {
+		model.Experiment
+		MinerCount *int `json:"minerCount"`
+	}
+	if err := decode(r, &request); err != nil {
 		fail(w, 400, err)
 		return
 	}
+	e := request.Experiment
 	if e.Name == "" || len(e.Placements) == 0 {
 		fail(w, 400, errors.New("name and placements are required"))
 		return
@@ -549,6 +881,14 @@ func (a *API) experiments(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, errors.New("an experiment is limited to 100 nodes"))
 		return
 	}
+	e.MinerCount = min(2, totalNodes)
+	if request.MinerCount != nil {
+		e.MinerCount = *request.MinerCount
+	}
+	if e.MinerCount < 1 || e.MinerCount > totalNodes {
+		fail(w, 400, fmt.Errorf("矿工数量必须在 1 到 %d 之间", totalNodes))
+		return
+	}
 	if e.NetworkID == 0 {
 		e.NetworkID = 55661
 	}
@@ -567,6 +907,9 @@ func (a *API) experiments(w http.ResponseWriter, r *http.Request) {
 	}
 	e.ID = id("exp")
 	e.Status = "draft"
+	e.Nodes = nil
+	e.MiningStatus, e.MiningError = "", ""
+	e.MiningUpdatedAt = time.Time{}
 	e.CreatedAt = time.Now()
 	if err := a.store.Update(func(s *model.State) error { s.Experiments = append(s.Experiments, e); return nil }); err != nil {
 		fail(w, 500, err)
@@ -604,6 +947,14 @@ func nextPortBase(start, count int, experiments []model.Experiment, rpc bool) in
 
 func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) == 6 && parts[3] == "nodes" && parts[5] == "recover" {
+		if r.Method != http.MethodPost {
+			fail(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+			return
+		}
+		a.recoverNode(w, parts[2], parts[4])
+		return
+	}
 	if len(parts) == 3 && r.Method == http.MethodDelete {
 		a.deleteExperiment(w, parts[2])
 		return
@@ -625,6 +976,16 @@ func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, errors.New("method not allowed"))
 		return
 	}
+	if action == "miners" {
+		a.updateMiners(w, r, eid)
+		return
+	}
+	// Serialize lifecycle admission with recovery and mining updates. The
+	// accepted state is persisted before launching the background operation.
+	if action == "deploy" || action == "start" || action == "stop" {
+		a.lifecycleMu.Lock()
+		defer a.lifecycleMu.Unlock()
+	}
 	var exp model.Experiment
 	servers := map[string]model.Server{}
 	found := false
@@ -643,8 +1004,12 @@ func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, errors.New("experiment not found"))
 		return
 	}
-	if (action == "deploy" || action == "start") && (exp.Status == "deploying" || exp.Status == "running") {
+	if (action == "deploy" || action == "start") && (exp.Status == "deploying" || exp.Status == "running" || exp.Status == "stopping") {
 		fail(w, 409, errors.New("experiment is already active"))
+		return
+	}
+	if exp.MiningStatus == "updating" && (action == "deploy" || action == "start" || action == "stop") {
+		fail(w, http.StatusConflict, errors.New("矿工配置正在应用，请等待完成后再操作实验"))
 		return
 	}
 	if (action == "deploy" || action == "start") && exp.Status == "failed" {
@@ -675,14 +1040,113 @@ func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 	}
 	switch action {
 	case "deploy", "start":
+		a.setExperiment(eid, "deploying", "", nil, "")
 		go a.deploy(eid, exp, servers)
 		jsonOut(w, 202, map[string]string{"status": "deploying"})
 	case "stop":
+		if exp.Status != "running" && exp.Status != "failed" {
+			fail(w, http.StatusConflict, errors.New("实验不在可停止状态，请等待当前操作完成"))
+			return
+		}
+		recovering := false
+		a.store.View(func(s model.State) {
+			for _, e := range s.Experiments {
+				if e.ID == eid {
+					for _, n := range e.Nodes {
+						recovering = recovering || n.Status == "recovering"
+					}
+				}
+			}
+		})
+		if recovering {
+			fail(w, http.StatusConflict, errors.New("节点正在恢复，请等待恢复完成后再停止实验"))
+			return
+		}
+		a.setExperiment(eid, "stopping", "", nil, "")
 		go a.stop(eid, exp, servers)
 		jsonOut(w, 202, map[string]string{"status": "stopping"})
+	case "initialize-accounts":
+		a.initializeAccounts(w, eid)
 	default:
 		fail(w, 404, errors.New("unknown action"))
 	}
+}
+
+func (a *API) initializeAccounts(w http.ResponseWriter, experimentID string) {
+	batchID := id("init")
+	queued := []model.Transaction{}
+	alreadyInitialized, busy, unavailable, total := 0, 0, 0, 0
+	err := a.store.Update(func(s *model.State) error {
+		var experiment *model.Experiment
+		for i := range s.Experiments {
+			if s.Experiments[i].ID == experimentID {
+				experiment = &s.Experiments[i]
+				break
+			}
+		}
+		if experiment == nil {
+			return os.ErrNotExist
+		}
+		if experiment.Status != "running" {
+			return errors.New("experiment must be running before accounts can be initialized")
+		}
+		total = len(experiment.Nodes)
+		if total == 0 {
+			return errors.New("experiment has no nodes")
+		}
+		for _, node := range experiment.Nodes {
+			if privateAccountInitialized(s.Transactions, experimentID, node) {
+				alreadyInitialized++
+				continue
+			}
+			if node.Status != "running" {
+				unavailable++
+				continue
+			}
+			if transactionNodesBusy(s.Transactions, node.ID, "") {
+				busy++
+				continue
+			}
+			tx := model.Transaction{
+				ID:           id("tx"),
+				BatchID:      batchID,
+				ExperimentID: experimentID,
+				Type:         "createAccount",
+				FromNode:     node.ID,
+				Status:       "queued",
+				SubmittedAt:  time.Now(),
+			}
+			s.Transactions = append(s.Transactions, tx)
+			queued = append(queued, tx)
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		fail(w, http.StatusNotFound, errors.New("experiment not found"))
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusConflict, err)
+		return
+	}
+	for _, tx := range queued {
+		go a.runTransaction(tx)
+	}
+	a.emit(experimentID, "info", "initialization", "batch CreateAccount queued", map[string]any{
+		"batchId": batchID, "queued": len(queued), "alreadyInitialized": alreadyInitialized, "busy": busy, "unavailable": unavailable,
+	})
+	status := http.StatusAccepted
+	if len(queued) == 0 {
+		status = http.StatusOK
+	}
+	transactionIDs := make([]string, 0, len(queued))
+	for _, tx := range queued {
+		transactionIDs = append(transactionIDs, tx.ID)
+	}
+	jsonOut(w, status, map[string]any{
+		"batchId": batchID, "total": total, "queued": len(queued), "alreadyInitialized": alreadyInitialized,
+		"busy": busy, "unavailable": unavailable, "transactionIds": transactionIDs,
+	})
 }
 
 func (a *API) deleteExperiment(w http.ResponseWriter, experimentID string) {
@@ -834,10 +1298,19 @@ func (a *API) setExperiment(id, status, errText string, nodes []model.Node, sha 
 			if s.Experiments[i].ID == id {
 				s.Experiments[i].Status = status
 				s.Experiments[i].Error = errText
+				if status == "deploying" {
+					s.Experiments[i].MiningStatus, s.Experiments[i].MiningError = "", ""
+					s.Experiments[i].MiningUpdatedAt = time.Now()
+				}
 				if nodes != nil {
 					s.Experiments[i].Nodes = nodes
 				}
 				if sha != "" {
+					if sha != s.Experiments[i].ArtifactSHA {
+						// A recovery hotfix belongs to one deployed runtime/key set.
+						// Never carry it over to a later deployment or key rotation.
+						s.Experiments[i].RecoveryArtifactSHA = ""
+					}
 					s.Experiments[i].ArtifactSHA = sha
 				}
 				if status == "running" {
@@ -851,6 +1324,7 @@ func (a *API) setExperiment(id, status, errText string, nodes []model.Node, sha 
 					for j := range s.Experiments[i].Nodes {
 						s.Experiments[i].Nodes[j].Status = "stopped"
 						s.Experiments[i].Nodes[j].Peers = 0
+						s.Experiments[i].Nodes[j].Mining = nil
 					}
 				}
 			}
@@ -865,6 +1339,16 @@ func (a *API) deploy(id string, e model.Experiment, servers map[string]model.Ser
 	defer cancel()
 	nodes, err := a.orch.Deploy(ctx, &e, servers, func(l, k, m string, f map[string]any) { a.emit(id, l, k, m, f) })
 	if err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		cleanupErr := a.orch.Stop(cleanupCtx, e, servers, func(l, k, m string, f map[string]any) {
+			a.emit(id, l, k, m, f)
+		})
+		cleanupCancel()
+		if cleanupErr != nil {
+			err = fmt.Errorf("%w; cleanup after failed deployment also failed: %v", err, cleanupErr)
+		} else {
+			a.emit(id, "info", "deploy", "partial deployment rolled back", nil)
+		}
 		a.setExperiment(id, "failed", err.Error(), nil, e.ArtifactSHA)
 		a.emit(id, "error", "deploy", err.Error(), nil)
 		return
@@ -896,6 +1380,9 @@ func (a *API) monitor(id string) {
 			return
 		}
 		for _, node := range exp.Nodes {
+			if node.Status == "recovering" {
+				continue
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			_ = a.sampleNode(ctx, exp, node, servers[node.ServerID], "monitor")
 			cancel()
@@ -904,9 +1391,16 @@ func (a *API) monitor(id string) {
 }
 
 func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, reason string) error {
-	expr := `(function(){var z=null,e="";try{z=eth.getAccountState()}catch(x){e=x.toString()}return JSON.stringify({block:eth.blockNumber.toString(),peers:net.peerCount.toString(),account:eth.accounts[0],publicBalance:eth.getBalance(eth.accounts[0]).toString(10),zk:z,zkError:e})})()`
+	started := time.Now()
+	expr := `(function(){var z=null,e="";try{z=eth.getAccountState()}catch(x){e=x.toString()}return JSON.stringify({block:eth.blockNumber.toString(),peers:net.peerCount.toString(),mining:eth.mining,account:eth.accounts[0],publicBalance:eth.getBalance(eth.accounts[0]).toString(10),zk:z,zkError:e})})()`
 	out, err := a.orch.Attach(ctx, exp, node, server, expr)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("节点状态查询超时，请检查 SSH、IPC 和服务器负载；这不代表进程已退出：%w", ctx.Err())
+		}
+		if detail := strings.TrimSpace(out); detail != "" && !strings.Contains(err.Error(), detail) {
+			err = fmt.Errorf("%w: %s", err, detail)
+		}
 		a.setNodeError(exp.ID, node.ID, "unreachable", err.Error())
 		return err
 	}
@@ -916,14 +1410,16 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 		return err
 	}
 	var sample struct {
+		Mining        *bool  `json:"mining"`
 		Block         string `json:"block"`
 		Peers         string `json:"peers"`
 		Account       string `json:"account"`
 		PublicBalance string `json:"publicBalance"`
 		ZK            *struct {
-			Balance     string `json:"balance"`
-			Commitment  string `json:"commitment"`
-			LastTxBlock string `json:"lastTxBlockNumber"`
+			Balance         string `json:"balance"`
+			Commitment      string `json:"commitment"`
+			LastTxBlock     string `json:"lastTxBlockNumber"`
+			CommitmentReady *bool  `json:"commitmentReady"`
 		} `json:"zk"`
 		ZKError string `json:"zkError"`
 	}
@@ -939,8 +1435,24 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 	}
 	block, _ := strconv.ParseUint(blockText, base, 64)
 	peers, _ := strconv.Atoi(sample.Peers)
+	var privacyErr error
+	a.store.View(func(s model.State) {
+		current := node
+		for _, e := range s.Experiments {
+			if e.ID == exp.ID {
+				for _, n := range e.Nodes {
+					if n.ID == node.ID {
+						current = n
+					}
+				}
+			}
+		}
+		if privateAccountInitialized(s.Transactions, exp.ID, current) && (sample.ZK == nil || !privateStateOnChain(sample.ZK.LastTxBlock) || (sample.ZK.CommitmentReady != nil && !*sample.ZK.CommitmentReady) || (current.RecoveryWarning != "" && sample.ZK.CommitmentReady == nil)) {
+			privacyErr = errors.New("已初始化账户未恢复有效的隐私状态或承诺树，已暂停该节点的隐私交易；请检查 SN 读取和承诺树恢复，不要重复 CreateAccount")
+		}
+	})
 	now := time.Now()
-	return a.store.Update(func(s *model.State) error {
+	err = a.store.Update(func(s *model.State) error {
 		for i := range s.Experiments {
 			if s.Experiments[i].ID != exp.ID {
 				continue
@@ -950,13 +1462,25 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 				if n.ID != node.ID {
 					continue
 				}
+				if s.Experiments[i].Status != "running" || n.RecoveryStartedAt.After(started) || (n.Status == "recovering" && reason != "recovery") {
+					continue
+				}
 				oldBalance, oldCommitment, firstSample := n.ZKBalance, n.Commitment, n.LastSeen.IsZero()
-				n.Status = "running"
+				if reason != "recovery" {
+					n.Status = "running"
+				}
 				n.Block = block
 				n.Peers = peers
+				if s.Experiments[i].MiningStatus != "updating" && !s.Experiments[i].MiningUpdatedAt.After(started) {
+					n.Mining = sample.Mining
+				}
 				n.Account = sample.Account
 				n.PublicBalance = sample.PublicBalance
 				n.StateError = sample.ZKError
+				n.PrivateStateError = ""
+				if privacyErr != nil {
+					n.PrivateStateError = privacyErr.Error()
+				}
 				n.LastSeen = now
 				if sample.ZK != nil {
 					n.ZKBalance = sample.ZK.Balance
@@ -970,6 +1494,10 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return privacyErr
 }
 
 func (a *API) setNodeError(experimentID, nodeID, status, message string) {
@@ -978,8 +1506,12 @@ func (a *API) setNodeError(experimentID, nodeID, status, message string) {
 			if s.Experiments[i].ID == experimentID {
 				for j := range s.Experiments[i].Nodes {
 					if s.Experiments[i].Nodes[j].ID == nodeID {
+						if s.Experiments[i].Status != "running" || s.Experiments[i].Nodes[j].Status == "recovering" {
+							continue
+						}
 						s.Experiments[i].Nodes[j].Status = status
 						s.Experiments[i].Nodes[j].StateError = message
+						s.Experiments[i].Nodes[j].Mining = nil
 					}
 				}
 			}
@@ -1018,6 +1550,7 @@ func (a *API) transactions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t.ID = id("tx")
+	t.BatchID = ""
 	t.Status = "queued"
 	t.SubmittedAt = time.Now()
 	if err := a.enqueueTransaction(t); err != nil {
@@ -1048,6 +1581,21 @@ func transactionNodesBusy(transactions []model.Transaction, fromNode, toNode str
 
 func (a *API) enqueueTransaction(t model.Transaction) error {
 	return a.store.Update(func(s *model.State) error {
+		if err := transactionNodesAvailable(*s, t); err != nil {
+			return err
+		}
+		if t.Type == "createAccount" {
+			for _, experiment := range s.Experiments {
+				if experiment.ID != t.ExperimentID {
+					continue
+				}
+				for _, node := range experiment.Nodes {
+					if node.ID == t.FromNode && privateAccountInitialized(s.Transactions, t.ExperimentID, node) {
+						return errors.New("selected node already has a private account; CreateAccount must only run once")
+					}
+				}
+			}
+		}
 		if transactionNodesBusy(s.Transactions, t.FromNode, t.ToNode) {
 			return errors.New("selected node already has an active transaction; wait for it to finish")
 		}
@@ -1078,6 +1626,7 @@ func (a *API) runTransaction(t model.Transaction) {
 	var node model.Node
 	var server model.Server
 	var toNode model.Node
+	privateAccountReady := false
 	ok := false
 	a.store.View(func(s model.State) {
 		for _, e := range s.Experiments {
@@ -1099,13 +1648,49 @@ func (a *API) runTransaction(t model.Transaction) {
 				ok = true
 			}
 		}
+		privateAccountReady = privateAccountInitialized(s.Transactions, t.ExperimentID, node)
 	})
 	if !ok {
 		a.finishTx(t.ID, "failed", "", errors.New("experiment, node or server not found"))
 		return
 	}
+	if t.Type == "createAccount" && t.BatchID != "" {
+		lockAny, _ := a.serverSetupLocks.LoadOrStore(server.ID, &sync.Mutex{})
+		serverLock := lockAny.(*sync.Mutex)
+		serverLock.Lock()
+		defer serverLock.Unlock()
+		// Another node on this server may have spent minutes generating its
+		// proof. Refresh lifecycle and account state after that wait so a stop
+		// request or an already completed initialization is still respected.
+		a.store.View(func(s model.State) {
+			for _, currentExperiment := range s.Experiments {
+				if currentExperiment.ID != t.ExperimentID {
+					continue
+				}
+				exp = currentExperiment
+				for _, currentNode := range currentExperiment.Nodes {
+					if currentNode.ID == t.FromNode {
+						node = currentNode
+					}
+				}
+			}
+			privateAccountReady = privateAccountInitialized(s.Transactions, t.ExperimentID, node)
+		})
+	}
 	if exp.Status != "running" {
 		a.finishTx(t.ID, "failed", "", errors.New("experiment is not running"))
+		return
+	}
+	if node.Status != "running" || (t.Type == "transfer" && toNode.Status != "running") {
+		a.finishTx(t.ID, "failed", "", errors.New("节点不可达或正在恢复，本次交易未发送；请恢复节点后重试"))
+		return
+	}
+	if t.Type != "public" && (node.PrivateStateError != "" || (t.Type == "transfer" && toNode.PrivateStateError != "")) {
+		a.finishTx(t.ID, "failed", "", errors.New("节点隐私账户状态未恢复，本次交易未发送，请先恢复节点"))
+		return
+	}
+	if t.Type == "createAccount" && privateAccountReady {
+		a.finishTx(t.ID, "skipped", "", errors.New("private account is already initialized; duplicate CreateAccount was skipped"))
 		return
 	}
 	value := t.Value
@@ -1344,6 +1929,21 @@ func privateStateOnChain(block string) bool {
 	return block != "" && block != "0" && block != "0x0"
 }
 
+func privateAccountInitialized(transactions []model.Transaction, experimentID string, node model.Node) bool {
+	if node.ID == "" {
+		return false
+	}
+	if privateStateOnChain(node.LastTxBlock) {
+		return true
+	}
+	for _, tx := range transactions {
+		if tx.ExperimentID == experimentID && tx.FromNode == node.ID && tx.Type == "createAccount" && tx.Status == "confirmed" {
+			return true
+		}
+	}
+	return false
+}
+
 func transferCommand(fromName, toName, value string) string {
 	return fromName + ": JSON.stringify(eth.getPayerNextState('0x01'," + strconv.Quote(value) + "))\n" +
 		toName + ": eth.sendTransferTransaction({from:eth.accounts[0],value:" + strconv.Quote(value) + ",rs:'0x01',cmtANew:<payer.cmtANew>,snAOld:<payer.snAOld>,proofA:<payer.proofA>})"
@@ -1505,7 +2105,7 @@ func (a *API) workloads(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, errors.New("experimentId, type, positive ratePerSecond and durationSeconds are required"))
 		return
 	}
-	if !map[string]bool{"createAccount": true, "mint": true, "transfer": true, "redeem": true, "public": true}[v.Type] {
+	if !map[string]bool{"mint": true, "transfer": true, "redeem": true, "public": true}[v.Type] {
 		fail(w, 400, errors.New("unsupported workload transaction type"))
 		return
 	}
@@ -1575,6 +2175,9 @@ func (a *API) runWorkload(v model.Workload) {
 			routeCursor++
 			tx := model.Transaction{ID: id("tx"), WorkloadID: v.ID, Sequence: submitted + 1, ExperimentID: v.ExperimentID, Type: v.Type, FromNode: node.ID, ToNode: toNode, Value: v.Value, Status: "queued", SubmittedAt: time.Now()}
 			if err := a.store.Update(func(s *model.State) error {
+				if err := transactionNodesAvailable(*s, tx); err != nil {
+					return err
+				}
 				if transactionNodesBusy(s.Transactions, tx.FromNode, tx.ToNode) {
 					return errNodeBusy
 				}
@@ -1586,7 +2189,7 @@ func (a *API) runWorkload(v model.Workload) {
 				}
 				return nil
 			}); err != nil {
-				if errors.Is(err, errNodeBusy) {
+				if errors.Is(err, errNodeBusy) || errors.Is(err, errNodeUnavailable) {
 					continue
 				}
 				a.finishWorkload(v.ID, "failed", err.Error())
