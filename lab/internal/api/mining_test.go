@@ -364,7 +364,9 @@ node="${2%/geth.ipc}"
 node="${node##*/}"
 expression="$4"
 printf '%s %s\n' "$node" "$expression" >>"$bin/mining.log"
-if [[ "$expression" == *miner.start* ]]; then
+if [ "$expression" = eth.mining ]; then
+    echo false
+elif [[ "$expression" == *miner.start* ]]; then
     if [ -f "$bin/fail-start-$node" ]; then echo 'mock start failure' >&2; exit 1; fi
     echo true
 elif [[ "$expression" == *miner.stop* ]]; then
@@ -409,7 +411,8 @@ func TestRunMiningUpdateStartsTargetsBeforeStoppingExistingMiners(t *testing.T) 
 					t.Fatal(err)
 				}
 			}
-			exp, servers, err := a.beginMiningUpdate("experiment", 1)
+			mode, count := "auto", 1
+			exp, servers, err := a.beginMiningSelectionUpdate("experiment", miningUpdateRequest{MinerMode: &mode, MinerCount: &count})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -440,5 +443,163 @@ func TestRunMiningUpdateStartsTargetsBeforeStoppingExistingMiners(t *testing.T) 
 				t.Fatalf("partial failure incorrectly reported success: %+v", after)
 			}
 		})
+	}
+}
+
+func TestManualMiningUpdatePersistsSelectionAndRejectsAmbiguousCount(t *testing.T) {
+	a := newMiningTestAPI(t)
+	mode := "manual"
+	request := miningUpdateRequest{MinerMode: &mode, MinerSelections: []model.MinerSelection{{ServerID: "server-a", LocalIndex: 2}}}
+	exp, _, err := a.beginMiningSelectionUpdate("experiment", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp.MinerMode != "manual" || exp.MinerCount != 1 || exp.Nodes[0].IsMiner || !exp.Nodes[1].IsMiner || exp.Nodes[2].IsMiner {
+		t.Fatalf("manual configuration lost: %+v", exp)
+	}
+	exp.MinerSelections[0].LocalIndex = 99
+	if recoveryTestState(a).Experiments[0].MinerSelections[0].LocalIndex != 2 {
+		t.Fatal("returned selections alias stored config")
+	}
+	if err := a.store.Update(func(s *model.State) error { s.Experiments[0].MiningStatus = ""; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	before := recoveryTestState(a)
+	if _, _, err := a.beginMiningUpdate("experiment", 1); err == nil {
+		t.Fatal("count-only update erased explicit selection")
+	}
+	if !reflect.DeepEqual(before, recoveryTestState(a)) {
+		t.Fatal("ambiguous update mutated state")
+	}
+	mode = "auto"
+	count := 1
+	if _, _, err := a.beginMiningSelectionUpdate("experiment", miningUpdateRequest{MinerMode: &mode, MinerCount: &count}); err != nil {
+		t.Fatal(err)
+	}
+	if got := recoveryTestState(a).Experiments[0]; got.MinerMode != "auto" || len(got.MinerSelections) != 0 || !got.Nodes[0].IsMiner {
+		t.Fatalf("explicit auto switch failed: %+v", got)
+	}
+}
+
+func TestManualMiningRejectsInvalidOrUnavailableSelectionWithoutMutation(t *testing.T) {
+	for _, selections := range [][]model.MinerSelection{nil, {{ServerID: "server-a", LocalIndex: 2}, {ServerID: "server-a", LocalIndex: 2}}, {{ServerID: "missing", LocalIndex: 1}}, {{ServerID: "server-b", LocalIndex: 1}}} {
+		a := newMiningTestAPI(t)
+		if err := a.store.Update(func(s *model.State) error { s.Experiments[0].Nodes[2].Status = "unreachable"; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		before := recoveryTestState(a)
+		mode := "manual"
+		if _, _, err := a.beginMiningSelectionUpdate("experiment", miningUpdateRequest{MinerMode: &mode, MinerSelections: selections}); err == nil {
+			t.Fatalf("invalid manual selection accepted: %+v", selections)
+		}
+		if !reflect.DeepEqual(before, recoveryTestState(a)) {
+			t.Fatal("invalid selection changed state")
+		}
+	}
+}
+
+func TestSameCountRetryAndStartupDoNotReallocateAfterHostMetadataChanges(t *testing.T) {
+	a := newMiningTestAPI(t)
+	if err := a.store.Update(func(s *model.State) error {
+		e := &s.Experiments[0]
+		e.MinerCount = 1
+		e.Nodes[0].IsMiner = false
+		e.Nodes[1].IsMiner = true
+		s.Servers[0].HostGroup = "changed-host"
+		s.Servers[1].HostGroup = "changed-host"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	exp, _, err := a.beginMiningUpdate("experiment", 1)
+	if err != nil || exp.Nodes[0].IsMiner || !exp.Nodes[1].IsMiner {
+		t.Fatalf("same-count retry reallocated roles: %+v %v", exp, err)
+	}
+	state := recoveryTestState(a)
+	state.Experiments[0].MinerMode = "manual"
+	state.Experiments[0].MinerSelections = []model.MinerSelection{{ServerID: "server-a", LocalIndex: 2}}
+	migrateMiningState(&state)
+	if state.Experiments[0].Nodes[0].IsMiner || !state.Experiments[0].Nodes[1].IsMiner {
+		t.Fatal("startup changed persisted manual roles")
+	}
+}
+
+func TestExplicitEmptyMinerModeDoesNotEraseRolesAfterHostMetadataChanges(t *testing.T) {
+	for _, savedMode := range []string{"auto", "manual"} {
+		t.Run(savedMode, func(t *testing.T) {
+			a := newMiningTestAPI(t)
+			if err := a.store.Update(func(s *model.State) error {
+				s.Servers[0].HostGroup, s.Servers[1].HostGroup = "shared-host", "shared-host"
+				s.Servers = append(s.Servers, model.Server{ID: "server-c", Host: "local", HostGroup: "another-host"})
+				e := &s.Experiments[0]
+				e.MinerMode, e.MinerCount = savedMode, 2
+				e.Placements = append(e.Placements, model.Placement{ServerID: "server-c", Count: 1})
+				e.Nodes = append(e.Nodes, model.Node{ID: "node-4", ServerID: "server-c", Index: 4, LocalIndex: 1, Status: "running"})
+				e.Nodes[2].IsMiner = true
+				if savedMode == "manual" {
+					e.Nodes[0].IsMiner, e.Nodes[1].IsMiner = false, true
+					e.MinerSelections = []model.MinerSelection{{ServerID: "server-a", LocalIndex: 2}, {ServerID: "server-b", LocalIndex: 1}}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			before := recoveryTestState(a)
+			mode, count := "", 2
+			if _, _, err := a.beginMiningSelectionUpdate("experiment", miningUpdateRequest{MinerMode: &mode, MinerCount: &count}); err == nil {
+				t.Fatal("explicit empty mode was accepted")
+			}
+			if !reflect.DeepEqual(before, recoveryTestState(a)) {
+				t.Fatal("empty mode changed saved selections, roles or state")
+			}
+			rec := httptest.NewRecorder()
+			a.updateMiners(rec, httptest.NewRequest(http.MethodPost, "/api/experiments/experiment/miners", strings.NewReader(`{"minerMode":"","minerCount":2}`)), "experiment")
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("HTTP empty mode accepted: %d %s", rec.Code, rec.Body.String())
+			}
+			if !reflect.DeepEqual(before, recoveryTestState(a)) {
+				t.Fatal("rejected HTTP request changed persisted state")
+			}
+		})
+	}
+}
+
+func TestManualMiningHTTPDraftDerivesCount(t *testing.T) {
+	a := newMiningTestAPI(t)
+	if err := a.store.Update(func(s *model.State) error {
+		s.Experiments[0].Status = "draft"
+		s.Experiments[0].Nodes = nil
+		s.Servers[0].HostGroup = "physical-a"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRecorder()
+	a.updateMiners(r, httptest.NewRequest(http.MethodPost, "/api/experiments/experiment/miners", strings.NewReader(`{"minerMode":"manual","minerSelections":[{"serverId":"server-a","localIndex":2}]}`)), "experiment")
+	if r.Code != http.StatusOK {
+		t.Fatalf("manual update: %d %s", r.Code, r.Body.String())
+	}
+	exp := recoveryTestState(a).Experiments[0]
+	if exp.MinerCount != 1 || exp.MinerMode != "manual" || len(exp.Nodes) != 0 {
+		t.Fatalf("draft manual selection lost: %+v", exp)
+	}
+	if err := a.store.Update(func(s *model.State) error { s.Servers[0].HostGroup = "later-metadata"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var targets []model.MinerTarget
+	for _, event := range recoveryTestState(a).Events {
+		if event.Kind != "mining" {
+			continue
+		}
+		data, err := json.Marshal(event.Fields["selectedTargets"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &targets); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(targets) != 1 || targets[0].ServerID != "server-a" || targets[0].LocalIndex != 2 || targets[0].HostGroup != "physical-a" || targets[0].NodeID != "experiment-n2" {
+		t.Fatalf("immutable draft target audit missing: %+v", targets)
 	}
 }

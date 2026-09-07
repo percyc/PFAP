@@ -27,7 +27,7 @@ elif [[ "$expression" == *miner.stop* ]]; then
     printf 'false\n' >"$dir/mock-next"
     printf 'true\n'
 else
-    cat "$dir/mock-next"
+    if [ -f "$dir/mock-next" ]; then cat "$dir/mock-next"; else printf 'false\n'; fi
 fi
 `
 
@@ -44,7 +44,7 @@ func TestSetMiningWaitsForObservedState(t *testing.T) {
 		log := testRead(t, filepath.Join(dir, "mock-mining.log"))
 		command := "miner.stop(); eth.mining"
 		if enabled {
-			command = "miner.setEtherbase(eth.accounts[0]); miner.start(1); eth.mining"
+			command = "eth.mining\nminer.setEtherbase(eth.accounts[0]); miner.start(1); eth.mining"
 		}
 		if log != command+"\neth.mining\n" {
 			t.Fatalf("should command once then confirm asynchronous state, got %q", log)
@@ -109,15 +109,91 @@ func TestSetMiningCancellationStopsHungAttach(t *testing.T) {
 	}
 }
 
+func TestSetMiningPreflightDoesNotBlockStopOrAlreadyActiveMiner(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			fakeDiskCapacity(t, 0, 0)
+			dfLog := filepath.Join(t.TempDir(), "df.log")
+			t.Setenv("PFAP_TEST_DF_LOG", dfLog)
+			o, exp, node, server, dir := recoveryFixture(t, 2)
+			geth := filepath.Join(server.WorkDir, "artifacts", exp.ArtifactSHA, "pfap-runtime", "bin", "geth")
+			if err := os.WriteFile(geth, []byte(mockMiningGeth), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "mock-next"), []byte("true\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := o.SetMining(context.Background(), exp, node, server, enabled); err != nil {
+				t.Fatalf("disk-full should not block this action: %v", err)
+			}
+			if _, err := os.Stat(dfLog); !os.IsNotExist(err) {
+				t.Fatal("capacity was checked for an existing miner or miner.stop")
+			}
+			if enabled && testRead(t, filepath.Join(dir, "mock-mining.log")) != "eth.mining\n" {
+				t.Fatal("an already-active miner was restarted")
+			}
+		})
+	}
+}
+
+func TestSetMiningRejectsInsufficientSpaceBeforeStart(t *testing.T) {
+	fakeDiskCapacity(t, 2<<20, 5000)
+	o, exp, node, server, dir := recoveryFixture(t, 2)
+	geth := filepath.Join(server.WorkDir, "artifacts", exp.ArtifactSHA, "pfap-runtime", "bin", "geth")
+	if err := os.WriteFile(geth, []byte(mockMiningGeth), 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Preallocated-looking cache files must not be credited as completed DAGs.
+	cacheDir := filepath.Join(filepath.Dir(dir), "ethash")
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"full-R23-0000000000000000", "full-R23-290decd9548b62a8"} {
+		path := filepath.Join(cacheDir, name)
+		if err := os.WriteFile(path, []byte("malformed"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(path, 1<<30); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.SetMining(context.Background(), exp, node, server, true); err == nil || !strings.Contains(err.Error(), "insufficient free disk space") {
+		t.Fatalf("start was not rejected: %v", err)
+	}
+	if log := testRead(t, filepath.Join(dir, "mock-mining.log")); log != "eth.mining\n" {
+		t.Fatalf("miner.start reached geth without capacity: %q", log)
+	}
+}
+
+func TestSetMiningReservesOtherConfiguredMinersTemporaryDAGs(t *testing.T) {
+	fakeDiskCapacity(t, 4<<20, 5000)
+	o, exp, node, server, dir := recoveryFixture(t, 2)
+	geth := filepath.Join(server.WorkDir, "artifacts", exp.ArtifactSHA, "pfap-runtime", "bin", "geth")
+	if err := os.WriteFile(geth, []byte(mockMiningGeth), 0700); err != nil {
+		t.Fatal(err)
+	}
+	node.IsMiner, exp.MinerCount = true, 2
+	exp.Nodes = []model.Node{node, {ID: "other-miner", ServerID: server.ID, LocalIndex: 4, IsMiner: true}}
+	if err := o.SetMining(context.Background(), exp, node, server, true); err == nil || !strings.Contains(err.Error(), "insufficient free disk space") {
+		t.Fatalf("concurrent DAG generation was not reserved: %v", err)
+	}
+	if log := testRead(t, filepath.Join(dir, "mock-mining.log")); log != "eth.mining\n" {
+		t.Fatalf("miner.start reached geth without concurrent DAG capacity: %q", log)
+	}
+}
+
 func TestDeployConnectsNodesBeforeStartingDistributedMiners(t *testing.T) {
+	t.Run("auto", func(t *testing.T) { testDeployDistributedMiners(t, false) })
+	t.Run("manual", func(t *testing.T) { testDeployDistributedMiners(t, true) })
+}
+
+func testDeployDistributedMiners(t *testing.T, manual bool) {
 	if _, err := exec.LookPath("ss"); err != nil {
 		t.Skip("requires ss for deployment port preflight")
 	}
 	root := t.TempDir()
 	archive := filepath.Join(root, "runtime.tar.gz")
-	if err := os.WriteFile(archive, []byte("already-cached-test-runtime"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeDiskRuntimeArchive(t, archive, map[string]string{"pfap-runtime/fixture": "already-cached-test-runtime"})
 	sha, err := fileSHA(archive)
 	if err != nil {
 		t.Fatal(err)
@@ -126,13 +202,14 @@ func TestDeployConnectsNodesBeforeStartingDistributedMiners(t *testing.T) {
 	servers := map[string]model.Server{}
 	for i := 1; i <= 2; i++ {
 		id := "server-" + strconv.Itoa(i)
-		server := model.Server{ID: id, Name: id, Host: "local", P2PHost: "192.0.2." + strconv.Itoa(i), WorkDir: filepath.Join(root, id)}
+		server := model.Server{ID: id, Name: id, Host: "local", HostGroup: "physical-" + id, P2PHost: "192.0.2." + strconv.Itoa(i), WorkDir: filepath.Join(root, id)}
 		servers[id] = server
 		runtime := filepath.Join(server.WorkDir, "artifacts", sha, "pfap-runtime")
 		geth := "#!/bin/bash\nset -eu\n[ \"$1\" != version ] || exit 0\nexpression=\"$4\"\nprintf '%s:%s\\n' " + shell(id) + " \"$expression\" >>" + shell(logPath) + `
 case "$expression" in
     'eth.accounts[0]') printf '"0x1111111111111111111111111111111111111111"\n' ;;
     admin.nodeInfo.enode) printf '"enode://abcdef@0.0.0.0:30303"\n' ;;
+    eth.mining) printf 'false\n' ;;
     *) printf 'true\n' ;;
 esac
 `
@@ -147,12 +224,26 @@ esac
 		}
 	}
 	exp := model.Experiment{ID: "exp-miners", ArtifactPath: archive, MinerCount: 2, NetworkID: 55661, P2PPortBase: 49171, RPCPortBase: 49181, Topology: "full-mesh", Placements: []model.Placement{{ServerID: "server-1", Count: 2}, {ServerID: "server-2", Count: 1}}}
-	nodes, err := (Orchestrator{}).Deploy(context.Background(), &exp, servers, func(string, string, string, map[string]any) {})
+	if manual {
+		exp.MinerMode = "manual"
+		exp.MinerSelections = []model.MinerSelection{{ServerID: "server-1", LocalIndex: 2}, {ServerID: "server-2", LocalIndex: 1}}
+	}
+	var deployedTargets []model.MinerTarget
+	nodes, err := (Orchestrator{}).Deploy(context.Background(), &exp, servers, func(_, kind, _ string, fields map[string]any) {
+		if kind == "deploy" {
+			if targets, ok := fields["selectedTargets"].([]model.MinerTarget); ok {
+				deployedTargets = targets
+			}
+		}
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 3 || !nodes[0].IsMiner || nodes[1].IsMiner || !nodes[2].IsMiner {
-		t.Fatalf("miners should span servers (nodes 1 and 3): %+v", nodes)
+	if len(nodes) != 3 || nodes[0].IsMiner == manual || nodes[1].IsMiner != manual || !nodes[2].IsMiner {
+		t.Fatalf("deployment lost desired auto/manual selection: %+v", nodes)
+	}
+	if len(deployedTargets) != 2 || deployedTargets[0].HostGroup != "physical-server-1" || deployedTargets[1].HostGroup != "physical-server-2" {
+		t.Fatalf("deployment target snapshot missing: %+v", deployedTargets)
 	}
 	for _, node := range nodes {
 		if node.Mining == nil || *node.Mining != node.IsMiner {

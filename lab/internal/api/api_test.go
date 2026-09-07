@@ -292,7 +292,9 @@ func TestInitializeAccountsQueuesOnlyEligibleNodes(t *testing.T) {
 		state.Transactions = []model.Transaction{{ID: "active", ExperimentID: "exp-init", Type: "mint", FromNode: "busy", Status: "submitted"}}
 		return nil
 	})
-	h := New(s).Handler(http.NotFoundHandler())
+	// Exercise admission against a live-status fixture, without startup
+	// reconciliation or background monitors changing that fixture.
+	h := (&API{store: s, subscribers: map[chan model.Event]struct{}{}}).Handler(http.NotFoundHandler())
 	req := httptest.NewRequest(http.MethodPost, "/api/experiments/exp-init/initialize-accounts", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

@@ -1,0 +1,39 @@
+/* Keep operational pages focused; detailed settings are disclosed on demand. */
+.hero:has(~ .tab.active:not(#overview)){display:none}
+button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--green);outline-offset:3px}
+button:disabled{cursor:not-allowed;opacity:.5}
+#experiments.active{display:flex;flex-direction:column;gap:18px}
+#experiments>.build-profile-card{order:2;margin:0}
+.experiment-workspace{display:grid;gap:18px;min-width:0}
+.workspace-fold{padding:20px;border:1px solid var(--line);border-radius:14px;background:#0d1714;scroll-margin-top:90px}
+.workspace-fold>summary{cursor:pointer;font-weight:650}
+.workspace-fold>summary small{color:var(--muted);font-weight:400;margin-left:10px}
+.workspace-fold[open]>summary{margin-bottom:20px}
+#experimentForm{max-width:1000px}
+.workspace-filters{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-bottom:12px}
+.workspace-filters label:first-child{flex:1;min-width:180px}
+.workspace-filters label{min-width:160px}
+.workspace-filters button{margin:0;min-height:39px}
+.workspace-count{color:var(--muted);font-size:12px}
+.workspace-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:16px}
+.workspace-pagination button{margin:0 0 0 8px}
+.experiment-entry{border:1px solid var(--line);border-radius:10px;margin-top:10px;background:#0b1412;overflow:hidden}
+.experiment-compact{display:grid;grid-template-columns:minmax(160px,1.3fr) minmax(85px,.6fr) minmax(160px,1fr) minmax(130px,.8fr) auto;gap:16px;align-items:center;padding:16px}
+.experiment-compact>*{min-width:0;overflow-wrap:anywhere}
+.experiment-compact small{display:block;color:var(--muted);font-size:11px;margin-top:5px}
+.experiment-compact time{color:var(--muted);font-size:12px}
+.experiment-entry-actions{display:flex;gap:8px;flex-wrap:wrap}
+.experiment-entry-actions button{margin:0;white-space:nowrap}
+.experiment-entry .experiment-detail{border:0;border-top:1px solid var(--line);border-radius:0;margin:0;padding:20px;background:#101c18}
+.experiment-detail>.row-actions{position:relative;flex-wrap:wrap}
+.workspace-node-heading{font-size:13px;margin:20px 0 8px}.workspace-node-heading small{color:var(--muted);font-weight:400;margin-left:8px}
+.experiment-detail>details{padding:12px;border:1px solid var(--line);border-radius:8px}
+.hero{gap:24px;margin:0 0 24px}.hero h1{font-size:clamp(26px,3vw,40px)}
+#experimentCards{max-height:650px;overflow:auto;align-content:start;padding-right:4px}
+.node-list{max-height:520px;overflow:auto;overscroll-behavior:contain}
+#accountCards{max-height:680px;overflow:auto;overscroll-behavior:contain;padding-right:5px}
+#accountHistory{max-height:360px;overflow:auto}
+.events,.event{overflow-wrap:anywhere}
+#toast{z-index:20;max-width:min(520px,calc(100vw - 32px));overflow-wrap:anywhere}
+@media(max-width:1150px){.experiment-compact{grid-template-columns:1fr 1fr}.experiment-name{grid-column:1/-1}.experiment-entry-actions{grid-column:1/-1}}
+@media(max-width:600px){.workspace-fold{padding:14px}.workspace-fold>summary small{display:block;margin:6px 0 0}.experiment-compact{padding:14px;gap:12px}.experiment-entry .experiment-detail{padding:12px}.workspace-filters label{flex:1;min-width:140px}.workspace-pagination{align-items:flex-start}.experiment-numbers{grid-column:1/-1}nav button{padding:13px 12px}.section-head{flex-wrap:wrap}.node-list{max-height:420px}}

@@ -28,6 +28,14 @@ if [ "${1:-}" = attach ]; then
         printf '"enode://abcdef@0.0.0.0:30303"\n'
     elif [ -f "$dir/mock-console-false" ]; then
         printf 'false\n'
+    elif [[ "$expression" == *miner.start* ]]; then
+        printf 'true\n' >"$dir/mock-mining-enabled"
+        printf 'true\n'
+    elif [ "$expression" = eth.mining ]; then
+        if [ -f "$dir/mock-mining-enabled" ]; then cat "$dir/mock-mining-enabled"; else printf 'false\n'; fi
+    elif [[ "$expression" == miner.stop* ]]; then
+        printf 'false\n' >"$dir/mock-mining-enabled"
+        printf 'false\n'
     else
         printf 'true\n'
     fi
@@ -188,6 +196,67 @@ func TestRecoverNodeStartupFailureIncludesLog(t *testing.T) {
 	err := o.RecoverNode(ctx, exp, node, map[string]model.Server{server.ID: server}, nil)
 	if err == nil || !strings.Contains(err.Error(), "malformed SN: unexpected EOF") {
 		t.Fatalf("startup failure log missing: %v", err)
+	}
+}
+
+func TestRecoverNodeRejectsLowCapacityBeforeSpawn(t *testing.T) {
+	for _, index := range []int{1, 2} {
+		t.Run(strconv.Itoa(index), func(t *testing.T) {
+			fakeDiskCapacity(t, 0, 5000)
+			o, exp, node, server, dir := recoveryFixture(t, index)
+			err := o.RecoverNode(context.Background(), exp, node, map[string]model.Server{server.ID: server}, nil)
+			if err == nil || !strings.Contains(err.Error(), "insufficient free disk space") {
+				t.Fatalf("capacity failure was not explicit: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "mock-starts")); !os.IsNotExist(err) {
+				t.Fatal("low capacity did not prevent spawning geth")
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "ethash")); !os.IsNotExist(err) {
+				t.Fatal("capacity preflight ran after DAG directory creation")
+			}
+		})
+	}
+}
+
+func TestRecoverNodePIDHandoffDiskFullFailsImmediately(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("requires /dev/full to simulate ENOSPC")
+	}
+	bin := fakeDiskCapacity(t, 4<<20, 5000)
+	o, exp, node, server, dir := recoveryFixture(t, 2)
+	handoff := filepath.Join(dir, "test-pid-handoff")
+	if err := os.Symlink("/dev/full", handoff); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "mktemp"), []byte("#!/bin/bash\nprintf '%s\\n' "+shell(handoff)+"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	started := time.Now()
+	err := o.RecoverNode(ctx, exp, node, map[string]model.Server{server.ID: server}, nil)
+	if err == nil || !strings.Contains(err.Error(), "Node launcher failed") || !strings.Contains(err.Error(), "No space left on device") {
+		t.Fatalf("PID handoff failure was not explicit: %v", err)
+	}
+	if time.Since(started) > 3*time.Second {
+		t.Fatal("PID write failure waited for IPC timeout")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "mock-starts")); !os.IsNotExist(err) {
+		t.Fatal("geth executed after its PID handoff failed")
+	}
+}
+
+func TestRecoverNodeReservesConcurrentMinersBeforeSpawn(t *testing.T) {
+	fakeDiskCapacity(t, 4<<20, 5000)
+	o, exp, node, server, dir := recoveryFixture(t, 2)
+	node.IsMiner, exp.MinerCount = true, 2
+	exp.Nodes = []model.Node{node, {ID: "other-miner", ServerID: server.ID, LocalIndex: 4, IsMiner: true}}
+	err := o.RecoverNode(context.Background(), exp, node, map[string]model.Server{server.ID: server}, nil)
+	if err == nil || !strings.Contains(err.Error(), "insufficient free disk space") {
+		t.Fatalf("concurrent DAG generation was not reserved before recovery: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "mock-starts")); !os.IsNotExist(err) {
+		t.Fatal("recovery spawned geth without concurrent DAG capacity")
 	}
 }
 

@@ -13,6 +13,7 @@ function ui(elements = {}) {
     setTimeout,
     clearTimeout,
   });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'web/miners.js'), 'utf8'), context);
   vm.runInContext(functionsOnly, context);
   return context;
 }
@@ -123,9 +124,9 @@ test('running miner change is explicit, numeric, and does not invoke deploy', as
   context.toast = () => {};
   context.render = () => {};
   context.refresh = async () => {};
-  vm.runInContext("state.experiments = [{id:'exp-1',name:'Test',status:'running',minerCount:1}]", context);
+  vm.runInContext("state.experiments = [{id:'exp-1',name:'Test',status:'running',minerCount:1,placements:[{serverId:'srv',count:2}]}]", context);
   await context.applyMinerCount({ preventDefault() {}, currentTarget: { elements: { minerCount: { value: '2' } }, reportValidity: () => true } }, 'exp-1');
-  assert.deepEqual(requests, [{ url: '/experiments/exp-1/miners', body: { minerCount: 2 } }]);
+  assert.deepEqual(requests, [{ url: '/experiments/exp-1/miners', body: { minerMode: 'auto', minerCount: 2 } }]);
   assert.match(confirmation, /不会重启节点、清空数据或重发交易/);
   assert.match(confirmation, /总算力与出块节奏可能变化/);
 });

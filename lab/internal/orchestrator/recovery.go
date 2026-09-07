@@ -16,6 +16,7 @@ import (
 var recoveryID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 var recoverySHA = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 var recoveryProcessResult = regexp.MustCompile(`(?m)^recovery=(started|existing) pid=[1-9][0-9]* runtimeSha=([a-fA-F0-9]{64})$`)
+var recoveryAccountResult = regexp.MustCompile(`(?m)^recovery-account=([a-fA-F0-9]{40})$`)
 
 func nodeRuntimeSHA(exp model.Experiment, node model.Node) string {
 	if node.RuntimeSHA != "" {
@@ -38,28 +39,13 @@ func (o Orchestrator) RecoverNode(ctx context.Context, exp model.Experiment, nod
 	if !ok {
 		return fmt.Errorf("server %s not found", node.ServerID)
 	}
-	script, err := recoveryScript(exp, node, server)
-	if err != nil {
-		return err
-	}
 	if emit == nil {
 		emit = func(string, string, string, map[string]any) {}
 	}
-	startCtx, cancel := context.WithTimeout(ctx, 80*time.Second)
-	out, err := o.Remote.Run(startCtx, server, script)
-	cancel()
-	if result := recoveryProcessResult.FindStringSubmatch(out); len(result) == 3 {
-		node.RuntimeSHA = result[2]
-		if result[1] == "started" {
-			emit("info", "node-recovery-started", "existing node process restarted", map[string]any{"nodeId": node.ID, "restarted": true, "runtimeSha": node.RuntimeSHA})
-		} else {
-			emit("info", "node-recovery-existing", "existing node process adopted", map[string]any{"nodeId": node.ID, "restarted": false, "runtimeSha": node.RuntimeSHA})
-		}
-	}
+	node, err := o.recoverNodeProcess(ctx, exp, node, server, emit)
 	if err != nil {
-		return fmt.Errorf("recover %s: %w (%s)", node.Name, err, strings.TrimSpace(out))
+		return err
 	}
-	emit("info", "recovery", "node process ready", map[string]any{"nodeId": node.ID, "detail": strings.TrimSpace(out)})
 	if err := o.reconnectRecoveredNode(ctx, exp, node, server, servers, emit); err != nil {
 		return err
 	}
@@ -70,6 +56,34 @@ func (o Orchestrator) RecoverNode(ctx context.Context, exp model.Experiment, nod
 		emit("info", "recovery", "mining restored", map[string]any{"nodeId": node.ID})
 	}
 	return nil
+}
+
+// recoverNodeProcess returns identity observed from the original datadir and
+// the actual process runtime, including when a later readiness check fails.
+func (o Orchestrator) recoverNodeProcess(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, emit EmitFunc) (model.Node, error) {
+	script, err := recoveryScript(exp, node, server)
+	if err != nil {
+		return node, err
+	}
+	startCtx, cancel := context.WithTimeout(ctx, 80*time.Second)
+	out, err := o.Remote.Run(startCtx, server, script)
+	cancel()
+	if account := recoveryAccountResult.FindStringSubmatch(out); len(account) == 2 && node.Account == "" {
+		node.Account = "0x" + strings.ToLower(account[1])
+	}
+	if result := recoveryProcessResult.FindStringSubmatch(out); len(result) == 3 {
+		node.RuntimeSHA = result[2]
+		if result[1] == "started" {
+			emit("info", "node-recovery-started", "existing node process restarted", map[string]any{"nodeId": node.ID, "restarted": true, "runtimeSha": node.RuntimeSHA})
+		} else {
+			emit("info", "node-recovery-existing", "existing node process adopted", map[string]any{"nodeId": node.ID, "restarted": false, "runtimeSha": node.RuntimeSHA})
+		}
+	}
+	if err != nil {
+		return node, fmt.Errorf("recover %s: %w (%s)", node.Name, err, strings.TrimSpace(out))
+	}
+	emit("info", "recovery", "node process ready", map[string]any{"nodeId": node.ID, "detail": strings.TrimSpace(out)})
+	return node, nil
 }
 
 func recoveryScript(exp model.Experiment, node model.Node, server model.Server) (string, error) {
@@ -88,6 +102,14 @@ func recoveryScript(exp model.Experiment, node model.Node, server model.Server) 
 	}
 	base := strings.TrimRight(server.WorkDir, "/")
 	root := base + "/experiments/" + exp.ID + "/" + server.ID
+	requiredBytes := MinimumDiskFreeBytes
+	if model.NodeIsMiner(exp, node) {
+		requiredBytes = minerServerDiskRequiredBytes(exp, node, server)
+	}
+	diskCheck, err := diskPreflightScript(server, requiredBytes)
+	if err != nil {
+		return "", err
+	}
 	variables := "runtime=" + shell(base+"/artifacts/"+targetSHA+"/pfap-runtime") + "\n" +
 		"current_runtime=" + shell(base+"/artifacts/"+currentSHA+"/pfap-runtime") + "\n" +
 		"current_sha=" + shell(currentSHA) + "\n" +
@@ -117,31 +139,13 @@ address=$(tr -d '\r\n' <"$dir/address")
 [ -z "$expected_account" ] || [ "${address,,}" = "$expected_account" ] || fail "Stored account does not match the experiment account"
 key=$(find "$dir/keystore" -maxdepth 1 -type f -iname "*--$address" -print -quit 2>/dev/null) || fail "Existing keystore is missing"
 [ -n "$key" ] || fail "Keystore for the existing account is missing"
+printf 'recovery-account=%s\n' "$address"
 for command in setsid timeout flock; do command -v "$command" >/dev/null || fail "Required recovery command is missing: $command"; done
 # This lock only serializes Lab recovery. It does not replace geth's own
 # fcntl/LevelDB locks, which flock cannot test.
-exec 9>"$dir/.lab-recovery.lock"
+exec 9>"$dir/.lab-recovery.lock" || fail "Cannot open recovery lock; check disk capacity and permissions"
 flock -n 9 || fail "Another recovery operation is already running for this node"
-process_uses_datadir() {
-    local pid="$1" previous='' arg
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    [ -r "/proc/$pid/cmdline" ] || return 1
-    while IFS= read -r -d '' arg; do
-        if { [ "$previous" = --datadir ] && [ "$arg" = "$dir" ]; } || [ "$arg" = "--datadir=$dir" ]; then return 0; fi
-        previous="$arg"
-    done <"/proc/$pid/cmdline"
-    return 1
-}
-process_uses_runtime() {
-    local pid="$1" arg index=0
-    while IFS= read -r -d '' arg; do
-        if [ "$arg" = "$geth" ]; then matched_sha="$target_sha"; return 0; fi
-        if [ "$arg" = "$current_geth" ]; then matched_sha="$current_sha"; return 0; fi
-        index=$((index + 1))
-        [ "$index" -lt 2 ] || break
-    done <"/proc/$pid/cmdline"
-    return 1
-}
+` + processOwnershipScript + `
 ipc_ready() {
     timeout 4 "$ipc_geth" attach "$dir/geth.ipc" --exec 'typeof eth.blockNumber === "number"' 2>/dev/null | grep -qx true
 }
@@ -160,7 +164,7 @@ if [ -n "$pid" ]; then
         export PFAP_PRFKEY_DIR="$current_runtime/prfKey" LD_LIBRARY_PATH="$current_runtime/lib"
     fi
     ipc_ready || fail "Existing node process (PID $pid) is alive but IPC is unavailable; it was left running for inspection"
-    printf '%s\n' "$pid" >"$pidfile"
+    printf '%s\n' "$pid" >"$pidfile" || fail "Cannot persist existing node PID; check disk capacity and permissions"
     printf 'recovery=existing pid=%s runtimeSha=%s\n' "$pid" "$matched_sha"
     exit 0
 fi
@@ -196,28 +200,33 @@ for lock in "$dir/geth/LOCK" "$dir/geth/chaindata/LOCK" "$dir/geth/lightchaindat
     fi
 done
 if command -v ss >/dev/null && ss -H -ltn "sport = :$p2p_port" | grep -q .; then fail "P2P port $p2p_port is already in use"; fi
-mkdir -p "$root/ethash"
+` + diskCheck + `
+mkdir -p "$root/ethash" || fail "Cannot create DAG directory; check disk capacity and permissions"
 log_offset=0
 if [ -f "$dir/geth.log" ]; then log_offset=$(wc -c <"$dir/geth.log"); fi
 startup_state_failed() {
     tail -c "+$((log_offset + 1))" "$dir/geth.log" | grep -E 'Decode SNSbytes error|Decode string[[:space:]]+error|Restore private account state|decode SN (state|hex):' >/dev/null
 }
-startup_pidfile=$(mktemp "$dir/.lab-recovery-pid.XXXXXX")
+startup_pidfile=$(mktemp "$dir/.lab-recovery-pid.XXXXXX") || fail "Cannot create PID handoff file; check disk capacity and permissions"
 trap 'rm -f -- "$startup_pidfile"' EXIT
 # The new session's child writes its own PID immediately before exec. $!
 # can refer to the short-lived setsid parent and must not be persisted.
-nohup setsid bash -c 'printf "%s\n" "$BASHPID" >"$1"; shift; exec "$@"' lab-recovery "$startup_pidfile" \
+nohup setsid --wait bash -ec 'printf "%s\n" "$BASHPID" >"$1"; shift; exec "$@"' lab-recovery "$startup_pidfile" \
     "$geth" --datadir "$dir" --networkid "$network_id" --port "$p2p_port" \
     --ipcpath "$dir/geth.ipc" --unlock "$address" --password "$root/password.txt" \
     --ethash.dagdir "$root/ethash" --nodiscover --nousb \
     9>&- </dev/null >>"$dir/geth.log" 2>&1 &
+startup_launcher=$!
 deadline=$((SECONDS + 60))
 while [ "$SECONDS" -lt "$deadline" ]; do
-    candidate=$(cat "$startup_pidfile" 2>/dev/null || true)
+    if ! kill -0 "$startup_launcher" 2>/dev/null; then
+        wait "$startup_launcher" || fail "Node launcher failed; check disk capacity, permissions and startup log"
+    fi
+    candidate=$(head -c 64 "$startup_pidfile" 2>/dev/null || true)
     if process_uses_datadir "$candidate" && process_uses_runtime "$candidate"; then
         if [ -z "$pid" ]; then printf 'recovery=started pid=%s runtimeSha=%s\n' "$candidate" "$target_sha"; fi
         pid="$candidate"
-        printf '%s\n' "$pid" >"$pidfile"
+        printf '%s\n' "$pid" >"$pidfile" || fail "Cannot persist restarted node PID; check disk capacity and permissions (process left running)"
         if ipc_ready; then
             if startup_state_failed; then fail "Private account SN restore failed during this startup; process left running for inspection, recovery is incomplete"; fi
             printf 'recovery=ready pid=%s runtimeSha=%s\n' "$pid" "$target_sha"

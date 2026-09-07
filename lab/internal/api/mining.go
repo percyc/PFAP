@@ -16,7 +16,7 @@ import (
 func migrateMiningState(s *model.State) {
 	for i := range s.Experiments {
 		e := &s.Experiments[i]
-		legacy := e.MinerCount == 0
+		legacy := e.MinerMode != "manual" && e.MinerCount == 0
 		if legacy {
 			e.MinerCount = 1
 		}
@@ -33,15 +33,19 @@ func migrateMiningState(s *model.State) {
 	}
 }
 
+type miningUpdateRequest struct {
+	MinerCount      *int                   `json:"minerCount"`
+	MinerMode       *string                `json:"minerMode"`
+	MinerSelections []model.MinerSelection `json:"minerSelections"`
+}
+
 func (a *API) updateMiners(w http.ResponseWriter, r *http.Request, experimentID string) {
-	var request struct {
-		MinerCount int `json:"minerCount"`
-	}
+	var request miningUpdateRequest
 	if err := decode(r, &request); err != nil {
 		fail(w, http.StatusBadRequest, err)
 		return
 	}
-	exp, servers, err := a.beginMiningUpdate(experimentID, request.MinerCount)
+	exp, servers, err := a.beginMiningSelectionUpdate(experimentID, request)
 	if err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, os.ErrNotExist) {
@@ -50,7 +54,14 @@ func (a *API) updateMiners(w http.ResponseWriter, r *http.Request, experimentID 
 		fail(w, code, err)
 		return
 	}
-	a.emit(exp.ID, "info", "mining", "矿工目标配置已保存", map[string]any{"minerCount": exp.MinerCount, "status": exp.MiningStatus})
+	nodes := exp.Nodes
+	if len(nodes) == 0 {
+		nodes, err = model.ResolvePlannedMiners(exp, servers)
+		if err != nil {
+			a.emit(exp.ID, "error", "mining", "矿工配置已保存，但无法生成目标快照："+err.Error(), nil)
+		}
+	}
+	a.emit(exp.ID, "info", "mining", "矿工目标配置已保存", map[string]any{"minerCount": exp.MinerCount, "minerMode": exp.MinerMode, "minerSelections": exp.MinerSelections, "selectedTargets": model.SelectedMinerTargets(nodes, servers), "status": exp.MiningStatus})
 	if exp.Status == "running" {
 		go a.runMiningUpdate(exp, servers)
 		jsonOut(w, http.StatusAccepted, exp)
@@ -60,7 +71,16 @@ func (a *API) updateMiners(w http.ResponseWriter, r *http.Request, experimentID 
 }
 
 func (a *API) beginMiningUpdate(experimentID string, count int) (model.Experiment, map[string]model.Server, error) {
-	a.lifecycleMu.Lock()
+	return a.beginMiningSelectionUpdate(experimentID, miningUpdateRequest{MinerCount: &count})
+}
+
+func (a *API) beginMiningSelectionUpdate(experimentID string, request miningUpdateRequest) (model.Experiment, map[string]model.Server, error) {
+	if request.MinerMode != nil && *request.MinerMode != "auto" && *request.MinerMode != "manual" {
+		return model.Experiment{}, nil, errors.New("显式矿工模式只能为 auto 或 manual")
+	}
+	if !a.lifecycleMu.TryLock() {
+		return model.Experiment{}, nil, errLifecycleBusy
+	}
 	defer a.lifecycleMu.Unlock()
 	var exp model.Experiment
 	servers := map[string]model.Server{}
@@ -79,19 +99,37 @@ func (a *API) beginMiningUpdate(experimentID string, count int) (model.Experimen
 			if e.MiningStatus == "updating" {
 				return errors.New("矿工配置正在应用，请勿重复操作")
 			}
-			total := len(e.Nodes)
-			if total == 0 {
-				for _, p := range e.Placements {
-					total += p.Count
+			configured := *e
+			if request.MinerMode == nil {
+				if e.MinerMode == "manual" {
+					return errors.New("当前为手动选择，请显式提交 manual 选择或切换 auto；不能仅修改数量")
 				}
+				if len(request.MinerSelections) != 0 {
+					return errors.New("提交节点选择时必须指定 manual 模式")
+				}
+				configured.MinerMode, configured.MinerSelections = "auto", nil
+			} else {
+				configured.MinerMode = *request.MinerMode
+				configured.MinerSelections = append([]model.MinerSelection(nil), request.MinerSelections...)
 			}
-			if count < 1 || count > total {
-				return fmt.Errorf("矿工数量必须在 1 到 %d 之间", total)
+			if configured.MinerMode != "manual" {
+				if request.MinerCount == nil || *request.MinerCount < 1 {
+					return errors.New("自动模式必须指定有效矿工数量")
+				}
+				configured.MinerCount = *request.MinerCount
+			}
+			if err := model.NormalizeMinerConfiguration(&configured); err != nil {
+				return err
 			}
 			nodes := append([]model.Node(nil), e.Nodes...)
 			if len(nodes) > 0 {
-				if err := model.AssignMiners(nodes, count); err != nil {
-					return err
+				// A legacy same-count retry retains the stored assignment. Only an
+				// explicit auto request reapplies changed physical-host metadata.
+				preserve := request.MinerMode == nil && configured.MinerCount == model.EffectiveMinerCount(*e)
+				if !preserve {
+					if err := model.ResolveMiners(nodes, configured, servers); err != nil {
+						return err
+					}
 				}
 			}
 			if e.Status == "running" {
@@ -116,7 +154,8 @@ func (a *API) beginMiningUpdate(experimentID string, count int) (model.Experimen
 			}
 			// Validate everything before mutating: Store.Update is not a rollback
 			// transaction when its callback returns an error.
-			e.MinerCount, e.Nodes = count, nodes
+			e.MinerCount, e.Nodes = configured.MinerCount, nodes
+			e.MinerMode, e.MinerSelections = configured.MinerMode, append([]model.MinerSelection(nil), configured.MinerSelections...)
 			e.MiningError, e.MiningStatus = "", ""
 			e.MiningUpdatedAt = time.Now()
 			if e.Status == "running" {
@@ -124,6 +163,7 @@ func (a *API) beginMiningUpdate(experimentID string, count int) (model.Experimen
 			}
 			exp = *e
 			exp.Nodes = append([]model.Node(nil), nodes...)
+			exp.MinerSelections = append([]model.MinerSelection(nil), e.MinerSelections...)
 			return nil
 		}
 		return os.ErrNotExist
@@ -195,5 +235,5 @@ func (a *API) runMiningUpdate(exp model.Experiment, servers map[string]model.Ser
 	}); err != nil {
 		level, message = "error", "矿工操作结束，但保存结果失败："+err.Error()
 	}
-	a.emit(exp.ID, level, "mining", message, map[string]any{"minerCount": exp.MinerCount})
+	a.emit(exp.ID, level, "mining", message, map[string]any{"minerCount": exp.MinerCount, "minerMode": exp.MinerMode, "minerSelections": exp.MinerSelections, "selectedTargets": model.SelectedMinerTargets(exp.Nodes, servers)})
 }

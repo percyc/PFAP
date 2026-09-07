@@ -21,23 +21,32 @@ import (
 type EmitFunc func(level, kind, message string, fields map[string]any)
 type Orchestrator struct{ Remote remote.Runner }
 
+// DeploymentPreflightError guarantees no worker write or process action occurred.
+// The API may restore only its pristine, newly admitted deployment to draft.
+type DeploymentPreflightError struct{ Err error }
+
+func (e *DeploymentPreflightError) Error() string { return e.Err.Error() }
+func (e *DeploymentPreflightError) Unwrap() error { return e.Err }
+
 func shell(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
 func (o Orchestrator) Check(ctx context.Context, s model.Server) (string, error) {
-	return o.Remote.Run(ctx, s, `set -eu
+	diskScript, err := diskStatsScript(s)
+	if err != nil {
+		return "", err
+	}
+	return o.Remote.Run(ctx, s, `set -euo pipefail
 printf 'host=%s\n' "$(hostname)"
 printf 'kernel=%s\n' "$(uname -sr)"
 printf 'cpus=%s\n' "$(getconf _NPROCESSORS_ONLN)"
 printf 'memory_kb=%s\n' "$(awk '/MemTotal/{print $2}' /proc/meminfo)"
 printf 'memory_available_kb=%s\n' "$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
 printf 'load1=%s\n' "$(awk '{print $1}' /proc/loadavg)"
-printf 'disk_total_kb=%s\n' "$(df -Pk . | awk 'NR==2{print $2}')"
-printf 'disk_available_kb=%s\n' "$(df -Pk . | awk 'NR==2{print $4}')"
 command -v tar >/dev/null
 command -v sha256sum >/dev/null
 command -v setsid >/dev/null
 command -v ss >/dev/null
-`)
+`+diskScript)
 }
 
 func fileSHA(path string) (string, error) {
@@ -73,7 +82,16 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 	if err != nil {
 		return nil, err
 	}
+	if exp.ArtifactSHA != "" && !strings.EqualFold(exp.ArtifactSHA, sha) {
+		return nil, fmt.Errorf("runtime archive changed after deployment was planned: expected %s, got %s", exp.ArtifactSHA, sha)
+	}
 	exp.ArtifactSHA = sha
+	if err := o.deploymentDiskPreflight(ctx, *exp, servers, artifact); err != nil {
+		return nil, &DeploymentPreflightError{Err: err}
+	}
+	if emit == nil {
+		emit = func(string, string, string, map[string]any) {}
+	}
 	var nodes []model.Node
 	global := 1
 	for _, p := range exp.Placements {
@@ -124,7 +142,7 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 			return nil, fmt.Errorf("start %s: %w (%s)", s.Name, err, out)
 		}
 		for local := 1; local <= p.Count; local++ {
-			nodes = append(nodes, model.Node{ID: fmt.Sprintf("%s-n%d", exp.ID, global), Name: fmt.Sprintf("node-%d", global), ServerID: s.ID, Index: global, LocalIndex: local, P2PPort: exp.P2PPortBase + global - 1, RPCPort: exp.RPCPortBase + global - 1, Status: "running"})
+			nodes = append(nodes, model.Node{ID: fmt.Sprintf("%s-n%d", exp.ID, global), Name: fmt.Sprintf("node-%d", global), ServerID: s.ID, Index: global, LocalIndex: local, P2PPort: exp.P2PPortBase + global - 1, RPCPort: exp.RPCPortBase + global - 1, Status: "running", RuntimeSHA: sha})
 			global++
 		}
 	}
@@ -174,10 +192,11 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 		}
 		emit("info", "topology", "full-mesh topology ready", map[string]any{"nodes": len(nodes)})
 	}
-	if err := model.AssignMiners(nodes, minerCount); err != nil {
+	if err := model.ResolveMiners(nodes, *exp, servers); err != nil {
 		return nil, err
 	}
 	exp.MinerCount = minerCount
+	exp.Nodes = append([]model.Node(nil), nodes...)
 	for i := range nodes {
 		mining := false
 		if nodes[i].IsMiner {
@@ -188,21 +207,13 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 		}
 		nodes[i].Mining = &mining
 	}
-	emit("info", "deploy", "all nodes started", map[string]any{"count": len(nodes), "minerCount": minerCount, "artifactSha256": sha})
+	emit("info", "deploy", "all nodes started", map[string]any{"count": len(nodes), "minerCount": minerCount, "artifactSha256": sha, "minerMode": exp.MinerMode, "selectedTargets": model.SelectedMinerTargets(nodes, servers)})
 	return nodes, nil
 }
 
 func (o Orchestrator) Stop(ctx context.Context, exp model.Experiment, servers map[string]model.Server, emit EmitFunc) error {
-	for _, p := range exp.Placements {
-		s := servers[p.ServerID]
-		base := strings.TrimRight(s.WorkDir, "/")
-		script := "set -eu\nroot=" + shell(base+"/experiments/"+exp.ID+"/"+s.ID) + "\nfor f in \"$root\"/node*/geth.pid; do [ -f \"$f\" ] || continue; pid=$(cat \"$f\"); kill \"$pid\" 2>/dev/null || true; done\n"
-		if _, err := o.Remote.Run(ctx, s, script); err != nil {
-			return err
-		}
-	}
-	emit("info", "lifecycle", "experiment stopped", nil)
-	return nil
+	_, err := o.StopNodes(ctx, exp, servers, emit)
+	return err
 }
 
 func (o Orchestrator) Attach(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, expression string) (string, error) {
@@ -220,7 +231,7 @@ func (o Orchestrator) Attach(ctx context.Context, exp model.Experiment, node mod
 func (o Orchestrator) TransactionTimings(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, hash string) (proofUs, verifyUs int64, err error) {
 	base := strings.TrimRight(server.WorkDir, "/")
 	logPath := base + "/experiments/" + exp.ID + "/" + server.ID + "/node" + strconv.Itoa(node.LocalIndex) + "/geth.log"
-	out, err := o.Remote.Run(ctx, server, "tail -n 2000 "+shell(logPath)+"\n")
+	out, err := o.Remote.Run(ctx, server, retainedLogTail(logPath, 2000))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -234,7 +245,7 @@ func (o Orchestrator) TransactionTimings(ctx context.Context, exp model.Experime
 func (o Orchestrator) RecentProofTimings(ctx context.Context, exp model.Experiment, node model.Node, server model.Server) (proofUs, verifyUs int64, err error) {
 	base := strings.TrimRight(server.WorkDir, "/")
 	logPath := base + "/experiments/" + exp.ID + "/" + server.ID + "/node" + strconv.Itoa(node.LocalIndex) + "/geth.log"
-	out, err := o.Remote.Run(ctx, server, "tail -n 200 "+shell(logPath)+"\n")
+	out, err := o.Remote.Run(ctx, server, retainedLogTail(logPath, 200))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -312,7 +323,7 @@ var txVerifyTimeRE = regexp.MustCompile(`Verify .+ transaction Cost Time \(ms\):
 func (o Orchestrator) TransactionPhaseTimings(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, hash string) (generationUs, verificationUs int64, err error) {
 	base := strings.TrimRight(server.WorkDir, "/")
 	logPath := base + "/experiments/" + exp.ID + "/" + server.ID + "/node" + strconv.Itoa(node.LocalIndex) + "/geth.log"
-	out, err := o.Remote.Run(ctx, server, "tail -n 4000 "+shell(logPath)+"\n")
+	out, err := o.Remote.Run(ctx, server, retainedLogTail(logPath, 4000))
 	if err != nil {
 		return 0, 0, err
 	}

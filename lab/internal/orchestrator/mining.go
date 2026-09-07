@@ -17,6 +17,20 @@ func (o Orchestrator) SetMining(ctx context.Context, exp model.Experiment, node 
 	defer cancel()
 	expression := "miner.stop(); eth.mining"
 	if enabled {
+		out, err := o.Attach(ctx, exp, node, server, "eth.mining")
+		if err != nil {
+			return fmt.Errorf("read mining state on %s: %w (%s)", node.Name, err, strings.TrimSpace(out))
+		}
+		mining, ok := consoleBoolean(out)
+		if !ok {
+			return fmt.Errorf("set mining=true on %s: console did not return eth.mining: %s", node.Name, strings.TrimSpace(out))
+		}
+		if mining {
+			return nil
+		}
+		if err := o.CheckDisk(ctx, server, minerServerDiskRequiredBytes(exp, node, server)); err != nil {
+			return fmt.Errorf("start mining on %s: %w", node.Name, err)
+		}
 		expression = "miner.setEtherbase(eth.accounts[0]); miner.start(1); eth.mining"
 	}
 	for {

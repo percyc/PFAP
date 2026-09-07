@@ -6,6 +6,7 @@ type Server struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
 	Host           string    `json:"host"`
+	HostGroup      string    `json:"hostGroup,omitempty"`
 	P2PHost        string    `json:"p2pHost,omitempty"`
 	Port           int       `json:"port"`
 	User           string    `json:"user"`
@@ -15,6 +16,8 @@ type Server struct {
 	Labels         []string  `json:"labels,omitempty"`
 	Status         string    `json:"status"`
 	LastCheck      time.Time `json:"lastCheck,omitempty"`
+	LastSuccessAt  time.Time `json:"lastSuccessAt,omitempty"`
+	LastError      string    `json:"lastError,omitempty"`
 	SystemInfo     string    `json:"systemInfo,omitempty"`
 	CreatedAt      time.Time `json:"createdAt"`
 }
@@ -24,27 +27,34 @@ type Placement struct {
 	Count    int    `json:"count"`
 }
 
+type MinerSelection struct {
+	ServerID   string `json:"serverId"`
+	LocalIndex int    `json:"localIndex"`
+}
+
 type Experiment struct {
-	ID                  string      `json:"id"`
-	Name                string      `json:"name"`
-	Status              string      `json:"status"`
-	NetworkID           int         `json:"networkId"`
-	P2PPortBase         int         `json:"p2pPortBase"`
-	RPCPortBase         int         `json:"rpcPortBase"`
-	ArtifactPath        string      `json:"artifactPath"`
-	ArtifactSHA         string      `json:"artifactSha,omitempty"`
-	RecoveryArtifactSHA string      `json:"recoveryArtifactSha,omitempty"`
-	Topology            string      `json:"topology"`
-	MinerCount          int         `json:"minerCount"`
-	MiningStatus        string      `json:"miningStatus,omitempty"`
-	MiningError         string      `json:"miningError,omitempty"`
-	MiningUpdatedAt     time.Time   `json:"miningUpdatedAt,omitempty"`
-	Placements          []Placement `json:"placements"`
-	Nodes               []Node      `json:"nodes,omitempty"`
-	CreatedAt           time.Time   `json:"createdAt"`
-	StartedAt           time.Time   `json:"startedAt,omitempty"`
-	FinishedAt          time.Time   `json:"finishedAt,omitempty"`
-	Error               string      `json:"error,omitempty"`
+	ID                  string           `json:"id"`
+	Name                string           `json:"name"`
+	Status              string           `json:"status"`
+	NetworkID           int              `json:"networkId"`
+	P2PPortBase         int              `json:"p2pPortBase"`
+	RPCPortBase         int              `json:"rpcPortBase"`
+	ArtifactPath        string           `json:"artifactPath"`
+	ArtifactSHA         string           `json:"artifactSha,omitempty"`
+	RecoveryArtifactSHA string           `json:"recoveryArtifactSha,omitempty"`
+	Topology            string           `json:"topology"`
+	MinerCount          int              `json:"minerCount"`
+	MinerMode           string           `json:"minerMode,omitempty"`
+	MinerSelections     []MinerSelection `json:"minerSelections,omitempty"`
+	MiningStatus        string           `json:"miningStatus,omitempty"`
+	MiningError         string           `json:"miningError,omitempty"`
+	MiningUpdatedAt     time.Time        `json:"miningUpdatedAt,omitempty"`
+	Placements          []Placement      `json:"placements"`
+	Nodes               []Node           `json:"nodes,omitempty"`
+	CreatedAt           time.Time        `json:"createdAt"`
+	StartedAt           time.Time        `json:"startedAt,omitempty"`
+	FinishedAt          time.Time        `json:"finishedAt,omitempty"`
+	Error               string           `json:"error,omitempty"`
 }
 
 type Node struct {
@@ -97,6 +107,10 @@ type Transaction struct {
 	Status                      string    `json:"status"`
 	Hash                        string    `json:"hash,omitempty"`
 	Error                       string    `json:"error,omitempty"`
+	ExecutionStage              string    `json:"executionStage,omitempty"`
+	SubmissionAttemptedAt       time.Time `json:"submissionAttemptedAt,omitempty"`
+	LastCheckedAt               time.Time `json:"lastCheckedAt,omitempty"`
+	ReconciliationError         string    `json:"reconciliationError,omitempty"`
 	Command                     string    `json:"command,omitempty"`
 	SubmittedAt                 time.Time `json:"submittedAt"`
 	ProvingAt                   time.Time `json:"provingAt,omitempty"`
@@ -136,20 +150,25 @@ type AccountSnapshot struct {
 }
 
 type Workload struct {
-	ID              string    `json:"id"`
-	ExperimentID    string    `json:"experimentId"`
-	Name            string    `json:"name"`
-	Type            string    `json:"type"`
-	Value           string    `json:"value"`
-	RatePerSecond   float64   `json:"ratePerSecond"`
-	DurationSeconds int       `json:"durationSeconds"`
-	Strategy        string    `json:"strategy"`
-	Status          string    `json:"status"`
-	Submitted       int       `json:"submitted"`
-	CreatedAt       time.Time `json:"createdAt"`
-	StartedAt       time.Time `json:"startedAt,omitempty"`
-	FinishedAt      time.Time `json:"finishedAt,omitempty"`
-	Error           string    `json:"error,omitempty"`
+	ID                  string    `json:"id"`
+	ExperimentID        string    `json:"experimentId"`
+	Name                string    `json:"name"`
+	Type                string    `json:"type"`
+	Value               string    `json:"value"`
+	RatePerSecond       float64   `json:"ratePerSecond"`
+	DurationSeconds     int       `json:"durationSeconds"`
+	Strategy            string    `json:"strategy"`
+	Status              string    `json:"status"`
+	Submitted           int       `json:"submitted"`
+	Attempted           int       `json:"attempted"`
+	SkippedBusy         int       `json:"skippedBusy"`
+	SkippedUnavailable  int       `json:"skippedUnavailable"`
+	StopRequested       bool      `json:"stopRequested"`
+	SubmissionStoppedAt time.Time `json:"submissionStoppedAt,omitempty"`
+	CreatedAt           time.Time `json:"createdAt"`
+	StartedAt           time.Time `json:"startedAt,omitempty"`
+	FinishedAt          time.Time `json:"finishedAt,omitempty"`
+	Error               string    `json:"error,omitempty"`
 }
 
 type State struct {

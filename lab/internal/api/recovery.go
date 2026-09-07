@@ -67,7 +67,9 @@ func (a *API) beginNodeRecovery(experimentID, nodeID string) (model.Experiment, 
 	var exp model.Experiment
 	var node model.Node
 	servers := map[string]model.Server{}
-	a.lifecycleMu.Lock()
+	if !a.lifecycleMu.TryLock() {
+		return exp, node, servers, errLifecycleBusy
+	}
 	defer a.lifecycleMu.Unlock()
 	err := a.store.Update(func(s *model.State) error {
 		for _, server := range s.Servers {

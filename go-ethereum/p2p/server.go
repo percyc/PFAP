@@ -709,7 +709,10 @@ func (srv *Server) encHandshakeChecks(peers map[discover.NodeID]*Peer, inboundCo
 		return DiscTooManyPeers
 	case peers[c.id] != nil:
 		return DiscAlreadyConnected
-	case c.id == srv.Self().ID:
+	// This runs in the network loop. Stop holds srv.lock while waiting for
+	// that loop, so calling Self here would deadlock with shutdown. The local
+	// handshake identity is immutable for the lifetime of this server run.
+	case c.id == srv.ourHandshake.ID:
 		return DiscSelf
 	default:
 		return nil
@@ -783,7 +786,13 @@ func (srv *Server) listenLoop() {
 
 	for {
 		// Wait for a handshake slot before accepting.
-		<-slots
+		// Pending SetupConn calls may need srv.lock, which Stop holds while
+		// waiting for this loop. Shutdown must not depend on a returned slot.
+		select {
+		case <-slots:
+		case <-srv.quit:
+			return
+		}
 
 		var (
 			fd  net.Conn

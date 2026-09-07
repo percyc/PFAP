@@ -9,6 +9,10 @@
 <link rel="stylesheet" href="/workloads.css">
 <link rel="stylesheet" href="/transactions.css">
 <link rel="stylesheet" href="/console.css">
+<link rel="stylesheet" href="/disk.css">
+<link rel="stylesheet" href="/servers.css">
+<link rel="stylesheet" href="/miners.css">
+<link rel="stylesheet" href="/workspace.css">
 </head>
 <body>
 <header>
@@ -20,6 +24,8 @@
 <div><span id="health" class="pill">连接中</span><button id="logout" class="action">退出</button></div>
 </header>
 <main>
+  <aside id="storageWarning" class="storage-warning" role="alert" hidden></aside>
+  <aside id="diskWarning" class="disk-warning" role="status" aria-live="polite" hidden></aside>
   <section class="hero">
 <div>
 <p class="eyebrow">EXPERIMENT CONTROL PLANE</p>
@@ -64,63 +70,69 @@
 </div>
 </section>
   <section id="servers" class="tab">
-<div class="split">
-<article>
-<h2>SSH 服务器</h2>
+<article class="server-inventory">
+<div class="server-inventory-head"><div><h2>服务器</h2><p>按名称、地址或宿主机查找，跨页选择后统一管理。</p></div><div class="row-actions"><button id="addServer" type="button" class="action">添加服务器</button><button id="addBatchServers" type="button" class="action secondary">批量添加</button></div></div>
+<div id="serverSummary" class="server-inventory-summary" aria-live="polite"></div>
+<div class="server-filters">
+<label class="server-search">查找服务器<input id="serverSearch" type="search" placeholder="名称、IP 或宿主机" autocomplete="off"></label>
+<label>连接状态<select id="serverConnectionFilter"><option value="all">全部连接</option><option value="online">在线</option><option value="error">连接异常</option><option value="unknown">待检查</option></select></label>
+<label>磁盘状态<select id="serverDiskFilter"><option value="all">全部磁盘</option><option value="alert">有空间告警</option><option value="critical">严重不足</option><option value="healthy">空间正常</option><option value="unknown">尚未采集</option><option value="stale">采样过期</option></select></label>
+<label>排序<select id="serverSort"><option value="name">名称自然排序</option><option value="host">IP / 主机地址</option><option value="created">最近添加优先</option></select></label>
+</div>
 <div class="server-batch-toolbar">
-<label class="server-select-all"><input id="selectAllServers" type="checkbox"> 全选</label>
-<span id="serverSelectionCount">已选 0 台</span>
+<label class="server-select-all"><input id="selectAllServers" type="checkbox"> 选择当前页</label>
+<span id="serverSelectionCount" aria-live="polite">已选 0 台</span>
+<button id="clearServerSelection" type="button" class="action secondary" disabled>清除选择</button>
+<button id="batchServerHostGroup" type="button" class="action secondary" disabled>设置宿主机</button>
 <button id="batchTrustServers" type="button" class="action secondary" disabled>批量信任</button>
 <button id="batchDeleteServers" type="button" class="action danger" disabled>批量删除</button>
 </div>
-<div id="serverRows">
-</div>
+<div id="serverRows"></div>
+<div class="server-pagination"><span id="serverResultCount" aria-live="polite"></span><label>每页<select id="serverPageSize"><option value="10">10 台</option><option value="20">20 台</option><option value="50">50 台</option></select></label><div><button id="serverPreviousPage" type="button" class="action secondary">上一页</button><span id="serverPageInfo" aria-live="polite">第 1 / 1 页</span><button id="serverNextPage" type="button" class="action secondary">下一页</button></div></div>
 </article>
-<article>
-<h2 id="serverFormTitle">添加服务器</h2>
+<dialog id="serverEditor" class="console-dialog server-editor" aria-labelledby="serverFormTitle">
+<div class="dialog-head"><h2 id="serverFormTitle">添加服务器</h2><button id="closeServerEditor" type="button" class="icon-button" aria-label="关闭服务器编辑">×</button></div>
+<p id="serverEditorError" class="server-editor-error" role="alert" hidden></p>
 <form id="serverForm">
 <input type="hidden" name="serverId">
-<label>名称<input name="name" required placeholder="worker-hk-1">
-</label>
-<label>主机<input name="host" required placeholder="10.0.0.11">
-</label>
-<label>P2P 公告地址（默认同 SSH 主机）<input name="p2pHost" placeholder="10.0.0.11"></label>
-<div class="pair">
-<label>SSH 用户<input name="user" required value="pfap">
-</label>
-<label>端口<input name="port" type="number" value="22">
-</label>
-</div>
-<label>私钥路径<input name="identityFile" placeholder="/home/user/.ssh/id_ed25519">
-</label>
-<label>远端工作目录<input name="workDir" value="/opt/pfap-lab">
-</label>
-<div class="form-actions"><button id="saveServer" type="submit" class="primary">保存服务器</button><button id="cancelServerEdit" type="button" class="action secondary" hidden>取消编辑</button></div>
+<div class="pair"><label>名称<input name="name" required placeholder="worker-hk-1"></label><label>主机 / IP<input name="host" required placeholder="10.0.0.11"></label></div>
+<label>宿主机标注（可选）<input name="hostGroup" placeholder="例如 pve-01" aria-describedby="serverHostGroupHint"><small id="serverHostGroupHint">同一物理宿主机的容器填写相同标注；仅手动元数据，不需要宿主机凭据，也不会自动切换已有矿工。</small></label>
+<label>实验通信地址（P2P）<input name="p2pHost" placeholder="例如 100.99.0.99" aria-describedby="serverNetworkHint"></label>
+<div class="network-picker"><button id="networkReadButton" type="button" class="action secondary" onclick="readServerNetwork()">读取服务器网卡</button><label>选择实验通信网卡<select id="serverNetworkChoice" onchange="chooseServerNetwork(this)" disabled><option value="">读取网卡后选择，或在上方手动填写</option></select></label><p id="serverNetworkStatus" role="status"></p><small id="serverNetworkHint">只设置其他节点连接本机的 IPv4 地址，不绑定系统网卡、不修改默认路由、SSH 或 Web 地址。网卡地址不代表其他节点一定可达，请使用实验网络中互通的地址。留空时远端服务器使用 SSH 主机地址；local 服务器请明确填写。新服务器请先保存 SSH 配置再读取。</small></div>
+<div class="pair"><label>SSH 用户<input name="user" required value="pfap"></label><label>端口<input name="port" type="number" min="1" max="65535" value="22"></label></div>
+<label>私钥路径<input name="identityFile" placeholder="/home/user/.ssh/id_ed25519"></label>
+<label>远端工作目录<input name="workDir" value="/opt/pfap-lab"></label>
+<p id="serverConnectionHint" class="server-lock-hint" hidden></p>
+<div class="form-actions"><button id="saveServer" type="submit" class="primary">保存服务器</button><button id="cancelServerEdit" type="button" class="action secondary">取消</button></div>
 </form>
-<details class="batch-server-panel">
-<summary>批量添加服务器</summary>
-<form id="batchServerForm">
+<form id="batchServerForm" hidden>
 <label>IP 或主机名列表<textarea name="hosts" rows="6" required placeholder="192.168.50.51&#10;192.168.50.52&#10;worker-03.internal"></textarea><small>每行一个，也支持逗号、空格或分号分隔；单次最多 100 台。</small></label>
-<label>名称前缀<input name="namePrefix" value="worker" required placeholder="worker"></label>
+<div class="pair"><label>名称前缀<input name="namePrefix" value="worker" required></label><label>共同宿主机标注（可选）<input name="hostGroup" placeholder="例如 pve-01"></label></div>
+<small>同批次共享该宿主机标注；来自不同物理主机时，可分批添加或稍后选中服务器批量标注。</small>
 <div class="pair"><label>SSH 用户<input name="user" required value="pfap"></label><label>端口<input name="port" type="number" min="1" max="65535" value="22"></label></div>
 <label>私钥路径<input name="identityFile" placeholder="/home/user/.ssh/id_ed25519"></label>
 <label>远端工作目录<input name="workDir" value="/opt/pfap-lab" required></label>
 <button type="submit" class="primary">批量创建</button>
 </form>
-</details>
-</article>
-</div>
+</dialog>
+<dialog id="serverHostGroupDialog" class="console-dialog server-editor server-group-dialog" aria-labelledby="serverGroupTitle">
+<div class="dialog-head"><h2 id="serverGroupTitle">设置所选服务器的宿主机</h2><button id="closeServerHostGroup" type="button" class="icon-button" aria-label="关闭宿主机设置">×</button></div>
+<p>同一物理宿主机的容器使用相同标注。这只更新手动元数据，不会自动切换现有实验的矿工角色。</p><pre id="serverGroupScope"></pre>
+<form id="serverHostGroupForm"><label>宿主机标注<input id="serverGroupInput" name="hostGroup" placeholder="例如 pve-01" aria-describedby="serverGroupHint"></label><small id="serverGroupHint">留空会清除所选服务器的宿主机标注；最多 80 个字符。</small><p id="serverGroupError" class="server-editor-error" role="alert" hidden></p><button type="submit" class="primary">保存宿主机标注</button></form>
+</dialog>
 </section>
   <section id="experiments" class="tab">
-<article class="build-profile-card"><div class="section-head"><div><h2>构建与密钥档案</h2><p>记录一次性电路编译、密钥生成、文件大小及构建主机环境。</p></div></div><div id="buildProfile"></div></article>
-<div class="split">
+<details class="build-profile-card workspace-fold"><summary>构建与密钥档案 <small>编译耗时、各电路密钥与主机配置</small></summary><div id="buildProfile"></div></details>
+<div class="experiment-workspace">
 <article>
-<h2>实验列表</h2>
+<div class="section-head"><div><h2>实验列表</h2><p>最新创建的实验在前；展开一项即可管理节点、矿工与运行状态。</p></div><button type="button" class="action" onclick="openExperimentCreate()">新建实验</button></div>
+<div class="workspace-filters"><label>搜索实验<input id="experimentSearch" type="search" placeholder="名称、实验 ID 或 Network ID" oninput="filterExperiments('query',this.value)"></label><label>实验状态<select id="experimentStatusFilter" onchange="filterExperiments('status',this.value)"><option value="">全部状态</option><option value="running">运行中</option><option value="attention">需要关注</option><option value="busy">操作中</option><option value="stopped">已停止</option><option value="draft">待部署</option></select></label><button class="action secondary" type="button" onclick="resetExperimentFilters()">重置筛选</button></div>
+<p id="experimentResultCount" class="workspace-count" aria-live="polite"></p>
 <div id="experimentRows">
 </div>
+<div id="experimentPagination" class="workspace-pagination"></div>
 </article>
-<article>
-<h2>新建实验</h2>
+<details id="experimentCreate" class="workspace-fold"><summary>新建实验 <small>配置部署服务器与矿工节点</small></summary>
 <form id="experimentForm">
 <label>实验名称<input name="name" required placeholder="transfer-baseline">
 </label>
@@ -139,11 +151,13 @@
 <label>部署服务器（可多选）<select name="serverId" id="serverSelect" multiple size="5" required>
 </select>
 </label>
-<label>矿工节点数<input name="minerCount" id="newExperimentMinerCount" type="number" min="1" step="1" value="1" required aria-describedby="minerPlacementPreview"></label>
+<fieldset class="miner-mode-switch new-miner-mode"><legend>矿工选择方式</legend><label><input type="radio" id="miners-new-mode-auto" name="minerMode" value="auto" checked onchange="changeNewMinerMode(this.value)">自动分散</label><label><input type="radio" id="miners-new-mode-manual" name="minerMode" value="manual" onchange="changeNewMinerMode(this.value)">手动选节点</label></fieldset>
+<label><span id="newMinerCountLabel">矿工节点数</span><input name="minerCount" id="newExperimentMinerCount" type="number" min="1" max="100" step="1" value="1" required aria-describedby="minerPlacementPreview"></label>
 <div id="minerPlacementPreview" class="miner-placement-preview" aria-live="polite">先选择部署服务器，再设置矿工节点数。</div>
+<div id="newExperimentDiskHint" aria-live="polite"></div>
 <button type="submit" class="primary">创建实验</button>
 </form>
-</article>
+</details>
 </div>
 </section>
   <section id="transactions" class="tab">
@@ -187,7 +201,10 @@
 <div class="transaction-secondary">
 <article class="transaction-history">
 <div class="section-head"><div><h2>交易记录</h2><p id="transactionScope">仅显示当前所选实验</p></div></div>
+<div class="workspace-filters"><label>搜索交易<input id="transactionSearch" type="search" placeholder="节点、交易类型或哈希" oninput="filterTransactions('query',this.value)"></label><label>结果<select id="transactionStatusFilter" onchange="filterTransactions('status',this.value)"><option value="">全部结果</option><option value="active">处理中 / 待核验</option><option value="confirmed">已确认</option><option value="failed">失败 / 超时</option><option value="cancelled">已取消</option></select></label></div>
+<p id="transactionResultCount" class="workspace-count" aria-live="polite"></p>
 <div id="transactionRows"></div>
+<div id="transactionPagination" class="workspace-pagination"></div>
 </article>
 <article class="workload-panel">
 <h2>自动交易规则</h2>
@@ -206,9 +223,9 @@
 </label>
 </div>
 <div class="pair">
-<label>每秒交易数<input name="ratePerSecond" type="number" min="0.01" step="0.01" value="0.1">
+<label>每秒尝试数<input name="ratePerSecond" type="number" min="0.01" max="100" step="0.01" value="0.1">
 </label>
-<label>持续秒数<input name="durationSeconds" type="number" min="1" value="60">
+<label>持续秒数<input name="durationSeconds" type="number" min="1" max="604800" step="1" value="60">
 </label>
 </div>
 <button id="startWorkload" type="submit" class="primary">启动 Round-robin 负载</button>
@@ -277,8 +294,16 @@
 <section class="console-result" aria-live="polite"><div><span>执行结果</span><small id="consoleMeta"></small></div><pre id="consoleOutput">尚未执行命令</pre></section>
 </form>
 </dialog>
+<dialog id="diskManager" class="console-dialog disk-dialog" aria-labelledby="diskDialogTitle" aria-describedby="diskDialogDescription">
+<div class="dialog-head"><div><h2 id="diskDialogTitle">磁盘管理</h2><p id="diskDialogDescription">检查工作目录所在文件系统，选择清理已停止实验的历史 DAG。</p></div><button id="closeDiskManager" type="button" class="icon-button" aria-label="关闭磁盘管理">×</button></div>
+<div id="diskManagerContent" aria-live="polite"></div>
+<div class="disk-dialog-footer"><p id="diskSelectionSummary">已选 0 项 · 预计释放 0 B（按实测占用）</p><div class="row-actions"><button id="refreshDiskManager" type="button" class="action secondary">重新检查磁盘</button><button id="cleanupDisk" type="button" class="action danger" disabled>清理所选 DAG</button></div></div>
+</dialog>
 <div id="toast">
 </div>
+<script src="/miners.js"></script>
+<script src="/network.js"></script>
+<script src="/workspace.js"></script>
 <script src="/app.js">
 </script>
 </body>

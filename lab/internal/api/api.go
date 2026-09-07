@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pfap/lab/internal/model"
@@ -24,21 +25,30 @@ import (
 )
 
 type API struct {
-	store            *store.Store
-	orch             orchestrator.Orchestrator
-	subscribers      map[chan model.Event]struct{}
-	mu               sync.Mutex
-	nodeLocks        sync.Map
-	serverSetupLocks sync.Map
-	lifecycleMu      sync.Mutex
-	knownHostsMu     sync.Mutex
+	store              *store.Store
+	orch               orchestrator.Orchestrator
+	subscribers        map[chan model.Event]struct{}
+	mu                 sync.Mutex
+	nodeLocks          sync.Map
+	serverSetupLocks   sync.Map
+	lifecycleMu        sync.Mutex
+	stopWaiters        atomic.Int32
+	knownHostsMu       sync.Mutex
+	reconcileLocks     sync.Map
+	pendingUncertainty sync.Map
+	pendingTxFinishes  sync.Map
+	workloadDrainLocks sync.Map
+	diskPlans          sync.Map
+	serverMaintenance  sync.Map
+	startupError       error
 }
 
 func New(s *store.Store) *API {
 	a := &API{store: s, subscribers: map[chan model.Event]struct{}{}}
 	var running []string
-	_ = s.Update(func(state *model.State) error {
+	err := s.Update(func(state *model.State) error {
 		migrateMiningState(state)
+		reconcileInterruptedTasks(state)
 		for i := range state.Experiments {
 			for j := range state.Experiments[i].Nodes {
 				n := &state.Experiments[i].Nodes[j]
@@ -85,6 +95,10 @@ func New(s *store.Store) *API {
 		}
 		return nil
 	})
+	if err != nil {
+		a.startupError = fmt.Errorf("控制器初始化状态保存失败，修复存储后请重启 Lab：%w", err)
+		return a
+	}
 	s.View(func(state model.State) {
 		for _, e := range state.Experiments {
 			if e.Status == "running" {
@@ -97,6 +111,8 @@ func New(s *store.Store) *API {
 	}
 	go a.backfillTransactionTimings()
 	go a.monitorServers()
+	go a.monitorUncertainTransactions()
+	go a.monitorLogRotation()
 	return a
 }
 
@@ -110,21 +126,7 @@ func (a *API) monitorServers() {
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			out, err := a.orch.Check(ctx, server)
 			cancel()
-			status := "online"
-			if err != nil {
-				status = "error"
-				out = err.Error()
-			}
-			_ = a.store.Update(func(s *model.State) error {
-				for i := range s.Servers {
-					if s.Servers[i].ID == server.ID {
-						s.Servers[i].Status = status
-						s.Servers[i].SystemInfo = out
-						s.Servers[i].LastCheck = time.Now()
-					}
-				}
-				return nil
-			})
+			_ = a.recordServerCheck(server.ID, out, err)
 		}
 		<-ticker.C
 	}
@@ -227,6 +229,14 @@ func (a *API) Handler(static http.Handler) http.Handler {
 			a.store.View(func(s model.State) { jsonOut(w, 200, s) })
 			return
 		}
+		if r.URL.Path == "/api/storage-health" && r.Method == http.MethodGet {
+			jsonOut(w, http.StatusOK, a.store.Health())
+			return
+		}
+		if a.startupError != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			fail(w, http.StatusServiceUnavailable, a.startupError)
+			return
+		}
 		if r.URL.Path == "/api/build-profile" && r.Method == http.MethodGet {
 			b, err := os.ReadFile("dist/build-profile.json")
 			if errors.Is(err, os.ErrNotExist) {
@@ -257,6 +267,10 @@ func (a *API) Handler(static http.Handler) http.Handler {
 			a.batchDeleteServers(w, r)
 			return
 		}
+		if r.URL.Path == "/api/servers/batch/host-group" {
+			a.batchServerHostGroup(w, r)
+			return
+		}
 		if r.URL.Path == "/api/servers/batch" {
 			a.batchServers(w, r)
 			return
@@ -279,6 +293,10 @@ func (a *API) Handler(static http.Handler) http.Handler {
 		}
 		if r.URL.Path == "/api/workloads" {
 			a.workloads(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/workloads/") {
+			a.workloadAction(w, r)
 			return
 		}
 		if r.URL.Path == "/api/console/execute" {
@@ -391,6 +409,8 @@ func (a *API) servers(w http.ResponseWriter, r *http.Request) {
 	}
 	v.ID = id("srv")
 	v.Status = "unknown"
+	v.LastCheck, v.LastSuccessAt = time.Time{}, time.Time{}
+	v.SystemInfo, v.LastError = "", ""
 	v.CreatedAt = time.Now()
 	if err := a.store.Update(func(s *model.State) error {
 		if duplicateServer(s.Servers, v, "") {
@@ -412,6 +432,11 @@ func (a *API) servers(w http.ResponseWriter, r *http.Request) {
 func (a *API) normalizeServer(v *model.Server) error {
 	v.Name, v.Host, v.P2PHost, v.User = strings.TrimSpace(v.Name), strings.TrimSpace(v.Host), strings.TrimSpace(v.P2PHost), strings.TrimSpace(v.User)
 	v.IdentityFile, v.WorkDir = strings.TrimSpace(v.IdentityFile), strings.TrimSpace(v.WorkDir)
+	var groupErr error
+	v.HostGroup, groupErr = normalizeHostGroup(v.HostGroup)
+	if groupErr != nil {
+		return groupErr
+	}
 	if v.Name == "" || v.Host == "" || v.User == "" {
 		return errors.New("name, host and user are required")
 	}
@@ -452,7 +477,7 @@ func experimentUsesServer(e model.Experiment, serverID string) bool {
 }
 
 func activeExperimentStatus(status string) bool {
-	return status == "running" || status == "deploying" || status == "stopping"
+	return status == "running" || status == "deploying" || status == "resuming" || status == "stopping" || status == "stop-failed" || status == "interrupted"
 }
 
 type serverIDsRequest struct {
@@ -593,6 +618,11 @@ func (a *API) batchDeleteServers(w http.ResponseWriter, r *http.Request) {
 		selected[server.ID] = true
 	}
 	err = a.store.Update(func(s *model.State) error {
+		for serverID := range selected {
+			if _, busy := a.serverMaintenance.Load(serverID); busy {
+				return errors.New("服务器正在执行磁盘维护，请稍后删除")
+			}
+		}
 		for _, e := range s.Experiments {
 			if !activeExperimentStatus(e.Status) && e.Status != "draft" {
 				continue
@@ -631,6 +661,7 @@ func (a *API) batchServers(w http.ResponseWriter, r *http.Request) {
 		Port         int      `json:"port"`
 		IdentityFile string   `json:"identityFile"`
 		WorkDir      string   `json:"workDir"`
+		HostGroup    string   `json:"hostGroup"`
 	}
 	if err := decode(r, &request); err != nil {
 		fail(w, http.StatusBadRequest, err)
@@ -654,7 +685,7 @@ func (a *API) batchServers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[key] = true
-		candidate := model.Server{Name: fmt.Sprintf("%s-%02d", prefix, i+1), Host: host, P2PHost: host, Port: request.Port, User: request.User, IdentityFile: request.IdentityFile, WorkDir: request.WorkDir, Status: "unknown", CreatedAt: time.Now()}
+		candidate := model.Server{Name: fmt.Sprintf("%s-%02d", prefix, i+1), Host: host, P2PHost: host, Port: request.Port, User: request.User, IdentityFile: request.IdentityFile, WorkDir: request.WorkDir, HostGroup: request.HostGroup, Status: "unknown", CreatedAt: time.Now()}
 		if err := a.normalizeServer(&candidate); err != nil {
 			fail(w, http.StatusBadRequest, fmt.Errorf("%s: %w", host, err))
 			return
@@ -698,11 +729,27 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, errors.New("server not found"))
 		return
 	}
+	if len(parts) >= 4 && parts[3] == "disk" {
+		a.serverDiskAction(w, r, server, parts)
+		return
+	}
+	if len(parts) == 4 && parts[3] == "network" {
+		a.serverNetwork(w, r, server)
+		return
+	}
 	if len(parts) == 3 && r.Method == http.MethodPut {
-		var updated model.Server
-		if err := decode(r, &updated); err != nil {
+		var request struct {
+			model.Server
+			HostGroup *string `json:"hostGroup"`
+		}
+		if err := decode(r, &request); err != nil {
 			fail(w, http.StatusBadRequest, err)
 			return
+		}
+		updated := request.Server
+		updated.HostGroup = server.HostGroup
+		if request.HostGroup != nil {
+			updated.HostGroup = *request.HostGroup
 		}
 		updated.ID, updated.CreatedAt = server.ID, server.CreatedAt
 		updated.KnownHostsFile = server.KnownHostsFile
@@ -714,10 +761,16 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 		criticalChanged := updated.Host != server.Host || updated.Port != server.Port || updated.User != server.User || updated.IdentityFile != server.IdentityFile || updated.WorkDir != server.WorkDir || updated.P2PHost != server.P2PHost
 		if criticalChanged {
 			updated.Status = "unknown"
+			updated.LastCheck, updated.LastSuccessAt = time.Time{}, time.Time{}
+			updated.SystemInfo, updated.LastError = "", ""
 		} else {
 			updated.Status, updated.LastCheck, updated.SystemInfo = server.Status, server.LastCheck, server.SystemInfo
+			updated.LastError, updated.LastSuccessAt = server.LastError, server.LastSuccessAt
 		}
 		err := a.store.Update(func(s *model.State) error {
+			if _, busy := a.serverMaintenance.Load(sid); busy {
+				return errors.New("服务器正在执行磁盘维护，请稍后编辑")
+			}
 			if duplicateServer(s.Servers, updated, sid) {
 				return errors.New("a server with the same host and port already exists")
 			}
@@ -730,6 +783,14 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 			}
 			for i := range s.Servers {
 				if s.Servers[i].ID == sid {
+					if request.HostGroup == nil {
+						updated.HostGroup = s.Servers[i].HostGroup
+					}
+					if !criticalChanged {
+						current := s.Servers[i]
+						updated.Status, updated.LastCheck, updated.LastSuccessAt = current.Status, current.LastCheck, current.LastSuccessAt
+						updated.SystemInfo, updated.LastError = current.SystemInfo, current.LastError
+					}
 					s.Servers[i] = updated
 					return nil
 				}
@@ -752,16 +813,10 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 			status = "error"
 			out = err.Error()
 		}
-		_ = a.store.Update(func(s *model.State) error {
-			for i := range s.Servers {
-				if s.Servers[i].ID == sid {
-					s.Servers[i].Status = status
-					s.Servers[i].SystemInfo = out
-					s.Servers[i].LastCheck = time.Now()
-				}
-			}
-			return nil
-		})
+		if saveErr := a.recordServerCheck(sid, out, err); saveErr != nil {
+			fail(w, http.StatusInternalServerError, saveErr)
+			return
+		}
 		if err != nil {
 			fail(w, 502, err)
 			return
@@ -802,6 +857,9 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 3 && r.Method == "DELETE" {
 		err := a.store.Update(func(s *model.State) error {
+			if _, busy := a.serverMaintenance.Load(sid); busy {
+				return errors.New("服务器正在执行磁盘维护，请稍后删除")
+			}
 			for _, e := range s.Experiments {
 				if experimentUsesServer(e, sid) && (activeExperimentStatus(e.Status) || e.Status == "draft") {
 					return fmt.Errorf("server is used by %s experiment %s", e.Status, e.Name)
@@ -854,7 +912,7 @@ func (a *API) experiments(w http.ResponseWriter, r *http.Request) {
 			knownServers[x.ID] = true
 		}
 		for _, x := range s.Experiments {
-			if x.Status == "running" || x.Status == "deploying" || x.Status == "stopping" {
+			if activeExperimentStatus(x.Status) {
 				activeExperiments = append(activeExperiments, x)
 			}
 		}
@@ -885,8 +943,12 @@ func (a *API) experiments(w http.ResponseWriter, r *http.Request) {
 	if request.MinerCount != nil {
 		e.MinerCount = *request.MinerCount
 	}
-	if e.MinerCount < 1 || e.MinerCount > totalNodes {
-		fail(w, 400, fmt.Errorf("矿工数量必须在 1 到 %d 之间", totalNodes))
+	if e.MinerMode != "manual" && (e.MinerCount < 1 || e.MinerCount > totalNodes) {
+		fail(w, http.StatusBadRequest, fmt.Errorf("矿工数量必须在 1 到 %d 之间", totalNodes))
+		return
+	}
+	if err := model.NormalizeMinerConfiguration(&e); err != nil {
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	if e.NetworkID == 0 {
@@ -908,6 +970,8 @@ func (a *API) experiments(w http.ResponseWriter, r *http.Request) {
 	e.ID = id("exp")
 	e.Status = "draft"
 	e.Nodes = nil
+	e.ArtifactSHA, e.RecoveryArtifactSHA, e.Error = "", "", ""
+	e.StartedAt, e.FinishedAt = time.Time{}, time.Time{}
 	e.MiningStatus, e.MiningError = "", ""
 	e.MiningUpdatedAt = time.Time{}
 	e.CreatedAt = time.Now()
@@ -980,96 +1044,11 @@ func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 		a.updateMiners(w, r, eid)
 		return
 	}
-	// Serialize lifecycle admission with recovery and mining updates. The
-	// accepted state is persisted before launching the background operation.
-	if action == "deploy" || action == "start" || action == "stop" {
-		a.lifecycleMu.Lock()
-		defer a.lifecycleMu.Unlock()
-	}
-	var exp model.Experiment
-	servers := map[string]model.Server{}
-	found := false
-	a.store.View(func(s model.State) {
-		for _, e := range s.Experiments {
-			if e.ID == eid {
-				exp = e
-				found = true
-			}
-		}
-		for _, x := range s.Servers {
-			servers[x.ID] = x
-		}
-	})
-	if !found {
-		fail(w, 404, errors.New("experiment not found"))
-		return
-	}
-	if (action == "deploy" || action == "start") && (exp.Status == "deploying" || exp.Status == "running" || exp.Status == "stopping") {
-		fail(w, 409, errors.New("experiment is already active"))
-		return
-	}
-	if exp.MiningStatus == "updating" && (action == "deploy" || action == "start" || action == "stop") {
-		fail(w, http.StatusConflict, errors.New("矿工配置正在应用，请等待完成后再操作实验"))
-		return
-	}
-	if (action == "deploy" || action == "start") && exp.Status == "failed" {
-		total := 0
-		for _, p := range exp.Placements {
-			total += p.Count
-		}
-		var active []model.Experiment
-		a.store.View(func(s model.State) {
-			for _, e := range s.Experiments {
-				if e.ID != exp.ID && (e.Status == "running" || e.Status == "deploying" || e.Status == "stopping") {
-					active = append(active, e)
-				}
-			}
-		})
-		exp.P2PPortBase = nextPortBase(30000, total, active, false)
-		exp.RPCPortBase = nextPortBase(40000, total, active, true)
-		_ = a.store.Update(func(s *model.State) error {
-			for i := range s.Experiments {
-				if s.Experiments[i].ID == exp.ID {
-					s.Experiments[i].P2PPortBase = exp.P2PPortBase
-					s.Experiments[i].RPCPortBase = exp.RPCPortBase
-					s.Experiments[i].Error = ""
-				}
-			}
-			return nil
-		})
-	}
-	switch action {
-	case "deploy", "start":
-		a.setExperiment(eid, "deploying", "", nil, "")
-		go a.deploy(eid, exp, servers)
-		jsonOut(w, 202, map[string]string{"status": "deploying"})
-	case "stop":
-		if exp.Status != "running" && exp.Status != "failed" {
-			fail(w, http.StatusConflict, errors.New("实验不在可停止状态，请等待当前操作完成"))
-			return
-		}
-		recovering := false
-		a.store.View(func(s model.State) {
-			for _, e := range s.Experiments {
-				if e.ID == eid {
-					for _, n := range e.Nodes {
-						recovering = recovering || n.Status == "recovering"
-					}
-				}
-			}
-		})
-		if recovering {
-			fail(w, http.StatusConflict, errors.New("节点正在恢复，请等待恢复完成后再停止实验"))
-			return
-		}
-		a.setExperiment(eid, "stopping", "", nil, "")
-		go a.stop(eid, exp, servers)
-		jsonOut(w, 202, map[string]string{"status": "stopping"})
-	case "initialize-accounts":
+	if action == "initialize-accounts" {
 		a.initializeAccounts(w, eid)
-	default:
-		fail(w, 404, errors.New("unknown action"))
+		return
 	}
+	a.lifecycleAction(w, eid, action)
 }
 
 func (a *API) initializeAccounts(w http.ResponseWriter, experimentID string) {
@@ -1099,7 +1078,7 @@ func (a *API) initializeAccounts(w http.ResponseWriter, experimentID string) {
 				alreadyInitialized++
 				continue
 			}
-			if node.Status != "running" {
+			if node.Status != "running" || node.PrivateStateError != "" {
 				unavailable++
 				continue
 			}
@@ -1126,6 +1105,9 @@ func (a *API) initializeAccounts(w http.ResponseWriter, experimentID string) {
 		return
 	}
 	if err != nil {
+		for _, tx := range queued {
+			_ = a.finishTx(tx.ID, "failed", "", fmt.Errorf("初始化入队保存未完成，未执行 RPC：%w", err))
+		}
 		fail(w, http.StatusConflict, err)
 		return
 	}
@@ -1150,6 +1132,11 @@ func (a *API) initializeAccounts(w http.ResponseWriter, experimentID string) {
 }
 
 func (a *API) deleteExperiment(w http.ResponseWriter, experimentID string) {
+	if !a.lifecycleMu.TryLock() {
+		fail(w, http.StatusConflict, errors.New("正在执行实验操作或磁盘维护，请稍后删除"))
+		return
+	}
+	defer a.lifecycleMu.Unlock()
 	err := a.store.Update(func(s *model.State) error {
 		index := -1
 		for i := range s.Experiments {
@@ -1162,16 +1149,16 @@ func (a *API) deleteExperiment(w http.ResponseWriter, experimentID string) {
 			return os.ErrNotExist
 		}
 		exp := s.Experiments[index]
-		if exp.Status == "running" || exp.Status == "deploying" || exp.Status == "stopping" {
+		if activeExperimentStatus(exp.Status) {
 			return errors.New("stop the experiment before deleting it")
 		}
 		for _, tx := range s.Transactions {
-			if tx.ExperimentID == experimentID && (tx.Status == "queued" || tx.Status == "proving" || tx.Status == "submitted") {
+			if tx.ExperimentID == experimentID && activeTransaction(tx.Status) {
 				return errors.New("experiment still has active transactions")
 			}
 		}
 		for _, workload := range s.Workloads {
-			if workload.ExperimentID == experimentID && (workload.Status == "running" || workload.Status == "draining") {
+			if workload.ExperimentID == experimentID && (workload.Status == "queued" || workload.Status == "running" || workload.Status == "draining") {
 				return errors.New("experiment still has an active workload")
 			}
 		}
@@ -1292,8 +1279,8 @@ func (a *API) report(w http.ResponseWriter, eid string) {
 	jsonOut(w, 200, map[string]any{"schemaVersion": 1, "generatedAt": time.Now(), "experiment": exp, "transactions": txs, "workloads": loads, "events": events})
 }
 
-func (a *API) setExperiment(id, status, errText string, nodes []model.Node, sha string) {
-	_ = a.store.Update(func(s *model.State) error {
+func (a *API) setExperiment(id, status, errText string, nodes []model.Node, sha string) error {
+	return a.store.Update(func(s *model.State) error {
 		for i := range s.Experiments {
 			if s.Experiments[i].ID == id {
 				s.Experiments[i].Status = status
@@ -1314,7 +1301,9 @@ func (a *API) setExperiment(id, status, errText string, nodes []model.Node, sha 
 					s.Experiments[i].ArtifactSHA = sha
 				}
 				if status == "running" {
-					s.Experiments[i].StartedAt = time.Now()
+					if s.Experiments[i].StartedAt.IsZero() {
+						s.Experiments[i].StartedAt = time.Now()
+					}
 					s.Experiments[i].FinishedAt = time.Time{}
 				}
 				if status == "stopped" || status == "failed" {
@@ -1333,14 +1322,24 @@ func (a *API) setExperiment(id, status, errText string, nodes []model.Node, sha 
 	})
 }
 func (a *API) deploy(id string, e model.Experiment, servers map[string]model.Server) {
-	a.setExperiment(id, "deploying", "", nil, "")
+	admitted := e
+	admitted.Nodes = append([]model.Node(nil), e.Nodes...)
 	a.emit(id, "info", "lifecycle", "deployment started", nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	nodes, err := a.orch.Deploy(ctx, &e, servers, func(l, k, m string, f map[string]any) { a.emit(id, l, k, m, f) })
 	if err != nil {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		cleanupErr := a.orch.Stop(cleanupCtx, e, servers, func(l, k, m string, f map[string]any) {
+		var preflightErr *orchestrator.DeploymentPreflightError
+		if errors.As(err, &preflightErr) {
+			if restoreErr := a.restoreDeploymentDraft(admitted, err); restoreErr != nil {
+				a.emit(id, "error", "preflight-failed", fmt.Sprintf("部署预检失败且未执行 worker 写入；保留当前实验状态，请核验：%v；%v", err, restoreErr), nil)
+			} else {
+				a.emit(id, "warning", "preflight-failed", "部署预检失败，已回到可重试草稿："+err.Error(), nil)
+			}
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		results, cleanupErr := a.orch.StopNodes(cleanupCtx, e, servers, func(l, k, m string, f map[string]any) {
 			a.emit(id, l, k, m, f)
 		})
 		cleanupCancel()
@@ -1349,11 +1348,14 @@ func (a *API) deploy(id string, e model.Experiment, servers map[string]model.Ser
 		} else {
 			a.emit(id, "info", "deploy", "partial deployment rolled back", nil)
 		}
-		a.setExperiment(id, "failed", err.Error(), nil, e.ArtifactSHA)
+		_ = a.completeExperimentStop(id, results, cleanupErr, err.Error())
 		a.emit(id, "error", "deploy", err.Error(), nil)
 		return
 	}
-	a.setExperiment(id, "running", "", nodes, e.ArtifactSHA)
+	if err := a.setExperiment(id, "running", "", nodes, e.ArtifactSHA); err != nil {
+		a.emit(id, "error", "lifecycle", "节点已启动但状态保存失败，修复存储后请重新核验；不要重复部署", nil)
+		return
+	}
 	a.emit(id, "info", "lifecycle", "experiment running", map[string]any{"nodes": len(nodes)})
 	go a.monitor(id)
 }
@@ -1520,14 +1522,10 @@ func (a *API) setNodeError(experimentID, nodeID, status, message string) {
 	})
 }
 func (a *API) stop(id string, e model.Experiment, servers map[string]model.Server) {
-	a.setExperiment(id, "stopping", "", nil, "")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
-	if err := a.orch.Stop(ctx, e, servers, func(l, k, m string, f map[string]any) { a.emit(id, l, k, m, f) }); err != nil {
-		a.setExperiment(id, "failed", err.Error(), nil, "")
-		return
-	}
-	a.setExperiment(id, "stopped", "", nil, "")
+	results, err := a.orch.StopNodes(ctx, e, servers, func(l, k, m string, f map[string]any) { a.emit(id, l, k, m, f) })
+	_ = a.completeExperimentStop(id, results, err, "")
 }
 
 func (a *API) transactions(w http.ResponseWriter, r *http.Request) {
@@ -1549,11 +1547,16 @@ func (a *API) transactions(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, errors.New("unsupported transaction type"))
 		return
 	}
-	t.ID = id("tx")
-	t.BatchID = ""
-	t.Status = "queued"
-	t.SubmittedAt = time.Now()
+	// Only request fields may cross admission; execution evidence is generated
+	// by the controller, never accepted from a client-provided transaction.
+	t = model.Transaction{ID: id("tx"), ExperimentID: t.ExperimentID, Type: t.Type, FromNode: t.FromNode, ToNode: t.ToNode, Value: t.Value, Status: "queued", SubmittedAt: time.Now()}
+	if t.Type != "transfer" && t.Type != "public" {
+		t.ToNode = ""
+	}
 	if err := a.enqueueTransaction(t); err != nil {
+		if a.store.Health().Degraded {
+			_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("交易入队保存未完成，未执行 RPC：%w", err))
+		}
 		fail(w, http.StatusConflict, err)
 		return
 	}
@@ -1562,7 +1565,7 @@ func (a *API) transactions(w http.ResponseWriter, r *http.Request) {
 }
 
 func activeTransaction(status string) bool {
-	return status == "queued" || status == "proving" || status == "submitted"
+	return status == "queued" || status == "proving" || status == "submitted" || status == "unknown"
 }
 
 var errNodeBusy = errors.New("node already has an active transaction")
@@ -1628,7 +1631,13 @@ func (a *API) runTransaction(t model.Transaction) {
 	var toNode model.Node
 	privateAccountReady := false
 	ok := false
+	queued := false
 	a.store.View(func(s model.State) {
+		for _, current := range s.Transactions {
+			if current.ID == t.ID {
+				queued = current.Status == "queued"
+			}
+		}
 		for _, e := range s.Experiments {
 			if e.ID == t.ExperimentID {
 				exp = e
@@ -1650,6 +1659,9 @@ func (a *API) runTransaction(t model.Transaction) {
 		}
 		privateAccountReady = privateAccountInitialized(s.Transactions, t.ExperimentID, node)
 	})
+	if !queued {
+		return
+	}
 	if !ok {
 		a.finishTx(t.ID, "failed", "", errors.New("experiment, node or server not found"))
 		return
@@ -1699,7 +1711,10 @@ func (a *API) runTransaction(t model.Transaction) {
 	}
 	expr := ""
 	if t.Type == "transfer" {
-		a.setTxCommand(t.ID, transferCommand(node.Name, toNode.Name, value))
+		if err := a.setTxCommand(t.ID, transferCommand(node.Name, toNode.Name, value)); err != nil {
+			_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("交易指令保存失败，未发送交易：%w", err))
+			return
+		}
 		a.runTransfer(t, exp, node, toNode, server, value)
 		return
 	}
@@ -1717,15 +1732,21 @@ func (a *API) runTransaction(t model.Transaction) {
 		}
 		expr = "eth.sendPublicTransaction({from:eth.accounts[0],to:" + strconv.Quote(toNode.Account) + ",value:" + strconv.Quote(value) + "})"
 	}
-	a.setTxCommand(t.ID, node.Name+": "+expr)
-	a.updateTx(t.ID, "proving", "", "")
+	if err := a.setTxCommand(t.ID, node.Name+": "+expr); err != nil {
+		_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("交易指令保存失败，未发送交易：%w", err))
+		return
+	}
+	if err := a.beginTransactionRPC(t.ID, "submit"); err != nil {
+		_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("未发送交易：%w", err))
+		return
+	}
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	out, err := a.orch.Attach(ctx, exp, node, server, expr)
 	rpcWallUs := time.Since(started).Microseconds()
 	if err != nil {
-		a.finishTx(t.ID, "failed", "", fmt.Errorf("%w: %s", err, out))
+		_ = a.markTransactionUnknown(t.ID, orchestrator.ParseHash(out), fmt.Errorf("RPC 返回失败：%w: %s", err, out))
 		return
 	}
 	hash := orchestrator.ParseHash(out)
@@ -1734,11 +1755,16 @@ func (a *API) runTransaction(t model.Transaction) {
 		if message == "" {
 			message = "node returned no transaction hash"
 		}
-		a.finishTx(t.ID, "failed", "", fmt.Errorf("transaction was not submitted: %s", message))
+		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("RPC 未返回可确认的交易哈希：%s", message))
 		return
 	}
-	proofMs := time.Since(started).Milliseconds()
-	proofUs := time.Since(started).Microseconds()
+	// Save the hash before timing lookups or receipt polling can be interrupted.
+	if err := a.updateTx(t.ID, "submitted", hash, ""); err != nil {
+		_ = a.markTransactionUnknown(t.ID, hash, err)
+		return
+	}
+	proofMs := rpcWallUs / 1000
+	proofUs := rpcWallUs
 	parsedProofUs, parsedVerifyUs := orchestrator.ParseProofTimesMicros(out)
 	if t.Type == "public" {
 		// A public transfer has no ZK proof stage. Its entire RPC wall time is
@@ -1758,9 +1784,8 @@ func (a *API) runTransaction(t model.Transaction) {
 	}
 	a.setTransactionBreakdown(t.ID, map[string]int64{"txGenerationUs": txGenerationUs})
 	proofMs = proofUs / 1000
-	a.updateTx(t.ID, "submitted", hash, "")
 	a.emit(t.ExperimentID, "info", "transaction", "transaction submitted", map[string]any{"id": t.ID, "hash": hash, "proofDurationMs": proofMs})
-	for i := 0; i < 300; i++ {
+	for i := 0; i < 300 && ctx.Err() == nil; i++ {
 		out, err = a.orch.Attach(ctx, exp, node, server, "JSON.stringify(eth.getTransactionReceipt("+strconv.Quote(hash)+"))")
 		if err == nil {
 			if receipt, block, receiptStatus, ok := parseReceipt(out); ok {
@@ -1770,7 +1795,10 @@ func (a *API) runTransaction(t model.Transaction) {
 					// includes proof generation, so it must not overwrite that value.
 					a.setTransactionBreakdown(t.ID, map[string]int64{"txVerificationUs": verificationUs})
 				}
-				a.confirmTx(t.ID, hash, receipt, block, receiptStatus, proofUs, parsedVerifyUs)
+				if err := a.confirmTx(t.ID, hash, receipt, block, receiptStatus, proofUs, parsedVerifyUs); err != nil {
+					_ = a.markTransactionUnknown(t.ID, hash, err)
+					return
+				}
 				a.refreshTransactionNodes(exp, node, toNode, server, t.ID)
 				if t.Type != "public" {
 					a.waitForNextBlock(ctx, exp, node, server, block)
@@ -1780,7 +1808,7 @@ func (a *API) runTransaction(t model.Transaction) {
 		}
 		time.Sleep(time.Second)
 	}
-	a.finishTx(t.ID, "timeout", hash, errors.New("receipt not observed within 5 minutes"))
+	_ = a.markTransactionUnknown(t.ID, hash, errors.New("未在查询窗口内观察到 Receipt"))
 }
 
 func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, receiver model.Node, payerServer model.Server, value string) {
@@ -1834,18 +1862,20 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		a.finishTx(t.ID, "failed", "", fmt.Errorf("receiver %s has no private account state on chain; run CreateAccount first", receiver.Name))
 		return
 	}
-	a.updateTx(t.ID, "proving", "", "")
+	if err := a.beginTransactionRPC(t.ID, "payer-proof"); err != nil {
+		_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("未开始付款方证明：%w", err))
+		return
+	}
 	started := time.Now()
 	out, err := a.orch.Attach(ctx, exp, payer, payerServer, "JSON.stringify(eth.getPayerNextState('0x01',"+strconv.Quote(value)+"))")
 	payerWallUs := time.Since(started).Microseconds()
 	if err != nil {
-		a.finishTx(t.ID, "failed", "", fmt.Errorf("payer proof: %w: %s", err, out))
+		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方证明调用结果不明：%w: %s", err, out))
 		return
 	}
 	raw, extractErr := orchestrator.ExtractJSONString(out)
 	if extractErr != nil {
-		_, _ = a.orch.Attach(ctx, exp, payer, payerServer, "eth.revertTransferState()")
-		a.finishTx(t.ID, "failed", "", extractErr)
+		_ = a.markTransactionUnknown(t.ID, "", extractErr)
 		return
 	}
 	var proof struct {
@@ -1854,8 +1884,7 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		Proof string `json:"proofA"`
 	}
 	if err := json.Unmarshal([]byte(raw), &proof); err != nil || proof.Proof == "" {
-		_, _ = a.orch.Attach(ctx, exp, payer, payerServer, "eth.revertTransferState()")
-		a.finishTx(t.ID, "failed", "", fmt.Errorf("decode payer proof: %w", err))
+		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方证明响应无法确认：%v", err))
 		return
 	}
 	expr := "eth.sendTransferTransaction({from:eth.accounts[0],value:" + strconv.Quote(value) + ",rs:'0x01',cmtANew:" + strconv.Quote(proof.CMT) + ",snAOld:" + strconv.Quote(proof.SN) + ",proofA:" + strconv.Quote(proof.Proof) + "})"
@@ -1863,22 +1892,28 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 	if logProofUs, logVerifyUs, timingErr := a.orch.RecentProofTimings(ctx, exp, payer, payerServer); timingErr == nil {
 		payerProofUs, payerVerifyUs = logProofUs, logVerifyUs
 	}
+	if err := a.beginTransactionRPC(t.ID, "submit"); err != nil {
+		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方已生成状态，接收方提交未执行：%w", err))
+		return
+	}
 	receiverStarted := time.Now()
 	out, err = a.orch.Attach(ctx, exp, receiver, receiverServer, expr)
 	receiverWallUs := time.Since(receiverStarted).Microseconds()
 	if err != nil {
-		_, _ = a.orch.Attach(ctx, exp, payer, payerServer, "eth.revertTransferState()")
-		a.finishTx(t.ID, "failed", "", fmt.Errorf("receiver submit: %w: %s", err, out))
+		_ = a.markTransactionUnknown(t.ID, orchestrator.ParseHash(out), fmt.Errorf("接收方提交结果不明，未回滚或重发：%w: %s", err, out))
 		return
 	}
 	hash := orchestrator.ParseHash(out)
 	if hash == "" {
-		_, _ = a.orch.Attach(ctx, exp, payer, payerServer, "eth.revertTransferState()")
 		message := strings.TrimSpace(out)
 		if message == "" {
 			message = "node returned no transaction hash"
 		}
-		a.finishTx(t.ID, "failed", "", fmt.Errorf("receiver transaction was not submitted: %s", message))
+		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("接收方未返回可确认的哈希，未回滚或重发：%s", message))
+		return
+	}
+	if err := a.updateTx(t.ID, "submitted", hash, ""); err != nil {
+		_ = a.markTransactionUnknown(t.ID, hash, err)
 		return
 	}
 	receiverProofUs, receiverVerifyUs := orchestrator.ParseProofTimesMicros(out)
@@ -1899,8 +1934,7 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		receiverTxGenerationUs = 0
 	}
 	a.setTransactionBreakdown(t.ID, map[string]int64{"payerProofGenerationUs": payerProofUs, "payerProofVerificationUs": payerVerifyUs, "payerTxGenerationUs": payerTxGenerationUs, "receiverProofGenerationUs": receiverProofUs, "receiverProofVerificationUs": receiverVerifyUs, "receiverTxGenerationUs": receiverTxGenerationUs, "txGenerationUs": payerTxGenerationUs + receiverTxGenerationUs})
-	a.updateTx(t.ID, "submitted", hash, "")
-	for i := 0; i < 600; i++ {
+	for i := 0; i < 600 && ctx.Err() == nil; i++ {
 		out, err = a.orch.Attach(ctx, exp, receiver, receiverServer, "JSON.stringify(eth.getTransactionReceipt("+strconv.Quote(hash)+"))")
 		if err == nil {
 			if receipt, block, receiptStatus, ok := parseReceipt(out); ok {
@@ -1913,7 +1947,10 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 					phaseValues["payerTxVerificationUs"] = verificationUs
 				}
 				a.setTransactionBreakdown(t.ID, phaseValues)
-				a.confirmTx(t.ID, hash, receipt, block, receiptStatus, proofUs, verifyUs)
+				if err := a.confirmTx(t.ID, hash, receipt, block, receiptStatus, proofUs, verifyUs); err != nil {
+					_ = a.markTransactionUnknown(t.ID, hash, err)
+					return
+				}
 				a.refreshTransactionNodes(exp, payer, receiver, payerServer, t.ID)
 				a.waitForNextBlock(ctx, exp, receiver, receiverServer, block)
 				return
@@ -1921,7 +1958,7 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		}
 		time.Sleep(time.Second)
 	}
-	a.finishTx(t.ID, "timeout", hash, errors.New("transfer receipt not observed"))
+	_ = a.markTransactionUnknown(t.ID, hash, errors.New("未在查询窗口内观察到 Transfer Receipt"))
 }
 
 func privateStateOnChain(block string) bool {
@@ -1998,20 +2035,28 @@ func parseReceipt(out string) (raw, block, status string, ok bool) {
 	if receipt.Status != nil {
 		status = fmt.Sprint(receipt.Status)
 	}
+	if _, valid := parseBlockValue(block); !valid || (status != "0x0" && status != "0" && status != "false" && status != "0x1" && status != "1" && status != "true") {
+		return "", "", "", false
+	}
 	return raw, block, status, true
 }
 
-func (a *API) confirmTx(id, hash, receipt, block, receiptStatus string, proofUs, verifyUs int64) {
+func (a *API) confirmTx(id, hash, receipt, block, receiptStatus string, proofUs, verifyUs int64) error {
 	finalStatus := "confirmed"
 	var txErr error
 	if receiptStatus == "0" || receiptStatus == "0x0" || receiptStatus == "false" {
 		finalStatus = "failed"
 		txErr = errors.New("transaction reverted on chain")
 	}
-	a.finishTx(id, finalStatus, hash, txErr)
-	_ = a.store.Update(func(s *model.State) error {
+	return a.store.Update(func(s *model.State) error {
 		for j := range s.Transactions {
 			if s.Transactions[j].ID == id {
+				s.Transactions[j].Status, s.Transactions[j].Hash = finalStatus, hash
+				s.Transactions[j].ConfirmedAt = time.Now()
+				s.Transactions[j].Error, s.Transactions[j].ReconciliationError = "", ""
+				if txErr != nil {
+					s.Transactions[j].Error = txErr.Error()
+				}
 				s.Transactions[j].ProofDurationUs = proofUs
 				s.Transactions[j].VerifyDurationUs = verifyUs
 				s.Transactions[j].ProofDurationMs = proofUs / 1000
@@ -2070,6 +2115,10 @@ func (a *API) setTransactionBreakdown(id string, values map[string]int64) {
 func (a *API) refreshTransactionNodes(exp model.Experiment, from, to model.Node, fromServer model.Server, txID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	a.refreshTransactionNodesContext(ctx, exp, from, to, fromServer, txID)
+}
+
+func (a *API) refreshTransactionNodesContext(ctx context.Context, exp model.Experiment, from, to model.Node, fromServer model.Server, txID string) {
 	_ = a.sampleNode(ctx, exp, from, fromServer, "transaction:"+txID)
 	if to.ID == "" || to.ID == from.ID {
 		return
@@ -2101,8 +2150,8 @@ func (a *API) workloads(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if v.ExperimentID == "" || v.Type == "" || v.RatePerSecond <= 0 || v.DurationSeconds < 1 {
-		fail(w, 400, errors.New("experimentId, type, positive ratePerSecond and durationSeconds are required"))
+	if v.ExperimentID == "" || v.Type == "" || v.RatePerSecond < 0.01 || v.RatePerSecond > 100 || v.DurationSeconds < 1 || v.DurationSeconds > 7*24*3600 {
+		fail(w, 400, errors.New("experimentId, type, ratePerSecond in [0.01,100], and durationSeconds in [1,604800] are required"))
 		return
 	}
 	if !map[string]bool{"mint": true, "transfer": true, "redeem": true, "public": true}[v.Type] {
@@ -2111,6 +2160,10 @@ func (a *API) workloads(w http.ResponseWriter, r *http.Request) {
 	}
 	if v.Strategy == "" {
 		v.Strategy = "round-robin"
+	}
+	if v.Strategy != "round-robin" {
+		fail(w, http.StatusBadRequest, errors.New("unsupported workload strategy"))
+		return
 	}
 	if v.Value == "" {
 		v.Value = "0x1"
@@ -2121,8 +2174,33 @@ func (a *API) workloads(w http.ResponseWriter, r *http.Request) {
 	v.ID = id("load")
 	v.Status = "queued"
 	v.CreatedAt = time.Now()
-	if err := a.store.Update(func(s *model.State) error { s.Workloads = append(s.Workloads, v); return nil }); err != nil {
-		fail(w, 500, err)
+	v.StartedAt, v.FinishedAt, v.SubmissionStoppedAt = time.Time{}, time.Time{}, time.Time{}
+	v.Submitted, v.Attempted, v.SkippedBusy, v.SkippedUnavailable = 0, 0, 0, 0
+	v.StopRequested, v.Error = false, ""
+	if err := a.store.Update(func(s *model.State) error {
+		for _, exp := range s.Experiments {
+			if exp.ID != v.ExperimentID {
+				continue
+			}
+			if exp.Status != "running" || len(exp.Nodes) == 0 {
+				return errors.New("experiment is not running or has no nodes")
+			}
+			if (v.Type == "transfer" || v.Type == "public") && len(exp.Nodes) < 2 {
+				return errors.New("transfer/public workload requires at least two nodes")
+			}
+			s.Workloads = append(s.Workloads, v)
+			return nil
+		}
+		return os.ErrNotExist
+	}); err != nil {
+		code := http.StatusConflict
+		if a.store.Health().Degraded {
+			code = http.StatusServiceUnavailable
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			code = http.StatusNotFound
+		}
+		fail(w, code, err)
 		return
 	}
 	go a.runWorkload(v)
@@ -2144,7 +2222,21 @@ func (a *API) runWorkload(v model.Workload) {
 		a.finishWorkload(v.ID, "failed", "experiment is not running or has no nodes")
 		return
 	}
-	a.updateWorkload(v.ID, "running", 0)
+	if err := a.store.Update(func(s *model.State) error {
+		for i := range s.Workloads {
+			w := &s.Workloads[i]
+			if w.ID == v.ID {
+				if w.StopRequested || w.Status != "queued" {
+					return errWorkloadStopped
+				}
+				w.Status, w.StartedAt = "running", time.Now()
+				return nil
+			}
+		}
+		return os.ErrNotExist
+	}); err != nil {
+		return
+	}
 	interval := time.Duration(float64(time.Second) / v.RatePerSecond)
 	if interval < 10*time.Millisecond {
 		interval = 10 * time.Millisecond
@@ -2153,12 +2245,29 @@ func (a *API) runWorkload(v model.Workload) {
 	defer ticker.Stop()
 	deadline := time.NewTimer(time.Duration(v.DurationSeconds) * time.Second)
 	defer deadline.Stop()
+	stopCheck := time.NewTicker(250 * time.Millisecond)
+	defer stopCheck.Stop()
 	submitted := 0
 	routeCursor := 0
 	for {
 		select {
+		case <-stopCheck.C:
+			stopped := false
+			a.store.View(func(s model.State) {
+				for _, w := range s.Workloads {
+					if w.ID == v.ID {
+						stopped = w.StopRequested || w.Status != "running"
+					}
+				}
+			})
+			if stopped {
+				a.drainWorkload(v, submitted)
+				return
+			}
 		case <-deadline.C:
-			a.updateWorkload(v.ID, "draining", submitted)
+			if err := a.updateWorkload(v.ID, "draining", submitted); err != nil {
+				return
+			}
 			a.emit(v.ExperimentID, "info", "workload", "workload stopped submitting; waiting for transactions", map[string]any{"id": v.ID, "submitted": submitted})
 			a.drainWorkload(v, submitted)
 			return
@@ -2174,26 +2283,17 @@ func (a *API) runWorkload(v model.Workload) {
 			}
 			routeCursor++
 			tx := model.Transaction{ID: id("tx"), WorkloadID: v.ID, Sequence: submitted + 1, ExperimentID: v.ExperimentID, Type: v.Type, FromNode: node.ID, ToNode: toNode, Value: v.Value, Status: "queued", SubmittedAt: time.Now()}
-			if err := a.store.Update(func(s *model.State) error {
-				if err := transactionNodesAvailable(*s, tx); err != nil {
-					return err
-				}
-				if transactionNodesBusy(s.Transactions, tx.FromNode, tx.ToNode) {
-					return errNodeBusy
-				}
-				s.Transactions = append(s.Transactions, tx)
-				for i := range s.Workloads {
-					if s.Workloads[i].ID == v.ID {
-						s.Workloads[i].Submitted++
-					}
-				}
-				return nil
-			}); err != nil {
-				if errors.Is(err, errNodeBusy) || errors.Is(err, errNodeUnavailable) {
-					continue
-				}
+			queued, err := a.enqueueWorkloadTick(v.ID, tx)
+			if errors.Is(err, errWorkloadStopped) {
+				a.drainWorkload(v, submitted)
+				return
+			}
+			if err != nil {
 				a.finishWorkload(v.ID, "failed", err.Error())
 				return
+			}
+			if !queued {
+				continue
 			}
 			submitted++
 			go a.runTransaction(tx)
@@ -2202,6 +2302,11 @@ func (a *API) runWorkload(v model.Workload) {
 }
 
 func (a *API) drainWorkload(v model.Workload, submitted int) {
+	l, _ := a.workloadDrainLocks.LoadOrStore(v.ID, &sync.Mutex{})
+	if !l.(*sync.Mutex).TryLock() {
+		return
+	}
+	defer l.(*sync.Mutex).Unlock()
 	deadline := time.NewTimer(30 * time.Minute)
 	ticker := time.NewTicker(time.Second)
 	defer deadline.Stop()
@@ -2209,11 +2314,18 @@ func (a *API) drainWorkload(v model.Workload, submitted int) {
 	for {
 		select {
 		case <-deadline.C:
-			a.finishWorkload(v.ID, "timeout", "transactions did not drain within 30 minutes")
+			a.finishWorkload(v.ID, "interrupted", "等待已发送交易超过 30 分钟，未确认交易继续待核验；不会自动重发。")
 			return
 		case <-ticker.C:
 			terminal, confirmed, failed := 0, 0, 0
+			draining := false
 			a.store.View(func(s model.State) {
+				for _, w := range s.Workloads {
+					if w.ID == v.ID {
+						draining = w.Status == "draining"
+						submitted = w.Submitted
+					}
+				}
 				for _, tx := range s.Transactions {
 					if tx.WorkloadID != v.ID {
 						continue
@@ -2222,12 +2334,15 @@ func (a *API) drainWorkload(v model.Workload, submitted int) {
 					case "confirmed":
 						confirmed++
 						terminal++
-					case "failed", "timeout":
+					case "failed", "timeout", "cancelled", "skipped":
 						failed++
 						terminal++
 					}
 				}
 			})
+			if !draining {
+				return
+			}
 			if terminal < submitted {
 				continue
 			}
@@ -2244,11 +2359,17 @@ func (a *API) drainWorkload(v model.Workload, submitted int) {
 	}
 }
 
-func (a *API) updateWorkload(id, status string, submitted int) {
-	_ = a.store.Update(func(s *model.State) error {
+func (a *API) updateWorkload(id, status string, submitted int) error {
+	return a.store.Update(func(s *model.State) error {
 		for i := range s.Workloads {
 			if s.Workloads[i].ID == id {
+				if s.Workloads[i].Status == "interrupted" || s.Workloads[i].Status == "cancelled" {
+					return errWorkloadStopped
+				}
 				s.Workloads[i].Status = status
+				if status == "draining" && s.Workloads[i].SubmissionStoppedAt.IsZero() {
+					s.Workloads[i].SubmissionStoppedAt = time.Now()
+				}
 				if submitted > 0 {
 					s.Workloads[i].Submitted = submitted
 				}
@@ -2260,13 +2381,19 @@ func (a *API) updateWorkload(id, status string, submitted int) {
 		return nil
 	})
 }
-func (a *API) finishWorkload(id, status, errText string) {
-	_ = a.store.Update(func(s *model.State) error {
+func (a *API) finishWorkload(id, status, errText string) error {
+	return a.store.Update(func(s *model.State) error {
 		for i := range s.Workloads {
 			if s.Workloads[i].ID == id {
+				if s.Workloads[i].Status == "cancelled" || s.Workloads[i].Status == "interrupted" || s.Workloads[i].Status == "completed" || s.Workloads[i].Status == "completed-with-errors" {
+					return nil
+				}
 				s.Workloads[i].Status = status
 				s.Workloads[i].Error = errText
 				s.Workloads[i].FinishedAt = time.Now()
+				if s.Workloads[i].SubmissionStoppedAt.IsZero() {
+					s.Workloads[i].SubmissionStoppedAt = s.Workloads[i].FinishedAt
+				}
 			}
 		}
 		return nil
@@ -2338,11 +2465,16 @@ func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 		return float64(confirmed) / float64(confirmed+failed)
 	}(), "confirmedTPS": tps, "latencyP50Ms": percentile(latencies, .50), "latencyP95Ms": percentile(latencies, .95), "proofP50Us": percentile(proofsUs, .50), "proofP95Us": percentile(proofsUs, .95), "verifyP50Us": percentile(verifiesUs, .50), "verifyP95Us": percentile(verifiesUs, .95), "chainConfirmP50Us": percentile(chainConfirmUs, .50), "chainConfirmP95Us": percentile(chainConfirmUs, .95)})
 }
-func (a *API) updateTx(id, status, hash, errText string) {
-	_ = a.store.Update(func(s *model.State) error {
+func (a *API) updateTx(id, status, hash, errText string) error {
+	return a.store.Update(func(s *model.State) error {
 		for i := range s.Transactions {
 			if s.Transactions[i].ID == id {
-				s.Transactions[i].Status = status
+				if s.Transactions[i].Receipt != "" || s.Transactions[i].Status == "confirmed" {
+					return nil
+				}
+				if s.Transactions[i].Status != "unknown" {
+					s.Transactions[i].Status, s.Transactions[i].Error = status, errText
+				}
 				if status == "proving" && s.Transactions[i].ProvingAt.IsZero() {
 					s.Transactions[i].ProvingAt = time.Now()
 				}
@@ -2352,15 +2484,14 @@ func (a *API) updateTx(id, status, hash, errText string) {
 				if hash != "" {
 					s.Transactions[i].Hash = hash
 				}
-				s.Transactions[i].Error = errText
 			}
 		}
 		return nil
 	})
 }
 
-func (a *API) setTxCommand(id, command string) {
-	_ = a.store.Update(func(s *model.State) error {
+func (a *API) setTxCommand(id, command string) error {
+	return a.store.Update(func(s *model.State) error {
 		for i := range s.Transactions {
 			if s.Transactions[i].ID == id {
 				s.Transactions[i].Command = command
@@ -2369,27 +2500,34 @@ func (a *API) setTxCommand(id, command string) {
 		return nil
 	})
 }
-func (a *API) finishTx(id, status, hash string, err error) {
+func (a *API) finishTx(id, status, hash string, err error) error {
 	msg := ""
 	if err != nil {
 		msg = err.Error()
 	}
-	_ = a.store.Update(func(s *model.State) error {
+	saveErr := a.store.Update(func(s *model.State) error {
 		for i := range s.Transactions {
 			if s.Transactions[i].ID == id {
+				if s.Transactions[i].Status == "unknown" || s.Transactions[i].Status == "cancelled" || s.Transactions[i].Status == "confirmed" || s.Transactions[i].Receipt != "" {
+					return nil
+				}
 				s.Transactions[i].Status = status
-				s.Transactions[i].Hash = hash
+				if hash != "" {
+					s.Transactions[i].Hash = hash
+				}
 				s.Transactions[i].Error = msg
 				s.Transactions[i].ConfirmedAt = time.Now()
 			}
 		}
 		return nil
 	})
+	if saveErr != nil {
+		a.pendingTxFinishes.Store(id, transactionFinish{status: status, hash: hash, cause: err})
+	} else {
+		a.pendingTxFinishes.Delete(id)
+	}
+	return saveErr
 }
-func (a *API) transactionAction(w http.ResponseWriter, r *http.Request) {
-	fail(w, 501, errors.New("transaction action not implemented"))
-}
-
 func (a *API) stream(w http.ResponseWriter, r *http.Request) {
 	f, ok := w.(http.Flusher)
 	if !ok {

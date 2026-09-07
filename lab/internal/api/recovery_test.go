@@ -167,7 +167,7 @@ func TestBeginNodeRecoveryConcurrentAdmission(t *testing.T) {
 	for err := range results {
 		if err == nil {
 			succeeded++
-		} else if !strings.Contains(err.Error(), "正在恢复") {
+		} else if err != errLifecycleBusy && !strings.Contains(err.Error(), "正在恢复") {
 			t.Errorf("unexpected duplicate error: %v", err)
 		}
 	}
