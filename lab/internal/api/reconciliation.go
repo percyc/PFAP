@@ -285,6 +285,9 @@ func (a *API) reconcileTransaction(ctx context.Context, txID string) (model.Tran
 		return tx, errors.Join(checkErr, err)
 	}
 	if !transactionHashPattern.MatchString(tx.Hash) {
+		if result, handled, err := a.reconcileProvenUnexecuted(ctx, tx, amountDecodeNeverExecuted, amountDecodeConclusion, "rpc-amount-decode-rejected"); handled {
+			return result, err
+		}
 		if result, handled, err := a.reconcileLegacyPublicStartup(ctx, tx); handled {
 			return result, err
 		}

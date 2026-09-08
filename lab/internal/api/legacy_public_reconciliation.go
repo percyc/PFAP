@@ -40,7 +40,11 @@ func legacyPublicConsoleNeverEvaluated(tx model.Transaction) bool {
 // worker calls are made. The original execution lock must be free, and both
 // eligibility and the lock's node identity are checked again at commit time.
 func (a *API) reconcileLegacyPublicStartup(ctx context.Context, tx model.Transaction) (model.Transaction, bool, error) {
-	if !legacyPublicConsoleNeverEvaluated(tx) {
+	return a.reconcileProvenUnexecuted(ctx, tx, legacyPublicConsoleNeverEvaluated, legacyPublicStartupConclusion, "legacy-console-startup-fatal")
+}
+
+func (a *API) reconcileProvenUnexecuted(ctx context.Context, tx model.Transaction, eligible func(model.Transaction) bool, conclusion, evidence string) (model.Transaction, bool, error) {
+	if !eligible(tx) {
 		return tx, false, nil
 	}
 	l, _ := a.nodeLocks.LoadOrStore(tx.FromNode, &sync.Mutex{})
@@ -66,7 +70,7 @@ func (a *API) reconcileLegacyPublicStartup(ctx context.Context, tx model.Transac
 			if current.ID != tx.ID {
 				continue
 			}
-			if current.FromNode != tx.FromNode || current.ExperimentID != tx.ExperimentID || !legacyPublicConsoleNeverEvaluated(*current) {
+			if current.FromNode != tx.FromNode || current.ExperimentID != tx.ExperimentID || !eligible(*current) {
 				return errors.New("交易执行证据已变化，不能确认未执行；请重新核验")
 			}
 			now := time.Now()
@@ -74,8 +78,8 @@ func (a *API) reconcileLegacyPublicStartup(ctx context.Context, tx model.Transac
 			current.LastCheckedAt = now
 			current.ReconciliationError = ""
 			// Preserve the complete original error; append the separate conclusion.
-			current.Error += "\n" + legacyPublicStartupConclusion
-			event = model.Event{ID: id("evt"), ExperimentID: current.ExperimentID, Level: "info", Kind: "transaction-reconciled", Message: legacyPublicStartupConclusion, Fields: map[string]any{"id": current.ID, "type": "public", "result": "not-executed", "evidence": "legacy-console-startup-fatal"}, At: now}
+			current.Error += "\n" + conclusion
+			event = model.Event{ID: id("evt"), ExperimentID: current.ExperimentID, Level: "info", Kind: "transaction-reconciled", Message: conclusion, Fields: map[string]any{"id": current.ID, "type": current.Type, "result": "not-executed", "evidence": evidence}, At: now}
 			s.Events = append(s.Events, event)
 			result = *current
 			return nil

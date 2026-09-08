@@ -1709,6 +1709,14 @@ func (a *API) runTransaction(t model.Transaction) {
 	if value == "" {
 		value = "0x1"
 	}
+	if t.Type != "createAccount" {
+		canonical, err := transactionRPCAmount(t.Type, value)
+		if err != nil {
+			_ = a.finishTx(t.ID, "failed", "", err)
+			return
+		}
+		value = canonical
+	}
 	expr := ""
 	if t.Type == "transfer" {
 		if err := a.setTxCommand(t.ID, transferCommand(node.Name, toNode.Name, value)); err != nil {
