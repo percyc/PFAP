@@ -99,6 +99,10 @@ type Transaction struct {
 	BatchID                     string    `json:"batchId,omitempty"`
 	WorkloadID                  string    `json:"workloadId,omitempty"`
 	Sequence                    int       `json:"sequence,omitempty"`
+	RunPhase                    string    `json:"runPhase,omitempty"`
+	ReadyAt                     time.Time `json:"readyAt,omitempty"`
+	ExpectedPayerBalance        string    `json:"expectedPayerBalance,omitempty"`
+	ExpectedReceiverBalance     string    `json:"expectedReceiverBalance,omitempty"`
 	ExperimentID                string    `json:"experimentId"`
 	Type                        string    `json:"type"`
 	FromNode                    string    `json:"fromNode"`
@@ -150,25 +154,48 @@ type AccountSnapshot struct {
 }
 
 type Workload struct {
-	ID                  string    `json:"id"`
-	ExperimentID        string    `json:"experimentId"`
-	Name                string    `json:"name"`
-	Type                string    `json:"type"`
-	Value               string    `json:"value"`
-	RatePerSecond       float64   `json:"ratePerSecond"`
-	DurationSeconds     int       `json:"durationSeconds"`
-	Strategy            string    `json:"strategy"`
-	Status              string    `json:"status"`
-	Submitted           int       `json:"submitted"`
-	Attempted           int       `json:"attempted"`
-	SkippedBusy         int       `json:"skippedBusy"`
-	SkippedUnavailable  int       `json:"skippedUnavailable"`
-	StopRequested       bool      `json:"stopRequested"`
-	SubmissionStoppedAt time.Time `json:"submissionStoppedAt,omitempty"`
-	CreatedAt           time.Time `json:"createdAt"`
-	StartedAt           time.Time `json:"startedAt,omitempty"`
-	FinishedAt          time.Time `json:"finishedAt,omitempty"`
-	Error               string    `json:"error,omitempty"`
+	Configuration        map[string]any `json:"configuration,omitempty"`
+	ObserverNodeID       string         `json:"observerNodeId,omitempty"`
+	Blocks               []RunBlock     `json:"blocks,omitempty"`
+	BlockError           string         `json:"blockError,omitempty"`
+	Mode                 string         `json:"mode,omitempty"`
+	NodeIDs              []string       `json:"nodeIds,omitempty"`
+	WarmupSeconds        int            `json:"warmupSeconds,omitempty"`
+	Confirmations        int            `json:"confirmations,omitempty"`
+	Phase                string         `json:"phase,omitempty"`
+	MeasurementStartedAt time.Time      `json:"measurementStartedAt,omitempty"`
+	MeasurementEndsAt    time.Time      `json:"measurementEndsAt,omitempty"`
+	InvalidReason        string         `json:"invalidReason,omitempty"`
+	ID                   string         `json:"id"`
+	ExperimentID         string         `json:"experimentId"`
+	Name                 string         `json:"name"`
+	Type                 string         `json:"type"`
+	Value                string         `json:"value"`
+	RatePerSecond        float64        `json:"ratePerSecond"`
+	DurationSeconds      int            `json:"durationSeconds"`
+	Strategy             string         `json:"strategy"`
+	Status               string         `json:"status"`
+	Submitted            int            `json:"submitted"`
+	Attempted            int            `json:"attempted"`
+	SkippedBusy          int            `json:"skippedBusy"`
+	SkippedUnavailable   int            `json:"skippedUnavailable"`
+	StopRequested        bool           `json:"stopRequested"`
+	SubmissionStoppedAt  time.Time      `json:"submissionStoppedAt,omitempty"`
+	CreatedAt            time.Time      `json:"createdAt"`
+	StartedAt            time.Time      `json:"startedAt,omitempty"`
+	FinishedAt           time.Time      `json:"finishedAt,omitempty"`
+	Error                string         `json:"error,omitempty"`
+}
+
+type RunBlock struct {
+	Number       uint64    `json:"number"`
+	Hash         string    `json:"hash"`
+	ParentHash   string    `json:"parentHash"`
+	Timestamp    uint64    `json:"timestamp"`
+	Size         uint64    `json:"size"`
+	Transactions int       `json:"transactions"`
+	ObservedAt   time.Time `json:"observedAt"`
+	ValidationUs *int64    `json:"validationUs"`
 }
 
 type State struct {

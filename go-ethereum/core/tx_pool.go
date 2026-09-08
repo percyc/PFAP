@@ -117,7 +117,6 @@ const (
 type blockChain interface {
 	CurrentBlock() *types.Block
 	GetBlock(hash common.Hash, number uint64) *types.Block
-	GetBlockByNumber(number uint64) *types.Block
 	StateAt(root common.Hash) (*state.StateDB, error)
 
 	SubscribeChainHeadEvent(ch chan<- ChainHeadEvent) event.Subscription
@@ -618,6 +617,15 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		}
 	}
 	if txCode == types.TransferTx {
+		if err := ValidateTransferShape(tx); err != nil {
+			return err
+		}
+		if _, err := ValidateTransferRoot(pool.chain.CurrentBlock(), pool.chain.GetBlock, tx.CMTBlocks(), tx.RTcmt()); err != nil {
+			return err
+		}
+		if err := validateTransferSerials(tx, pool.currentState.Exist); err != nil {
+			return err
+		}
 		rtCmt := tx.RTcmt()
 		// Verify payer's proof_A (type=0): cmtS, sn_A_old, cmt_A_new
 		err = zktx.VerifyTransferProof(tx.ZKCMTS(), tx.ZKSN(), tx.ZKCMT(), &rtCmt, tx.ZKValue(), 0, tx.ZKProof())
@@ -639,12 +647,9 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		}
 	}
 	verProofEnd := time.Now()
-	fmt.Println("***** Verify transaction Cost Time (ms): ", verProofEnd.Sub(verProofStart).Nanoseconds() / 1000000, " Tx Size (bytes): ", tx.Size())
+	fmt.Println("***** Verify transaction Cost Time (ms): ", verProofEnd.Sub(verProofStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size())
 
-	// NOTE: the legacy seq-based root re-check (rebuilding a SHA-256 Merkle tree
-	// from tx.CMTBlocks()) is removed. With the global Poseidon state Merkle
-	// tree, rt need not be the latest root: the ZK proof already proves that
-	// cmt_old's leaf was 1 under the claimed rt, which is all that is required.
+	// Transfer membership is valid only under a verified ancestral block root.
 	return nil
 }
 

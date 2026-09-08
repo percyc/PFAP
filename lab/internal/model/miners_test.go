@@ -6,6 +6,19 @@ import (
 	"testing"
 )
 
+func TestPlannedNodesCapacity300(t *testing.T) {
+	for _, count := range []int{100, 300, 301} {
+		e := Experiment{ID: "capacity", MinerCount: 1, Placements: []Placement{{ServerID: "a", Count: count}}}
+		nodes, err := ResolvePlannedMiners(e, map[string]Server{"a": {ID: "a"}})
+		if count <= 300 && (err != nil || len(nodes) != count) {
+			t.Fatalf("count %d: nodes %d, %v", count, len(nodes), err)
+		}
+		if count > 300 && err == nil {
+			t.Fatal("accepted oversized experiment")
+		}
+	}
+}
+
 func TestAssignMinersSpreadsAcrossServers(t *testing.T) {
 	for _, tc := range []struct {
 		count int

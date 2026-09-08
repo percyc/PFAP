@@ -85,6 +85,11 @@ func (a *API) beginMiningSelectionUpdate(experimentID string, request miningUpda
 	var exp model.Experiment
 	servers := map[string]model.Server{}
 	err := a.store.Update(func(s *model.State) error {
+		for _, run := range s.Workloads {
+			if run.ExperimentID == experimentID && run.Strategy == "ready-pool" && runActive(run) {
+				return errors.New("完整实验流程运行中，不能调整矿工；请先停止并收尾")
+			}
+		}
 		for _, server := range s.Servers {
 			servers[server.ID] = server
 		}

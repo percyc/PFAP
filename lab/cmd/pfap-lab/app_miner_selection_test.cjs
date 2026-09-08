@@ -75,12 +75,19 @@ test('manual apply confirms old/new nodes and known hosts and suppresses duplica
  const busy=context.minerConfiguration(data.experiments[0]);assert.match(busy,/miner-apply" disabled>调整中/);assert.match(busy,/type="radio"[^>]*disabled/);
  finish({miningStatus:'updating'});await pending;
 });
+test('300-node preview is complete and selectable',()=>{
+ const context=ui(),data=fixture();setState(context,data);
+ const experiment={...data.experiments[0],nodes:[],placements:[{serverId:'a',count:300}]};
+ assert.equal(context.minerCandidates(experiment).length,300);
+ assert.doesNotThrow(()=>context.minerRequestBody(experiment,{mode:'manual',selections:['a:300'],count:'1'}));
+});
+
 test('manual validation rejects empty, duplicate, and stale selections',()=>{
  const context=ui(),data=fixture();setState(context,data);const experiment=data.experiments[0];
  assert.throws(()=>context.minerRequestBody(experiment,{mode:'manual',selections:[],count:'2'}),/1 至 6/);
  assert.throws(()=>context.minerRequestBody(experiment,{mode:'manual',selections:['a:1','a:1'],count:'2'}),/重复/);
  assert.throws(()=>context.minerRequestBody(experiment,{mode:'manual',selections:['outside:1'],count:'2'}),/部署清单/);
- assert.throws(()=>context.minerRequestBody({...experiment,nodes:[],placements:[{serverId:'a',count:101}]},{mode:'auto',count:'2',selections:[]}),/最多 100/);
+ assert.throws(()=>context.minerRequestBody({...experiment,nodes:[],placements:[{serverId:'a',count:301}]},{mode:'auto',count:'2',selections:[]}),/最多 300/);
  const html=context.minerChecklist(experiment,{mode:'manual',count:'1',selections:['b:1']});
  assert.match(html,/node-3/);assert.match(html,/10\.0\.0\.2/);assert.match(html,/物理主机 rack x/);assert.match(html,/磁盘空间尚未采集/);assert.match(html,/当前期望矿工 · 实际正在挖矿/);
 });
@@ -110,7 +117,7 @@ test('new experiment submits an explicit manual list once without requiring expe
 test('temporarily invalid node-count edits preserve the new manual draft',()=>{
  const {context,count}=newFormContext();context.updateMinerPlacement();context.changeNewMinerMode('manual');
  const selected=plain(context.newMinerDraft().selections);
- for(const value of ['', '1.5', '101']){count.value=value;context.updateMinerPlacement();assert.deepEqual(plain(context.newMinerDraft().selections),selected)}
+ for(const value of ['', '1.5', '301']){count.value=value;context.updateMinerPlacement();assert.deepEqual(plain(context.newMinerDraft().selections),selected)}
  count.value='2';context.updateMinerPlacement();assert.equal(context.minerDraftValidation(context.newMinerExperiment(),context.newMinerDraft()),'');
 });
 test('repeated identical refresh keeps auto previews disabled, preserves manual drafts, and disables all pending fields',()=>{

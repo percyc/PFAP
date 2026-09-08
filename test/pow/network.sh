@@ -8,6 +8,7 @@ if [ -f "$SCRIPT_DIR/network.env" ]; then
 fi
 
 NODE_COUNT="${NODE_COUNT:-3}"
+MAX_PEERS="${MAX_PEERS:-25}"
 NETWORK_ID="${NETWORK_ID:-55661}"
 P2P_PORT_BASE="${P2P_PORT_BASE:-20000}"
 HTTP_PORT_BASE="${HTTP_PORT_BASE:-21000}"
@@ -38,6 +39,7 @@ info() { printf '[INFO] %s\n' "$*"; }
 
 validate_config() {
     [[ "$NODE_COUNT" =~ ^[1-9][0-9]*$ ]] || die "NODE_COUNT must be a positive integer"
+    [[ "$MAX_PEERS" =~ ^[1-9][0-9]{0,4}$ ]] && (( MAX_PEERS <= 65535 )) || die "MAX_PEERS must be an integer between 1 and 65535"
     [[ "$P2P_PORT_BASE" =~ ^[0-9]+$ ]] || die "P2P_PORT_BASE must be an integer"
     command -v "$GETH_BIN" >/dev/null 2>&1 || die "geth not found: $GETH_BIN"
     [ -f "$GENESIS" ] || die "genesis not found: $GENESIS"
@@ -153,7 +155,7 @@ start_network() {
         fi
         info "Starting node $node (p2p=$port, account=0x$address)"
         mkdir -p "$NETWORK_ROOT/ethash"
-        nohup setsid "$GETH_BIN" --datadir "$dir" --networkid "$NETWORK_ID" --port "$port" \
+        nohup setsid "$GETH_BIN" --datadir "$dir" --networkid "$NETWORK_ID" --port "$port" --maxpeers "$MAX_PEERS" \
             --ipcpath "$(ipc_path "$node")" --unlock "$address" --password "$PASSWORD_FILE" \
             --ethash.dagdir "$NETWORK_ROOT/ethash" --nodiscover --nousb \
             "${http_args[@]}" \

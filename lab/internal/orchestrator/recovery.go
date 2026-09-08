@@ -118,6 +118,7 @@ func recoveryScript(exp model.Experiment, node model.Node, server model.Server) 
 		"dir=" + shell(root+"/node"+strconv.Itoa(node.LocalIndex)) + "\n" +
 		"network_id=" + strconv.Itoa(exp.NetworkID) + "\n" +
 		"p2p_port=" + strconv.Itoa(node.P2PPort) + "\n" +
+		"max_peers=" + strconv.Itoa(experimentMaxPeers(exp)) + "\n" +
 		"expected_account=" + shell(strings.TrimPrefix(strings.ToLower(node.Account), "0x")) + "\n"
 	return "set -euo pipefail\n" + variables + `
 geth="$runtime/bin/geth"
@@ -212,7 +213,7 @@ trap 'rm -f -- "$startup_pidfile"' EXIT
 # The new session's child writes its own PID immediately before exec. $!
 # can refer to the short-lived setsid parent and must not be persisted.
 nohup setsid --wait bash -ec 'printf "%s\n" "$BASHPID" >"$1"; shift; exec "$@"' lab-recovery "$startup_pidfile" \
-    "$geth" --datadir "$dir" --networkid "$network_id" --port "$p2p_port" \
+    "$geth" --datadir "$dir" --networkid "$network_id" --port "$p2p_port" --maxpeers "$max_peers" \
     --ipcpath "$dir/geth.ipc" --unlock "$address" --password "$root/password.txt" \
     --ethash.dagdir "$root/ethash" --nodiscover --nousb \
     9>&- </dev/null >>"$dir/geth.log" 2>&1 &

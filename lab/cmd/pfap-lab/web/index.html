@@ -152,7 +152,8 @@
 </select>
 </label>
 <fieldset class="miner-mode-switch new-miner-mode"><legend>矿工选择方式</legend><label><input type="radio" id="miners-new-mode-auto" name="minerMode" value="auto" checked onchange="changeNewMinerMode(this.value)">自动分散</label><label><input type="radio" id="miners-new-mode-manual" name="minerMode" value="manual" onchange="changeNewMinerMode(this.value)">手动选节点</label></fieldset>
-<label><span id="newMinerCountLabel">矿工节点数</span><input name="minerCount" id="newExperimentMinerCount" type="number" min="1" max="100" step="1" value="1" required aria-describedby="minerPlacementPreview"></label>
+<label><span id="newMinerCountLabel">矿工节点数</span><input name="minerCount" id="newExperimentMinerCount" type="number" min="1" max="300" step="1" value="1" required aria-describedby="minerPlacementPreview"></label>
+<p class="run-note">每个实验最多 300 个节点。节点数量不代表可保证的吞吐量，请按宿主机 CPU、内存、磁盘与网络容量规划。</p>
 <div id="minerPlacementPreview" class="miner-placement-preview" aria-live="polite">先选择部署服务器，再设置矿工节点数。</div>
 <div id="newExperimentDiskHint" aria-live="polite"></div>
 <button type="submit" class="primary">创建实验</button>
@@ -207,10 +208,23 @@
 <div id="transactionPagination" class="workspace-pagination"></div>
 </article>
 <article class="workload-panel">
-<h2>自动交易规则</h2>
+<h2>自动实验流程</h2>
+<p class="run-intro">准备账户 → 预热 → 独立测量窗口 → 停止投递并收尾。只有双方账户完成核验后才会再次参与交易。</p>
 <div id="workloadRows"></div>
-<form id="workloadForm">
+<form id="workloadForm" oninput="invalidateRunPreflight()">
 <input type="hidden" name="experimentId" id="workloadExperiment">
+<label>运行名称<input name="name" value="Transfer 稳态实验" required maxlength="100"></label>
+<label>流程<select name="strategy" onchange="updateRunForm()"><option value="ready-pool">完整 Transfer 实验（空闲账户配对）</option><option value="round-robin">传统定时测试（Mint / Redeem / Public）</option></select></label>
+<fieldset id="runPlan"><legend>1 · 选择参与节点与运行参数</legend>
+<label>交易节点（至少两个在线非矿工）<select id="runNodeSelect" multiple size="6" aria-label="参与自动实验的节点" onchange="invalidateRunPreflight()"></select></label>
+<label>区块观察节点<select id="runObserverSelect" name="observerNodeId" onchange="invalidateRunPreflight()"><option value="">默认第一个参与节点</option></select></label>
+<p class="run-note">建议选不挖矿的独立观察节点，减少生成证明与采集之间的资源干扰。旧运行包没有执行验证埋点时，报告保留缺失计数。</p>
+<div class="row-actions"><button type="button" class="action secondary" onclick="selectRunNodes(true)">选择全部在线非矿工</button><button type="button" class="action secondary" onclick="selectRunNodes(false)">清空选择</button></div>
+<p class="run-note">矿工仅负责出块与验证，不参与自动交易或账户准备。需至少一个在线矿工及两个非矿工；挖矿状态未确认的节点不可选。LXC 容器共享宿主机时仍会竞争资源，建议将矿工与交易节点分布到不同宿主机。</p>
+<label>负载模式<select name="mode" onchange="updateRunForm()"><option value="saturation">持续饱和：有空闲账户即配对</option><option value="rate">目标速率：按频率准入</option></select></label>
+<div class="pair"><label>预热秒数<input name="warmupSeconds" type="number" min="1" max="7200" value="600" required></label><label>确认深度（含交易块）<input name="confirmations" type="number" min="1" max="64" value="2" required></label></div>
+<p class="run-note">预热至少达到设定时长，且每个参与账户完成过安全交易。最多额外等待 30 分钟。此条件不等同于统计平稳，请结合结果趋势评估。</p>
+</fieldset>
 <div class="pair">
 <label>类型<select name="type">
 <option value="mint">Mint</option>
@@ -225,10 +239,12 @@
 <div class="pair">
 <label>每秒尝试数<input name="ratePerSecond" type="number" min="0.01" max="100" step="0.01" value="0.1">
 </label>
-<label>持续秒数<input name="durationSeconds" type="number" min="1" max="604800" step="1" value="60">
+<label>正式测量秒数<input name="durationSeconds" type="number" min="1" max="604800" step="1" value="3600">
 </label>
 </div>
-<button id="startWorkload" type="submit" class="primary">启动 Round-robin 负载</button>
+<section id="runPreparation"><h3>2 · 账户准备与检查</h3><p class="run-note">以下操作需要单独确认，实际发送交易但不计入测量窗口。先初始化，等待完成后再补足余额；不会自动预付公开手续费。</p><button type="button" class="action secondary" onclick="prepareRunAccounts('initialize')">初始化所选未开户节点</button><label>目标隐私余额<input id="runFundingTarget" value="0x3e8" placeholder="十进制或 0x 十六进制"></label><button type="button" class="action secondary" onclick="prepareRunAccounts('fund')">Mint 补足所选节点到目标余额</button><p class="run-note">低于目标时仅补差额；达到目标的节点跳过。已有交易或状态未刷新时拒绝，避免重复补款。</p><button type="button" class="action secondary" id="checkRunPlanButton" onclick="checkRunPlan()">检查参与节点（不发送交易）</button><div id="runPreflightResult" role="status">尚未检查</div></section>
+<button id="startWorkload" type="submit" class="primary">检查通过后启动预热与测量</button>
+<p class="run-note">启动需要确认；已有实验配置不变。运行中不能插入手动交易。区块验证耗时未采集时明确显示缺失，不用证明耗时替代。</p>
 </form>
 </article>
 </div>
@@ -304,6 +320,7 @@
 <script src="/miners.js"></script>
 <script src="/network.js"></script>
 <script src="/workspace.js"></script>
+<script src="/runs.js"></script>
 <script src="/app.js">
 </script>
 </body>

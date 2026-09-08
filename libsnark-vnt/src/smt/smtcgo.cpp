@@ -67,10 +67,9 @@ void smtReset() {
 //   [.. +64]       : root (64 hex chars)
 // Total length = 1 + 256 + 256*64 + 64 = 16705 chars (+ null terminator).
 // Caller frees with smtFree.
-char* smtProve(const char* cmt_hex) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+static char* proveSnapshot(PoseidonSMT& snapshot, const char* cmt_hex) {
     uint256 cmt = uint256S(cmt_hex);
-    PoseidonSMT::Proof pr = tree().prove(cmt);
+    PoseidonSMT::Proof pr = snapshot.prove(cmt);
 
     std::string out;
     out.reserve(1 + 256 + 256 * 64 + 64);
@@ -89,6 +88,22 @@ char* smtProve(const char* cmt_hex) {
     }
     return dupString(out);
 }
+
+char* smtProve(const char* cmt_hex) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return proveSnapshot(tree(), cmt_hex);
+}
+
+void* smtSnapshotNew() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    tree(); // initialize curve parameters through the existing initialization path
+    return new PoseidonSMT();
+}
+void* smtSnapshotClone(void* handle) { return new PoseidonSMT(*static_cast<PoseidonSMT*>(handle)); }
+void smtSnapshotDelete(void* handle) { delete static_cast<PoseidonSMT*>(handle); }
+void smtSnapshotInsert(void* handle, const char* cmt) { static_cast<PoseidonSMT*>(handle)->insert(uint256S(cmt)); }
+char* smtSnapshotRoot(void* handle) { return dupString(static_cast<PoseidonSMT*>(handle)->root_uint256().ToString()); }
+char* smtSnapshotProve(void* handle, const char* cmt) { return proveSnapshot(*static_cast<PoseidonSMT*>(handle), cmt); }
 
 void smtFree(char* p) {
     delete[] p;

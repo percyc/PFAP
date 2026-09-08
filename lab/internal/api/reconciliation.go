@@ -119,6 +119,10 @@ func (a *API) recordServerCheck(serverID, output string, checkErr error) error {
 // This is the durable boundary before an RPC may change node state. If the
 // intent cannot be saved, the RPC must not run.
 func (a *API) beginTransactionRPC(txID, stage string) error {
+	return a.beginTransactionRPCWithPayerState(txID, stage, "")
+}
+
+func (a *API) beginTransactionRPCWithPayerState(txID, stage, payerCommitment string) error {
 	return a.store.Update(func(s *model.State) error {
 		for i := range s.Transactions {
 			tx := &s.Transactions[i]
@@ -128,7 +132,10 @@ func (a *API) beginTransactionRPC(txID, stage string) error {
 			if tx.Status != "queued" && tx.Status != "proving" {
 				return errors.New("交易已停止执行或结果待核验，未发送新指令")
 			}
-			if err := transactionNodesAvailable(*s, *tx); err != nil {
+			if payerCommitment != "" && (stage != "submit" || tx.Type != "transfer" || tx.Status != "proving" || tx.ExecutionStage != "payer-proof" || !tx.SubmissionAttemptedAt.IsZero()) {
+				return errors.New("当前交易不是等待接收方提交的付款证明阶段，未重复发送")
+			}
+			if err := transactionNodesAvailableAfterPayerProof(*s, *tx, stage, payerCommitment, time.Now()); err != nil {
 				return err
 			}
 			tx.Status, tx.ExecutionStage = "proving", stage
@@ -227,6 +234,32 @@ func (a *API) reconcileTransaction(ctx context.Context, txID string) (model.Tran
 	if tx.ID == "" {
 		return tx, os.ErrNotExist
 	}
+	if tx.Status == "settling" {
+		ids := []string{tx.FromNode, tx.ToNode}
+		sort.Strings(ids)
+		var locks []*sync.Mutex
+		defer func() {
+			for _, lock := range locks {
+				lock.Unlock()
+			}
+		}()
+		for _, id := range ids {
+			lock, _ := a.nodeLocks.LoadOrStore(id, &sync.Mutex{})
+			if !lock.(*sync.Mutex).TryLock() {
+				return tx, errors.New("双方核验仍在执行，请稍后重试")
+			}
+			locks = append(locks, lock.(*sync.Mutex))
+		}
+		err := a.checkRunReadiness(ctx, tx.ID)
+		a.store.View(func(s model.State) {
+			for _, current := range s.Transactions {
+				if current.ID == tx.ID {
+					tx = current
+				}
+			}
+		})
+		return tx, err
+	}
 	if tx.Status == "confirmed" || tx.Receipt != "" {
 		return tx, nil
 	}
@@ -252,6 +285,9 @@ func (a *API) reconcileTransaction(ctx context.Context, txID string) (model.Tran
 		return tx, errors.Join(checkErr, err)
 	}
 	if !transactionHashPattern.MatchString(tx.Hash) {
+		if result, handled, err := a.reconcileLegacyPublicStartup(ctx, tx); handled {
+			return result, err
+		}
 		return finishCheck(errors.New("没有可核验的交易哈希，无法断言交易未发送；请人工检查节点日志和双方账户状态，勿重复发送或初始化"))
 	}
 	lockIDs := []string{tx.FromNode}

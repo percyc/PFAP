@@ -160,12 +160,17 @@ console.log("payer data:", payerData)
    {
      cmtANew: "0x...",   // payer's new commitment
      snAOld: "0x...",    // payer's old serial number
-     proofA: "0x..."     // payer's proof
+     proofA: "0x...",    // payer's proof
+     proofRoot: "0x...", // verified historical commitment root
+     proofBlock: "0x..." // anchor height (hex quantity)
    }
 */
 ```
 
-> If you want to abort the transfer, call: `eth.revertTransferState()`
+> Reserve BOTH accounts before generating the payer proof. Do not automatically
+> revert or retry a frozen payer when submission is uncertain: first reconcile
+> the transaction on chain. Use a fresh chain with all nodes on the historical-root
+> runtime; the legacy unanchored/on-chain-payer Transfer format is not supported.
 
 ### 5c. Receiver submits the final transaction
 
@@ -183,7 +188,9 @@ eth.sendTransferTransaction({
     rs: rs,
     cmtANew: payerData.cmtANew,
     snAOld: payerData.snAOld,
-    proofA: payerData.proofA
+    proofA: payerData.proofA,
+    proofRoot: payerData.proofRoot,
+    proofBlock: payerData.proofBlock
 })
 ```
 

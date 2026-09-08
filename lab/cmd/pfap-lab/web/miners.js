@@ -10,8 +10,8 @@ function minerCandidates(experiment){
    result.push({...node,localIndex:Number(node.localIndex)||0,name:node.name||`node-${Number(node.index)||result.length+1}`});
   }
  }else for(const placement of placements){
-  const count=Number(placement.count);if(!Number.isInteger(count)||count<1||count>100)continue;
-  for(let localIndex=1;localIndex<=count&&result.length<101;localIndex++)result.push({serverId:placement.serverId,localIndex,index:result.length+1,name:`node-${result.length+1}`});
+  const count=Number(placement.count);if(!Number.isInteger(count)||count<1||count>300)continue;
+  for(let localIndex=1;localIndex<=count&&result.length<301;localIndex++)result.push({serverId:placement.serverId,localIndex,index:result.length+1,name:`node-${result.length+1}`});
  }
  return result;
 }
@@ -59,12 +59,12 @@ function minerDraftNodes(experiment,draft,nodes=minerCandidates(experiment)){
 function minerDraftValidation(experiment,draft){
  const nodes=minerCandidates(experiment),total=experimentNodeCount(experiment),selected=minerDraftNodes(experiment,draft,nodes),count=draft.mode==='manual'?selected.length:Number(draft.count);
  if(draft.mode==='manual'&&manualMinerManifestProblem(experiment))return manualMinerManifestProblem(experiment);
- if((experiment.placements||[]).some(placement=>!Number.isInteger(Number(placement.count))||Number(placement.count)<1))return '每台节点数必须为 1 至 100 的整数';
+ if((experiment.placements||[]).some(placement=>!Number.isInteger(Number(placement.count))||Number(placement.count)<1))return '每台节点数必须为 1 至 300 的整数';
  if(total<1)return '请先选择部署服务器并填写每台节点数';
- if(total>100)return '每个实验最多 100 个节点，请减少服务器或每台节点数';
+ if(total>300)return '每个实验最多 300 个节点，请减少服务器或每台节点数';
  if(draft.mode==='manual'&&new Set(draft.selections).size!==draft.selections.length)return '矿工节点清单不能重复';
  if(draft.mode==='manual'&&draft.selections.some(key=>!nodes.some(node=>minerSelectionKey(node)===key)))return '部分所选节点已不在部署清单中，请重新选择';
- return Number.isInteger(count)&&count>=1&&count<=Math.min(total,100)?'':`请选择 1 至 ${Math.min(total,100)} 个矿工${draft.mode==='auto'?'，节点数必须为整数':''}`;
+ return Number.isInteger(count)&&count>=1&&count<=Math.min(total,300)?'':`请选择 1 至 ${Math.min(total,300)} 个矿工${draft.mode==='auto'?'，节点数必须为整数':''}`;
 }
 function minerDraftChanged(experiment,draft){
  if(draft.mode!==(experiment.minerMode==='manual'?'manual':'auto'))return true;
@@ -95,7 +95,7 @@ function minerModeFields(id,draft,busy,isNew=false,manualProblem=''){
 function minerSelectionConfiguration(experiment){
  const draft=minerDraft(experiment),total=experimentNodeCount(experiment),busy=experimentBusy(experiment),editable=['draft','stopped','running'].includes(experiment.status),changed=minerDraftChanged(experiment,draft),error=minerDraftValidation(experiment,draft),saved=savedMinerNodes(experiment),count=draft.mode==='manual'?minerDraftNodes(experiment,draft).length:draft.count,manualProblem=manualMinerManifestProblem(experiment);
  const retry=!changed&&experiment.miningError,needsReapply=!changed&&miningNeedsReapply(experiment),label=busy?'调整中…':retry?'重试应用':needsReapply?'重新应用':'应用配置';
- return `<section class="miner-configuration"><div class="miner-configuration-head"><b>出块配置</b><div class="meta">${miningHealth(experiment)}</div></div><p class="miner-saved-selection"><b>已保存期望 · ${experiment.minerMode==='manual'?'手动':'自动'}</b> ${esc(minerCoverageText(saved))}<span>${esc(saved.map(node=>node.name+' / '+minerServer(node).name).join('、')||'尚无已部署矿工')}</span></p>${editable?`<form class="miner-count-form miner-selection-form" data-miner-form="${esc(experiment.id)}" onsubmit="applyMinerCount(event,this.dataset.minerForm)">${minerModeFields(experiment.id,draft,busy,false,manualProblem)}<div class="miner-selection-actions"><label for="miners-${esc(experiment.id)}">${draft.mode==='manual'?'已选矿工数':'矿工节点数'}<input id="miners-${esc(experiment.id)}" name="minerCount" type="number" min="1" max="${Math.min(total,100)}" step="1" ${draft.mode==='manual'?'readonly':'required'} value="${esc(count)}" data-miner-experiment="${esc(experiment.id)}" oninput="editMinerCount(this,this.dataset.minerExperiment)" ${busy?'disabled':''}></label><button type="submit" class="action secondary miner-apply" ${busy||error||(!changed&&!experiment.miningError&&!miningNeedsReapply(experiment))?'disabled':''}>${label}</button></div><div id="miner-preview-${esc(experiment.id)}">${minerPreview(experiment,draft,{busy})}</div></form>`:''}<p class="miner-config-hint">切换方式与勾选仅修改草稿，点击“应用配置”后才生效。多矿工会改变总算力、出块节奏及分叉概率，性能对比时请保持配置一致。</p>${experiment.status==='running'&&miningStats(experiment).active===0&&!busy?'<p class="miner-health-warning">暂未观测到在线挖矿节点，请检查矿工连接与挖矿状态。</p>':''}${busy?'<p class="miner-config-progress" role="status">正在调整矿工，完成后会自动更新实际状态；请勿重复操作。</p>':''}${experiment.miningError?`<p class="node-recovery-error breakable" role="alert">矿工配置未完全生效：${esc(experiment.miningError)}。请核对各节点实际挖矿状态，再重试。</p>`:''}${experimentDiskHint(experiment)}</section>`;
+ return `<section class="miner-configuration"><div class="miner-configuration-head"><b>出块配置</b><div class="meta">${miningHealth(experiment)}</div></div><p class="miner-saved-selection"><b>已保存期望 · ${experiment.minerMode==='manual'?'手动':'自动'}</b> ${esc(minerCoverageText(saved))}<span>${esc(saved.map(node=>node.name+' / '+minerServer(node).name).join('、')||'尚无已部署矿工')}</span></p>${editable?`<form class="miner-count-form miner-selection-form" data-miner-form="${esc(experiment.id)}" onsubmit="applyMinerCount(event,this.dataset.minerForm)">${minerModeFields(experiment.id,draft,busy,false,manualProblem)}<div class="miner-selection-actions"><label for="miners-${esc(experiment.id)}">${draft.mode==='manual'?'已选矿工数':'矿工节点数'}<input id="miners-${esc(experiment.id)}" name="minerCount" type="number" min="1" max="${Math.min(total,300)}" step="1" ${draft.mode==='manual'?'readonly':'required'} value="${esc(count)}" data-miner-experiment="${esc(experiment.id)}" oninput="editMinerCount(this,this.dataset.minerExperiment)" ${busy?'disabled':''}></label><button type="submit" class="action secondary miner-apply" ${busy||error||(!changed&&!experiment.miningError&&!miningNeedsReapply(experiment))?'disabled':''}>${label}</button></div><div id="miner-preview-${esc(experiment.id)}">${minerPreview(experiment,draft,{busy})}</div></form>`:''}<p class="miner-config-hint">切换方式与勾选仅修改草稿，点击“应用配置”后才生效。多矿工会改变总算力、出块节奏及分叉概率，性能对比时请保持配置一致。</p>${experiment.status==='running'&&miningStats(experiment).active===0&&!busy?'<p class="miner-health-warning">暂未观测到在线挖矿节点，请检查矿工连接与挖矿状态。</p>':''}${busy?'<p class="miner-config-progress" role="status">正在调整矿工，完成后会自动更新实际状态；请勿重复操作。</p>':''}${experiment.miningError?`<p class="node-recovery-error breakable" role="alert">矿工配置未完全生效：${esc(experiment.miningError)}。请核对各节点实际挖矿状态，再重试。</p>`:''}${experimentDiskHint(experiment)}</section>`;
 }
 function changeMinerMode(id,mode){
  const experiment=state.experiments.find(item=>item.id===id);if(!experiment||experimentBusy(experiment)||!['auto','manual'].includes(mode))return;
@@ -133,9 +133,9 @@ function changeNewMinerMode(mode){
 function updateNewMinerPlacement(){
  const form=$('#experimentForm');if(!form)return;
  const experiment=newMinerExperiment(),input=form.elements.minerCount,total=experimentNodeCount(experiment),allowed=new Set(minerCandidates(experiment).map(minerSelectionKey)),previous=newMinerSelection.selections;
- const validLayout=Number.isInteger(Number(form.elements.count.value))&&Number(form.elements.count.value)>=1&&total<=100;
+ const validLayout=Number.isInteger(Number(form.elements.count.value))&&Number(form.elements.count.value)>=1&&total<=300;
  if(validLayout||!experiment.placements.length){newMinerSelection.selections=previous.filter(key=>allowed.has(key));newMinerSelection.removed+=previous.length-newMinerSelection.selections.length}
- input.max=String(Math.min(100,Math.max(total,1)));
+ input.max=String(Math.min(300,Math.max(total,1)));
  if(newMinerSelection.mode==='manual')input.value=String(newMinerSelection.selections.length);else if(!newMinerCountEdited)input.value=String(Math.min(2,Math.max(total,1)));
  input.readOnly=newMinerSelection.mode==='manual';input.required=!input.readOnly;
  for(const field of form.querySelectorAll?.('input,select')||[])field.disabled=newMinerSelection.pending||(field.name==='minerNode'&&newMinerSelection.mode!=='manual');

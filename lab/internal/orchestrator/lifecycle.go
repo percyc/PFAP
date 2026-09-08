@@ -71,8 +71,8 @@ func lifecycleNodes(exp model.Experiment) ([]model.Node, error) {
 	var nodes []model.Node
 	index := 1
 	for _, placement := range exp.Placements {
-		if placement.Count < 1 || placement.Count > 100 || len(nodes)+placement.Count > 100 {
-			return nil, fmt.Errorf("server %s node count is invalid or total exceeds 100", placement.ServerID)
+		if placement.Count < 1 || placement.Count > 300 || len(nodes)+placement.Count > 300 {
+			return nil, fmt.Errorf("server %s node count is invalid or total exceeds 300", placement.ServerID)
 		}
 		for local := 1; local <= placement.Count; local++ {
 			nodes = append(nodes, model.Node{
@@ -194,10 +194,11 @@ if [ -z "$pid" ]; then
     # An interrupted fresh deployment may never have created this datadir.
     # Walk from the configured work directory with access checks so EACCES
     # and dangling symlinks cannot be mistaken for a missing directory.
-    checked="$workdir"
-    for part in experiments "$experiment_id" "$server_id" "$node_dir"; do
+    checked="/"
+    IFS='/' read -r -a work_parts <<< "${workdir#/}"
+    for part in "${work_parts[@]}" experiments "$experiment_id" "$server_id" "$node_dir"; do
         [ -d "$checked" ] && [ -r "$checked" ] && [ -x "$checked" ] || fail "Cannot inspect node directory ancestry: $checked"
-        next="$checked/$part"
+        next="${checked%/}/$part"
         if [ ! -e "$next" ]; then
             [ ! -L "$next" ] || fail "Node directory ancestry contains a dangling symlink: $next"
             [ -r "$checked" ] && [ -x "$checked" ] && [ ! -e "$dir" ] && [ ! -L "$dir" ] || fail "Node directory changed during inspection"
@@ -207,6 +208,13 @@ if [ -z "$pid" ]; then
         checked="$next"
     done
     [ -d "$checked" ] && [ -r "$checked" ] && [ -x "$checked" ] || fail "Cannot inspect original node directory: $checked"
+    # Account creation can be interrupted before initialization or launch.
+    # Accept only an inspectable directory with no PID, chain directory or IPC;
+    # initialized nodes without a PID remain uncertain.
+    if [ ! -e "$dir/geth.pid" ] && [ ! -L "$dir/geth.pid" ] && [ ! -e "$dir/geth" ] && [ ! -L "$dir/geth" ] && [ ! -e "$dir/geth.ipc" ] && [ ! -L "$dir/geth.ipc" ]; then
+        printf 'stop=stopped\n'
+        exit 0
+    fi
     [[ "$recorded" =~ ^[1-9][0-9]*$ ]] || fail "No owned process found and no valid recorded PID; stopped state is unknown"
     if [ -e "/proc/$recorded" ]; then
         stat=$(cat "/proc/$recorded/stat" 2>/dev/null) || fail "Recorded PID cannot be inspected"
@@ -221,6 +229,7 @@ process_uses_datadir "$pid" && process_uses_runtime "$pid" || fail "Process owne
 [ "$(process_identity "$pid" || true)" = "$identity" ] || fail "PID was reused before stop; no signal sent"
 kill -TERM -- "$pid" || fail "TERM could not be delivered to the owned node process"
 deadline=$((SECONDS + 20))
+ownership_misses=0
 while [ "$SECONDS" -lt "$deadline" ]; do
     if [ ! -e "/proc/$pid" ]; then break; fi
     current_identity=$(process_identity "$pid" || true)
@@ -236,7 +245,12 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         current_identity=$(process_identity "$pid" || true)
         if [ -n "$current_identity" ] && [ "$current_identity" != "$identity" ]; then break; fi
         process_exited "$pid" && break
-        fail "Process ownership changed while waiting for exit"
+        # Exiting Linux tasks can briefly retain their start time while argv
+        # or exe is already unavailable. Require a persistent mismatch.
+        ownership_misses=$((ownership_misses + 1))
+        [ "$ownership_misses" -lt 10 ] || fail "Process ownership changed while waiting for exit"
+    else
+        ownership_misses=0
     fi
     sleep 0.1
 done

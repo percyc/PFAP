@@ -62,7 +62,49 @@ func fileSHA(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// Static peers still count against geth's Ethereum protocol peer limit. Keep
+// enough capacity for the full deployment, including a partially saved plan
+// being recovered; merely accepting admin.addPeer does not establish a link.
+func experimentMaxPeers(exp model.Experiment) int {
+	if exp.Topology != "full-mesh" {
+		return 25
+	}
+	count := 0
+	for _, placement := range exp.Placements {
+		count += max(0, placement.Count)
+	}
+	count = max(count, len(exp.Nodes))
+	if count == 0 {
+		return 25 // Legacy recovery record without a deployment inventory.
+	}
+	return max(1, count-1)
+}
+
 func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers map[string]model.Server, emit EmitFunc) ([]model.Node, error) {
+	if emit == nil {
+		emit = func(string, string, string, map[string]any) {}
+	}
+	stage := "部署预检"
+	attach := func(n model.Node, s model.Server, expression string) (string, error) {
+		return deploymentStep(ctx, "读取或配置节点 / "+n.Name, 2*time.Minute, func(step context.Context) (string, error) { return o.Attach(step, *exp, n, s, expression) })
+	}
+	stepLimit := 2 * time.Minute
+	run := func(s model.Server, script string) (string, error) {
+		return deploymentStep(ctx, stage+" / "+s.Name, stepLimit, func(step context.Context) (string, error) { return o.Remote.Run(step, s, script) })
+	}
+	copyRuntime := func(s model.Server, source, target string) error {
+		_, err := deploymentStep(ctx, "上传运行包 / "+s.Name, 10*time.Minute, func(step context.Context) (string, error) { return "", o.Remote.Copy(step, s, source, target) })
+		return err
+	}
+	progress := func(nextStage, server string, completed int) {
+		stage = nextStage
+		total := 0
+		for _, p := range exp.Placements {
+			total += p.Count
+		}
+		emit("info", "deploy-progress", stage, map[string]any{"stage": stage, "server": server, "completedNodes": completed, "totalNodes": total})
+	}
+	progress("检查运行包与所有服务器磁盘", "", 0)
 	count := 0
 	for _, placement := range exp.Placements {
 		if placement.Count < 1 {
@@ -95,6 +137,7 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 	var nodes []model.Node
 	global := 1
 	for _, p := range exp.Placements {
+		stepLimit = 2 * time.Minute
 		s, ok := servers[p.ServerID]
 		if !ok {
 			return nil, fmt.Errorf("server %s not found", p.ServerID)
@@ -103,42 +146,49 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 			return nil, fmt.Errorf("server %s node count must be positive", s.Name)
 		}
 		emit("info", "deploy", "preparing "+s.Name, map[string]any{"nodes": p.Count})
+		progress("准备目录与检查端口", s.Name, len(nodes))
 		base := strings.TrimRight(s.WorkDir, "/")
 		artifactDir := base + "/artifacts/" + sha
 		remoteArchive := base + "/uploads/pfap-runtime-" + sha + ".tar.gz"
 		prepare := "set -eu\nmkdir -p " + shell(base+"/uploads") + " " + shell(base+"/artifacts") + " " + shell(base+"/experiments") + "\n"
-		if _, err := o.Remote.Run(ctx, s, prepare); err != nil {
+		if _, err := run(s, prepare); err != nil {
 			return nil, err
 		}
 		firstPort := exp.P2PPortBase + global - 1
 		lastPort := firstPort + p.Count - 1
 		portCheck := fmt.Sprintf("set -eu\nfor port in $(seq %d %d); do if ss -H -ltn \"sport = :$port\" | grep -q .; then echo \"P2P port $port is already in use\" >&2; exit 42; fi; done\n", firstPort, lastPort)
-		if out, err := o.Remote.Run(ctx, s, portCheck); err != nil {
+		if out, err := run(s, portCheck); err != nil {
 			return nil, fmt.Errorf("port preflight on %s: %w (%s)", s.Name, err, strings.TrimSpace(out))
 		}
 		probe := "test -x " + shell(artifactDir+"/pfap-runtime/bin/geth")
-		if _, err := o.Remote.Run(ctx, s, probe); err != nil {
+		if _, err := run(s, probe); err != nil {
 			emit("info", "deploy", "uploading runtime to "+s.Name, map[string]any{"sha256": sha})
-			if err := o.Remote.Copy(ctx, s, artifact, remoteArchive); err != nil {
+			progress("上传运行包", s.Name, len(nodes))
+			if err := copyRuntime(s, artifact, remoteArchive); err != nil {
 				return nil, err
 			}
+			progress("校验并解压运行包", s.Name, len(nodes))
 			script := "set -eu\necho " + shell(sha+"  "+remoteArchive) + " | sha256sum -c -\nmkdir -p " + shell(artifactDir) + "\ntar -xzf " + shell(remoteArchive) + " -C " + shell(artifactDir) + "\n"
-			if _, err := o.Remote.Run(ctx, s, script); err != nil {
+			if _, err := run(s, script); err != nil {
 				return nil, err
 			}
 		}
 		runtime := artifactDir + "/pfap-runtime"
+		progress("检查运行包兼容性", s.Name, len(nodes))
 		preflight := "set -eu\nruntime=" + shell(runtime) + "\nLD_LIBRARY_PATH=\"$runtime/lib\" \"$runtime/bin/geth\" version >/dev/null\n"
-		if out, err := o.Remote.Run(ctx, s, preflight); err != nil {
+		if out, err := run(s, preflight); err != nil {
 			return nil, fmt.Errorf("runtime incompatible on %s: %w (%s); rebuild the runtime on an OS/toolchain compatible with this worker", s.Name, err, strings.TrimSpace(out))
 		}
 		runtimeDir := base + "/experiments/" + exp.ID + "/" + s.ID
 		portOffset := global - 1
 		// Keep cached runtimes compatible: all nodes start without mining, then
 		// selected roles are enabled over IPC once the topology is connected.
-		env := fmt.Sprintf("NODE_COUNT=%d NETWORK_ID=%d P2P_PORT_BASE=%d HTTP_PORT_BASE=%d RUNTIME_DIR=%s GETH_BIN=%s PFAP_PRFKEY_DIR=%s LD_LIBRARY_PATH=%s ENABLE_HTTP=false MINE=false", p.Count, exp.NetworkID, exp.P2PPortBase+portOffset, exp.RPCPortBase+portOffset, shell(runtimeDir), shell(runtime+"/bin/geth"), shell(runtime+"/prfKey"), shell(runtime+"/lib"))
+		env := fmt.Sprintf("NODE_COUNT=%d MAX_PEERS=%d NETWORK_ID=%d P2P_PORT_BASE=%d HTTP_PORT_BASE=%d RUNTIME_DIR=%s GETH_BIN=%s PFAP_PRFKEY_DIR=%s LD_LIBRARY_PATH=%s ENABLE_HTTP=false MINE=false", p.Count, experimentMaxPeers(*exp), exp.NetworkID, exp.P2PPortBase+portOffset, exp.RPCPortBase+portOffset, shell(runtimeDir), shell(runtime+"/bin/geth"), shell(runtime+"/prfKey"), shell(runtime+"/lib"))
 		script := "set -eu\nmkdir -p " + shell(runtimeDir) + "\ncd " + shell(runtime+"/pow") + "\n" + env + " ./network.sh start\n"
-		if out, err := o.Remote.Run(ctx, s, script); err != nil {
+		progress("初始化账户并启动节点，等待 IPC 就绪", s.Name, len(nodes))
+		stage = "初始化账户并启动节点"
+		stepLimit = 5*time.Minute + time.Duration(p.Count)*time.Minute
+		if out, err := run(s, script); err != nil {
 			return nil, fmt.Errorf("start %s: %w (%s)", s.Name, err, out)
 		}
 		for local := 1; local <= p.Count; local++ {
@@ -148,8 +198,9 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 	}
 	for i := range nodes {
 		n := nodes[i]
+		progress("读取账户与准备组网", n.Name, len(nodes))
 		s := servers[n.ServerID]
-		accountOut, err := o.Attach(ctx, *exp, n, s, "eth.accounts[0]")
+		accountOut, err := attach(n, s, "eth.accounts[0]")
 		if err != nil {
 			return nil, fmt.Errorf("read account for %s: %w", n.Name, err)
 		}
@@ -164,7 +215,7 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 		var endpoints []endpoint
 		for _, n := range nodes {
 			s := servers[n.ServerID]
-			out, err := o.Attach(ctx, *exp, n, s, "admin.nodeInfo.enode")
+			out, err := attach(n, s, "admin.nodeInfo.enode")
 			if err != nil {
 				return nil, fmt.Errorf("read enode for %s: %w", n.Name, err)
 			}
@@ -180,13 +231,21 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 			endpoints = append(endpoints, endpoint{node: n, server: s, enode: enode})
 		}
 		for i := range endpoints {
+			progress(fmt.Sprintf("连接网络（%d/%d）", i+1, len(endpoints)), endpoints[i].node.Name, len(nodes))
+			var peerCommands []string
 			for j := range endpoints {
 				if i == j || endpoints[i].server.ID == endpoints[j].server.ID {
 					continue
 				}
-				expr := "admin.addPeer(" + strconv.Quote(endpoints[j].enode) + ")"
-				if _, err := o.Attach(ctx, *exp, endpoints[i].node, endpoints[i].server, expr); err != nil {
-					return nil, fmt.Errorf("connect %s to %s: %w", endpoints[i].node.Name, endpoints[j].node.Name, err)
+				peerCommands = append(peerCommands, "if (!admin.addPeer("+strconv.Quote(endpoints[j].enode)+")) throw new Error('addPeer rejected');")
+			}
+			if len(peerCommands) > 0 {
+				out, err := attach(endpoints[i].node, endpoints[i].server, "(function(){"+strings.Join(peerCommands, "")+"return true;})()")
+				if err != nil {
+					return nil, fmt.Errorf("connect peers for %s: %w", endpoints[i].node.Name, err)
+				}
+				if accepted, valid := consoleBoolean(out); !valid || !accepted {
+					return nil, fmt.Errorf("connect peers for %s: peer configuration was not acknowledged", endpoints[i].node.Name)
 				}
 			}
 		}
@@ -199,6 +258,7 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 	exp.Nodes = append([]model.Node(nil), nodes...)
 	for i := range nodes {
 		mining := false
+		progress("应用矿工配置", nodes[i].Name, len(nodes))
 		if nodes[i].IsMiner {
 			if err := o.SetMining(ctx, *exp, nodes[i], servers[nodes[i].ServerID], true); err != nil {
 				return nil, fmt.Errorf("start configured miner: %w", err)
@@ -208,6 +268,7 @@ func (o Orchestrator) Deploy(ctx context.Context, exp *model.Experiment, servers
 		nodes[i].Mining = &mining
 	}
 	emit("info", "deploy", "all nodes started", map[string]any{"count": len(nodes), "minerCount": minerCount, "artifactSha256": sha, "minerMode": exp.MinerMode, "selectedTargets": model.SelectedMinerTargets(nodes, servers)})
+	progress("部署完成", "", len(nodes))
 	return nodes, nil
 }
 
@@ -225,7 +286,9 @@ func (o Orchestrator) Attach(ctx context.Context, exp model.Experiment, node mod
 	// Replace the local shell so context cancellation terminates the attach
 	// process itself instead of leaving it behind with inherited output pipes.
 	script := "set -eu\n" + find + "PFAP_PRFKEY_DIR=\"$runtime/prfKey\" LD_LIBRARY_PATH=\"$runtime/lib\" exec \"$runtime/bin/geth\" attach " + shell(root+"/node"+strconv.Itoa(node.LocalIndex)+"/geth.ipc") + " --exec " + shell(expression) + "\n"
-	return o.Remote.Run(ctx, server, script)
+	return attachWithStartupRetry(ctx, func(attempt context.Context) (string, error) {
+		return o.Remote.Run(attempt, server, script)
+	})
 }
 
 func (o Orchestrator) TransactionTimings(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, hash string) (proofUs, verifyUs int64, err error) {

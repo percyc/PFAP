@@ -22,8 +22,14 @@ func plannedNodes(exp model.Experiment) ([]model.Node, error) {
 }
 
 func (a *API) beginLifecycle(experimentID, action string) (model.Experiment, map[string]model.Server, string, error) {
-	if action == "stop" {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	if action == "stop" || action == "deploy" || action == "resume" || action == "start" {
+		// User lifecycle requests must not starve behind periodic log rotation.
+		// The waiter count also makes background rotation yield between nodes.
+		limit := 30 * time.Second
+		if action == "stop" {
+			limit = 90 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), limit)
 		defer cancel()
 		if err := a.waitForStopAdmission(ctx); err != nil {
 			return model.Experiment{}, nil, "", err
@@ -172,7 +178,7 @@ func (a *API) waitForStopAdmission(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
-			return errors.New("等待当前实验操作或磁盘维护结束超时，尚未提交停止；请检查维护任务后重试")
+			return errors.New("等待当前实验操作或磁盘维护结束超时，尚未提交操作；请检查维护任务后重试")
 		}
 		if a.lifecycleMu.TryLock() {
 			return nil

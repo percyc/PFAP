@@ -213,7 +213,7 @@ case "$expression" in
     *) printf 'true\n' ;;
 esac
 `
-		network := "#!/bin/bash\nset -eu\nprintf '%s:MINE=%s\\n' " + shell(id) + " \"$MINE\" >>" + shell(logPath) + "\n[ \"$MINE\" = false ]\n"
+		network := "#!/bin/bash\nset -eu\nprintf '%s:MINE=%s MAX_PEERS=%s\\n' " + shell(id) + " \"$MINE\" \"$MAX_PEERS\" >>" + shell(logPath) + "\n[ \"$MINE\" = false ]\n"
 		for path, content := range map[string]string{filepath.Join(runtime, "bin", "geth"): geth, filepath.Join(runtime, "pow", "network.sh"): network} {
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				t.Fatal(err)
@@ -253,6 +253,9 @@ esac
 	log := testRead(t, logPath)
 	if strings.Count(log, "MINE=false") != 2 || strings.Count(log, "miner.start(1)") != 2 {
 		t.Fatalf("unexpected startup/mining calls: %s", log)
+	}
+	if strings.Count(log, "MAX_PEERS=2") != 2 {
+		t.Fatalf("deployment did not pass the global peer limit to both placements: %s", log)
 	}
 	if strings.LastIndex(log, "admin.addPeer") > strings.Index(log, "miner.start(1)") || !strings.Contains(log, "admin.addPeer") {
 		t.Fatalf("mining started before topology was connected: %s", log)

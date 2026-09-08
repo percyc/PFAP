@@ -178,8 +178,8 @@ func ResolvePlannedMiners(exp Experiment, servers map[string]Server) ([]Node, er
 	var nodes []Node
 	seen := make(map[string]bool)
 	for _, placement := range exp.Placements {
-		if placement.ServerID == "" || seen[placement.ServerID] || placement.Count < 1 || placement.Count > 100 || len(nodes) > 100-placement.Count {
-			return nil, fmt.Errorf("invalid or duplicate placement; experiment must contain 1–100 nodes")
+		if placement.ServerID == "" || seen[placement.ServerID] || placement.Count < 1 || placement.Count > 300 || len(nodes) > 300-placement.Count {
+			return nil, fmt.Errorf("invalid or duplicate placement; experiment must contain 1–300 nodes")
 		}
 		seen[placement.ServerID] = true
 		for local := 1; local <= placement.Count; local++ {

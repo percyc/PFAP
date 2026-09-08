@@ -10,6 +10,12 @@ char* smtGetRoot();
 void smtReset();
 char* smtProve(const char* cmt_hex);
 void smtFree(char* p);
+void* smtSnapshotNew();
+void* smtSnapshotClone(void* handle);
+void smtSnapshotDelete(void* handle);
+void smtSnapshotInsert(void* handle, const char* cmt);
+char* smtSnapshotRoot(void* handle);
+char* smtSnapshotProve(void* handle, const char* cmt);
 
 #ifdef __cplusplus
 }

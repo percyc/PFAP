@@ -133,8 +133,21 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 		fmt.Println("***** Verify redeem transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size(), " Tx Hash: ", tx.Hash().Hex())
 	} else if tx.TxCode() == types.TransferTx {
 		txVerifyStart := time.Now()
-		if exist := statedb.Exist(common.BytesToAddress(tx.ZKSN().Bytes())); exist == true && (*(tx.ZKSN()) != *(initSN)) {
-			return nil, 0, errors.New("sn in transfer tx has been already used")
+		if err := ValidateTransferShape(tx); err != nil {
+			return nil, 0, err
+		}
+		reader, ok := bc.(interface {
+			GetBlock(common.Hash, uint64) *types.Block
+		})
+		if !ok || header.Number.Sign() <= 0 {
+			return nil, 0, errors.New("Transfer requires full ancestor block access")
+		}
+		parent := reader.GetBlock(header.ParentHash, header.Number.Uint64()-1)
+		if _, err := ValidateTransferRoot(parent, reader.GetBlock, tx.CMTBlocks(), tx.RTcmt()); err != nil {
+			return nil, 0, err
+		}
+		if err := validateTransferSerials(tx, statedb.Exist); err != nil {
+			return nil, 0, err
 		}
 		rtCmt := tx.RTcmt()
 		if err = zktx.VerifyTransferProof(tx.ZKCMTS(), tx.ZKSN(), tx.ZKCMT(), &rtCmt, tx.ZKValue(), 0, tx.ZKProof()); err != nil {
@@ -149,6 +162,8 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
 		}
 		statedb.CreateAccount(common.BytesToAddress(tx.ZKSN().Bytes()))
 		statedb.SetNonce(common.BytesToAddress(tx.ZKSN().Bytes()), 1)
+		statedb.CreateAccount(common.BytesToAddress(tx.ZKSNS().Bytes()))
+		statedb.SetNonce(common.BytesToAddress(tx.ZKSNS().Bytes()), 1)
 		fmt.Println("***** Verify transfer transaction Cost Time (ms): ", time.Since(txVerifyStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size(), " Tx Hash: ", tx.Hash().Hex())
 	} else if tx.TxCode() == types.CreateAccountTx {
 		txVerifyStart := time.Now()

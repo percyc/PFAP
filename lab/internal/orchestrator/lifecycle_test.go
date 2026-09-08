@@ -249,7 +249,17 @@ func TestStopNodesVerifiesAbsentDatadirWithoutHidingAccessFailures(t *testing.T)
 		prepare      func(t *testing.T, workdir string)
 	}{
 		{name: "deployment never made experiment directory", status: "stopped"},
-		{name: "unavailable work directory", status: "unknown", prepare: func(t *testing.T, workdir string) {
+		{name: "interrupted account creation before initialization", status: "stopped", prepare: func(t *testing.T, workdir string) {
+			if err := os.MkdirAll(filepath.Join(workdir, "experiments", "partial", "worker", "node1"), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "initialized directory without PID stays uncertain", status: "unknown", prepare: func(t *testing.T, workdir string) {
+			if err := os.MkdirAll(filepath.Join(workdir, "experiments", "partial", "worker", "node1", "geth"), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "absent work directory with inspectable parent and no owned process", status: "stopped", prepare: func(t *testing.T, workdir string) {
 			if err := os.Rename(workdir, workdir+"-retained"); err != nil {
 				t.Fatal(err)
 			}

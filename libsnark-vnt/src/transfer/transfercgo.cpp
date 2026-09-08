@@ -356,7 +356,7 @@ char *genTransferproof(uint64_t value,
     uint256 sk = uint256S(sk_string);
     uint256 r_s = uint256S(r_s_string);
 
-    (void)cmtarray; (void)n; (void)RT;
+    // n == -1 carries an immutable historical SMT witness, not a CMT array.
 
     Note note_old = Note(value_old, sn_old, r_old);
 
@@ -369,11 +369,11 @@ char *genTransferproof(uint64_t value,
     std::vector<uint256> smt_siblings;
     uint256 rt;
     {
-        char *proofBuf = smtProve(cmtA_old_string);
+        char *proofBuf = n == -1 ? cmtarray : smtProve(cmtA_old_string);
         bool found = parseSmtProof(proofBuf, smt_path_bits, smt_siblings, rt);
-        smtFree(proofBuf);
-        if (!found) {
-            printf("transfer: cmtA_old not found in global state Merkle tree\n");
+        if (n != -1) smtFree(proofBuf);
+        if (!found || rt != uint256S(RT)) {
+            printf("transfer: commitment missing or witness root differs from requested root\n");
             fflush(stdout);
             char *p = new char[1153];
             memset(p, '0', 1152);
@@ -418,9 +418,9 @@ r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
 
     std::string proof_string = string_proof_as_hex(proof);
 
-    char *p = new char[1153];
-    proof_string.copy(p, 1152, 0);
-    *(p + 1152) = '\0';
+    char *p = new char[proof_string.size() + 1];
+    proof_string.copy(p, proof_string.size(), 0);
+    p[proof_string.size()] = '\0';
 
     return p;
 }

@@ -483,6 +483,18 @@ func GenCMTStransfer(ValueS uint64, RS *common.Hash) *common.Hash {
 }
 
 func GenTransferProof(ValueOld uint64, RAold *common.Hash, SNAnew *common.Hash, RAnew *common.Hash, CMTold *common.Hash, SNold *common.Hash, CMTnew *common.Hash, ValueNew uint64, SK *common.Hash, ValueS uint64, RS *common.Hash, CMTSForMerkle []*common.Hash, RTcmt []byte, TypeVal uint8) []byte {
+	return genTransferProof(ValueOld, RAold, SNAnew, RAnew, CMTold, SNold, CMTnew, ValueNew, SK, ValueS, RS, CMTSForMerkle, RTcmt, TypeVal, "")
+}
+
+// GenTransferProofAt uses an immutable witness captured from verified chain history.
+func GenTransferProofAt(ValueOld uint64, RAold, SNAnew, RAnew, CMTold, SNold, CMTnew *common.Hash, ValueNew uint64, SK *common.Hash, ValueS uint64, RS *common.Hash, RTcmt []byte, TypeVal uint8, witness string) []byte {
+	if len(witness) != 16705 || witness[0] != '1' {
+		return nil
+	}
+	return genTransferProof(ValueOld, RAold, SNAnew, RAnew, CMTold, SNold, CMTnew, ValueNew, SK, ValueS, RS, nil, RTcmt, TypeVal, witness)
+}
+
+func genTransferProof(ValueOld uint64, RAold *common.Hash, SNAnew *common.Hash, RAnew *common.Hash, CMTold *common.Hash, SNold *common.Hash, CMTnew *common.Hash, ValueNew uint64, SK *common.Hash, ValueS uint64, RS *common.Hash, CMTSForMerkle []*common.Hash, RTcmt []byte, TypeVal uint8, witness string) []byte {
 	value_c := C.ulong(ValueNew)
 	value_old_c := C.ulong(ValueOld)
 
@@ -503,18 +515,34 @@ func GenTransferProof(ValueOld uint64, RAold *common.Hash, SNAnew *common.Hash, 
 		s := string(common.ToHex(CMTSForMerkle[i][:]))
 		cmtArray += s
 	}
-	cmtsM := C.CString(cmtArray)
 	nC := C.int(len(CMTSForMerkle))
+	if witness != "" {
+		cmtArray, nC = witness, -1
+	}
+	cmtsM := C.CString(cmtArray)
 	RT_c := C.CString(common.ToHex(RTcmt))
 	type_c := C.uint8_t(TypeVal)
+	for _, p := range []*C.char{sn_old_c, r_old_c, sn_c, r_new_c, cmtA_old_c, cmtA_c, sk_c, r_s_c, cmtsM, RT_c} {
+		defer C.free(unsafe.Pointer(p))
+	}
 
 	cproof := C.genTransferproof(value_c, value_old_c, sn_old_c, r_old_c, sn_c, r_new_c, cmtA_old_c, cmtA_c, value_s_c, sk_c, r_s_c, cmtsM, nC, RT_c, type_c)
+	defer C.smtFree(cproof)
 	var goproof string
 	goproof = C.GoString(cproof)
 	return []byte(goproof)
 }
 
+// TransferProofHexSize is two G1 points and one G2 point (8 field coordinates).
+const TransferProofHexSize = 8 * 64
+
 func VerifyTransferProof(cmtS *common.Hash, snaold *common.Hash, cmtnew *common.Hash, rtcmt *common.Hash, value uint64, typeVal uint8, proof []byte) error {
+	if cmtS == nil || snaold == nil || cmtnew == nil || rtcmt == nil || len(proof) != TransferProofHexSize {
+		return InvalidTransferProof
+	}
+	if _, err := hex.DecodeString(string(proof)); err != nil {
+		return InvalidTransferProof
+	}
 	cproof := C.CString(string(proof))
 	cmtS_c := C.CString(common.ToHex(cmtS[:]))
 	sn_old_c := C.CString(common.ToHex(snaold.Bytes()[:]))
@@ -522,6 +550,9 @@ func VerifyTransferProof(cmtS *common.Hash, snaold *common.Hash, cmtnew *common.
 	rt_c := C.CString(common.ToHex(rtcmt[:]))
 	value_s_c := C.ulong(value)
 	type_c := C.uint8_t(typeVal)
+	for _, p := range []*C.char{cproof, cmtS_c, sn_old_c, cmtA_c, rt_c} {
+		defer C.free(unsafe.Pointer(p))
+	}
 
 	tf := C.verifyTransferproof(cproof, cmtS_c, sn_old_c, cmtA_c, rt_c, value_s_c, type_c)
 	if tf == false {

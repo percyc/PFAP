@@ -45,6 +45,35 @@ func TestStopWaitsForMaintenanceAndThenAdmits(t *testing.T) {
 	}
 }
 
+func TestDeployWaitsForMaintenanceBeforeCheckingState(t *testing.T) {
+	a := hostGroupTestAPI(t)
+	a.lifecycleMu.Lock()
+	done := make(chan error, 1)
+	go func() { _, _, _, err := a.beginLifecycle("missing", "deploy"); done <- err }()
+	deadline := time.After(time.Second)
+	for a.stopWaiters.Load() == 0 {
+		select {
+		case <-deadline:
+			a.lifecycleMu.Unlock()
+			t.Fatal("deployment did not queue")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if a.tryLogRotationAdmission() {
+		a.lifecycleMu.Unlock()
+		t.Fatal("rotation overtook deployment")
+	}
+	a.lifecycleMu.Unlock()
+	select {
+	case err := <-done:
+		if err == nil || err == errLifecycleBusy {
+			t.Fatalf("admission not retried: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deployment did not resume")
+	}
+}
+
 func TestStopTimeoutPreservesMaintenanceOwnerAndState(t *testing.T) {
 	a := hostGroupTestAPI(t)
 	before := recoveryTestState(a)

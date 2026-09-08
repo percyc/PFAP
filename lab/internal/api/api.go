@@ -376,6 +376,18 @@ func (a *API) executeConsole(w http.ResponseWriter, r *http.Request) {
 	lock := lockAny.(*sync.Mutex)
 	lock.Lock()
 	defer lock.Unlock()
+	flowBusy := false
+	a.store.View(func(s model.State) {
+		for _, run := range s.Workloads {
+			if run.ExperimentID == exp.ID && run.Strategy == "ready-pool" && runActive(run) {
+				flowBusy = true
+			}
+		}
+	})
+	if flowBusy {
+		fail(w, http.StatusConflict, errors.New("完整实验流程运行中，节点控制台暂不可执行命令；请先停止并收尾"))
+		return
+	}
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
@@ -935,8 +947,8 @@ func (a *API) experiments(w http.ResponseWriter, r *http.Request) {
 		seen[p.ServerID] = true
 		totalNodes += p.Count
 	}
-	if totalNodes > 100 {
-		fail(w, 400, errors.New("an experiment is limited to 100 nodes"))
+	if totalNodes > 300 {
+		fail(w, 400, errors.New("an experiment is limited to 300 nodes"))
 		return
 	}
 	e.MinerCount = min(2, totalNodes)
@@ -1033,7 +1045,7 @@ func (a *API) experimentAction(w http.ResponseWriter, r *http.Request) {
 	}
 	eid, action := parts[2], parts[3]
 	if action == "report" && r.Method == "GET" {
-		a.report(w, eid)
+		a.exportResults(w, r, eid, "")
 		return
 	}
 	if r.Method != "POST" {
@@ -1056,6 +1068,11 @@ func (a *API) initializeAccounts(w http.ResponseWriter, experimentID string) {
 	queued := []model.Transaction{}
 	alreadyInitialized, busy, unavailable, total := 0, 0, 0, 0
 	err := a.store.Update(func(s *model.State) error {
+		for _, run := range s.Workloads {
+			if run.ExperimentID == experimentID && run.Strategy == "ready-pool" && runActive(run) {
+				return errors.New("完整实验流程运行中，不能重新初始化账户")
+			}
+		}
 		var experiment *model.Experiment
 		for i := range s.Experiments {
 			if s.Experiments[i].ID == experimentID {
@@ -1244,39 +1261,8 @@ func (a *API) nodeState(w http.ResponseWriter, r *http.Request, experimentID, no
 }
 
 func (a *API) report(w http.ResponseWriter, eid string) {
-	var exp *model.Experiment
-	var txs []model.Transaction
-	var loads []model.Workload
-	var events []model.Event
-	a.store.View(func(s model.State) {
-		for i := range s.Experiments {
-			if s.Experiments[i].ID == eid {
-				copy := s.Experiments[i]
-				exp = &copy
-			}
-		}
-		for _, t := range s.Transactions {
-			if t.ExperimentID == eid {
-				txs = append(txs, t)
-			}
-		}
-		for _, x := range s.Workloads {
-			if x.ExperimentID == eid {
-				loads = append(loads, x)
-			}
-		}
-		for _, e := range s.Events {
-			if e.ExperimentID == eid {
-				events = append(events, e)
-			}
-		}
-	})
-	if exp == nil {
-		fail(w, 404, errors.New("experiment not found"))
-		return
-	}
-	w.Header().Set("Content-Disposition", `attachment; filename="pfap-`+eid+`.json"`)
-	jsonOut(w, 200, map[string]any{"schemaVersion": 1, "generatedAt": time.Now(), "experiment": exp, "transactions": txs, "workloads": loads, "events": events})
+	request, _ := http.NewRequest(http.MethodGet, "http://lab.local/report?format=json", nil)
+	a.exportResults(w, request, eid, "")
 }
 
 func (a *API) setExperiment(id, status, errText string, nodes []model.Node, sha string) error {
@@ -1325,7 +1311,7 @@ func (a *API) deploy(id string, e model.Experiment, servers map[string]model.Ser
 	admitted := e
 	admitted.Nodes = append([]model.Node(nil), e.Nodes...)
 	a.emit(id, "info", "lifecycle", "deployment started", nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), orchestrator.DeploymentTimeout(e))
 	defer cancel()
 	nodes, err := a.orch.Deploy(ctx, &e, servers, func(l, k, m string, f map[string]any) { a.emit(id, l, k, m, f) })
 	if err != nil {
@@ -1338,7 +1324,7 @@ func (a *API) deploy(id string, e model.Experiment, servers map[string]model.Ser
 			}
 			return
 		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), orchestrator.StopTimeout(e))
 		results, cleanupErr := a.orch.StopNodes(cleanupCtx, e, servers, func(l, k, m string, f map[string]any) {
 			a.emit(id, l, k, m, f)
 		})
@@ -1381,14 +1367,9 @@ func (a *API) monitor(id string) {
 		if !running {
 			return
 		}
-		for _, node := range exp.Nodes {
-			if node.Status == "recovering" {
-				continue
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		monitorNodeRound(exp.Nodes, func(ctx context.Context, node model.Node) {
 			_ = a.sampleNode(ctx, exp, node, servers[node.ServerID], "monitor")
-			cancel()
-		}
+		})
 	}
 }
 
@@ -1403,12 +1384,17 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 		if detail := strings.TrimSpace(out); detail != "" && !strings.Contains(err.Error(), detail) {
 			err = fmt.Errorf("%w: %s", err, detail)
 		}
-		a.setNodeError(exp.ID, node.ID, "unreachable", err.Error())
+		if preserved, saveErr := a.preserveBusyMonitorTimeout(ctx, exp.ID, node.ID, reason, err.Error(), started); saveErr != nil {
+			return fmt.Errorf("%w; 保存节点查询超时失败：%v", err, saveErr)
+		} else if preserved {
+			return err
+		}
+		a.setNodeSampleError(exp.ID, node.ID, err.Error(), reason, started)
 		return err
 	}
 	raw, err := orchestrator.ExtractJSONString(out)
 	if err != nil {
-		a.setNodeError(exp.ID, node.ID, "unreachable", err.Error())
+		a.setNodeSampleError(exp.ID, node.ID, err.Error(), reason, started)
 		return err
 	}
 	var sample struct {
@@ -1426,7 +1412,7 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 		ZKError string `json:"zkError"`
 	}
 	if err = json.Unmarshal([]byte(raw), &sample); err != nil {
-		a.setNodeError(exp.ID, node.ID, "unreachable", err.Error())
+		a.setNodeSampleError(exp.ID, node.ID, err.Error(), reason, started)
 		return err
 	}
 	base := 10
@@ -1450,7 +1436,7 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 			}
 		}
 		if privateAccountInitialized(s.Transactions, exp.ID, current) && (sample.ZK == nil || !privateStateOnChain(sample.ZK.LastTxBlock) || (sample.ZK.CommitmentReady != nil && !*sample.ZK.CommitmentReady) || (current.RecoveryWarning != "" && sample.ZK.CommitmentReady == nil)) {
-			privacyErr = errors.New("已初始化账户未恢复有效的隐私状态或承诺树，已暂停该节点的隐私交易；请检查 SN 读取和承诺树恢复，不要重复 CreateAccount")
+			privacyErr = errors.New(unconfirmedPrivateStateMessage)
 		}
 	})
 	now := time.Now()
@@ -1464,7 +1450,7 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 				if n.ID != node.ID {
 					continue
 				}
-				if s.Experiments[i].Status != "running" || n.RecoveryStartedAt.After(started) || (n.Status == "recovering" && reason != "recovery") {
+				if obsoleteNodeSample(s.Experiments[i], *n, started, reason) {
 					continue
 				}
 				oldBalance, oldCommitment, firstSample := n.ZKBalance, n.Commitment, n.LastSeen.IsZero()
@@ -1522,7 +1508,7 @@ func (a *API) setNodeError(experimentID, nodeID, status, message string) {
 	})
 }
 func (a *API) stop(id string, e model.Experiment, servers map[string]model.Server) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), orchestrator.StopTimeout(e))
 	defer cancel()
 	results, err := a.orch.StopNodes(ctx, e, servers, func(l, k, m string, f map[string]any) { a.emit(id, l, k, m, f) })
 	_ = a.completeExperimentStop(id, results, err, "")
@@ -1565,7 +1551,7 @@ func (a *API) transactions(w http.ResponseWriter, r *http.Request) {
 }
 
 func activeTransaction(status string) bool {
-	return status == "queued" || status == "proving" || status == "submitted" || status == "unknown"
+	return status == "queued" || status == "proving" || status == "submitted" || status == "unknown" || status == "settling"
 }
 
 var errNodeBusy = errors.New("node already has an active transaction")
@@ -1584,6 +1570,11 @@ func transactionNodesBusy(transactions []model.Transaction, fromNode, toNode str
 
 func (a *API) enqueueTransaction(t model.Transaction) error {
 	return a.store.Update(func(s *model.State) error {
+		for _, run := range s.Workloads {
+			if run.Strategy == "ready-pool" && run.ExperimentID == t.ExperimentID && runActive(run) {
+				return errors.New("完整实验流程运行中，不能插入手动交易；请先停止新增投递并收尾")
+			}
+		}
 		if err := transactionNodesAvailable(*s, t); err != nil {
 			return err
 		}
@@ -1621,6 +1612,11 @@ func (a *API) runTransaction(t model.Transaction) {
 		locks = append(locks, lock)
 	}
 	defer func() {
+		if t.RunPhase != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			_ = a.checkRunReadiness(ctx, t.ID)
+			cancel()
+		}
 		for i := len(locks) - 1; i >= 0; i-- {
 			locks[i].Unlock()
 		}
@@ -1660,6 +1656,10 @@ func (a *API) runTransaction(t model.Transaction) {
 		privateAccountReady = privateAccountInitialized(s.Transactions, t.ExperimentID, node)
 	})
 	if !queued {
+		return
+	}
+	if t.WorkloadID != "" && (node.IsMiner || (node.Mining != nil && *node.Mining) || ((t.Type == "transfer" || t.Type == "public") && (toNode.IsMiner || (toNode.Mining != nil && *toNode.Mining)))) {
+		a.finishTx(t.ID, "failed", "", errors.New("节点角色已变化：矿工不参与自动交易，本次交易未发送"))
 		return
 	}
 	if !ok {
@@ -1746,6 +1746,11 @@ func (a *API) runTransaction(t model.Transaction) {
 	out, err := a.orch.Attach(ctx, exp, node, server, expr)
 	rpcWallUs := time.Since(started).Microseconds()
 	if err != nil {
+		var notExecuted *orchestrator.PreExecutionAttachError
+		if errors.As(err, &notExecuted) {
+			_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("控制台初始化失败，交易指令未执行：%w", err))
+			return
+		}
 		_ = a.markTransactionUnknown(t.ID, orchestrator.ParseHash(out), fmt.Errorf("RPC 返回失败：%w: %s", err, out))
 		return
 	}
@@ -1870,6 +1875,11 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 	out, err := a.orch.Attach(ctx, exp, payer, payerServer, "JSON.stringify(eth.getPayerNextState('0x01',"+strconv.Quote(value)+"))")
 	payerWallUs := time.Since(started).Microseconds()
 	if err != nil {
+		var notExecuted *orchestrator.PreExecutionAttachError
+		if errors.As(err, &notExecuted) {
+			_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("控制台初始化失败，付款方证明指令未执行：%w", err))
+			return
+		}
 		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方证明调用结果不明：%w: %s", err, out))
 		return
 	}
@@ -1882,17 +1892,19 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		CMT   string `json:"cmtANew"`
 		SN    string `json:"snAOld"`
 		Proof string `json:"proofA"`
+		Root  string `json:"proofRoot"`
+		Block string `json:"proofBlock"`
 	}
-	if err := json.Unmarshal([]byte(raw), &proof); err != nil || proof.Proof == "" {
-		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方证明响应无法确认：%v", err))
+	if err := json.Unmarshal([]byte(raw), &proof); err != nil || proof.Proof == "" || proof.Root == "" || proof.Block == "" {
+		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方证明响应不完整（必须包含 proofA、proofRoot、proofBlock），请确认所有节点运行包版本一致；付款状态可能已冻结，未自动重发：%v", err))
 		return
 	}
-	expr := "eth.sendTransferTransaction({from:eth.accounts[0],value:" + strconv.Quote(value) + ",rs:'0x01',cmtANew:" + strconv.Quote(proof.CMT) + ",snAOld:" + strconv.Quote(proof.SN) + ",proofA:" + strconv.Quote(proof.Proof) + "})"
+	expr := "eth.sendTransferTransaction({from:eth.accounts[0],value:" + strconv.Quote(value) + ",rs:'0x01',cmtANew:" + strconv.Quote(proof.CMT) + ",snAOld:" + strconv.Quote(proof.SN) + ",proofA:" + strconv.Quote(proof.Proof) + ",proofRoot:" + strconv.Quote(proof.Root) + ",proofBlock:" + strconv.Quote(proof.Block) + "})"
 	payerProofUs, payerVerifyUs := orchestrator.ParseProofTimesMicros(out)
 	if logProofUs, logVerifyUs, timingErr := a.orch.RecentProofTimings(ctx, exp, payer, payerServer); timingErr == nil {
 		payerProofUs, payerVerifyUs = logProofUs, logVerifyUs
 	}
-	if err := a.beginTransactionRPC(t.ID, "submit"); err != nil {
+	if err := a.beginTransferReceiverRPC(t.ID, proof.CMT); err != nil {
 		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方已生成状态，接收方提交未执行：%w", err))
 		return
 	}
@@ -1952,7 +1964,9 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 					return
 				}
 				a.refreshTransactionNodes(exp, payer, receiver, payerServer, t.ID)
-				a.waitForNextBlock(ctx, exp, receiver, receiverServer, block)
+				if t.RunPhase == "" {
+					a.waitForNextBlock(ctx, exp, receiver, receiverServer, block)
+				}
 				return
 			}
 		}
@@ -2051,6 +2065,9 @@ func (a *API) confirmTx(id, hash, receipt, block, receiptStatus string, proofUs,
 	return a.store.Update(func(s *model.State) error {
 		for j := range s.Transactions {
 			if s.Transactions[j].ID == id {
+				if s.Transactions[j].RunPhase != "" && s.Transactions[j].ReadyAt.IsZero() {
+					finalStatus = "settling"
+				}
 				s.Transactions[j].Status, s.Transactions[j].Hash = finalStatus, hash
 				s.Transactions[j].ConfirmedAt = time.Now()
 				s.Transactions[j].Error, s.Transactions[j].ReconciliationError = "", ""
@@ -2150,6 +2167,10 @@ func (a *API) workloads(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
+	if v.Strategy == "ready-pool" {
+		a.createRun(w, r, v)
+		return
+	}
 	if v.ExperimentID == "" || v.Type == "" || v.RatePerSecond < 0.01 || v.RatePerSecond > 100 || v.DurationSeconds < 1 || v.DurationSeconds > 7*24*3600 {
 		fail(w, 400, errors.New("experimentId, type, ratePerSecond in [0.01,100], and durationSeconds in [1,604800] are required"))
 		return
@@ -2178,6 +2199,11 @@ func (a *API) workloads(w http.ResponseWriter, r *http.Request) {
 	v.Submitted, v.Attempted, v.SkippedBusy, v.SkippedUnavailable = 0, 0, 0, 0
 	v.StopRequested, v.Error = false, ""
 	if err := a.store.Update(func(s *model.State) error {
+		for _, existing := range s.Workloads {
+			if existing.ExperimentID == v.ExperimentID && existing.Strategy == "ready-pool" && (existing.Status == "queued" || existing.Status == "running" || existing.Status == "draining") {
+				return errors.New("完整实验流程正在占用该实验，请先停止并收尾")
+			}
+		}
 		for _, exp := range s.Experiments {
 			if exp.ID != v.ExperimentID {
 				continue
@@ -2218,8 +2244,13 @@ func (a *API) runWorkload(v model.Workload) {
 			}
 		}
 	})
+	exp.Nodes = slices.DeleteFunc(slices.Clone(exp.Nodes), func(n model.Node) bool { return n.IsMiner || (n.Mining != nil && *n.Mining) })
 	if !found || exp.Status != "running" || len(exp.Nodes) == 0 {
-		a.finishWorkload(v.ID, "failed", "experiment is not running or has no nodes")
+		a.finishWorkload(v.ID, "failed", "实验未运行或没有可参与交易的非矿工节点")
+		return
+	}
+	if (v.Type == "transfer" || v.Type == "public") && len(exp.Nodes) < 2 {
+		a.finishWorkload(v.ID, "failed", "自动转账至少需要两个非矿工节点")
 		return
 	}
 	if err := a.store.Update(func(s *model.State) error {
@@ -2348,6 +2379,14 @@ func (a *API) drainWorkload(v model.Workload, submitted int) {
 			}
 			status := "completed"
 			errText := ""
+			a.store.View(func(s model.State) {
+				for _, w := range s.Workloads {
+					if w.ID == v.ID && w.InvalidReason != "" {
+						status = "completed-with-errors"
+						errText = w.InvalidReason
+					}
+				}
+			})
 			if failed > 0 {
 				status = "completed-with-errors"
 				errText = fmt.Sprintf("%d of %d transactions failed", failed, submitted)

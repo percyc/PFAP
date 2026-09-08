@@ -1238,11 +1238,13 @@ type SendTxArgs struct {
 	Key    string         `json:"key"`
 	TxHash common.Hash    `json:"txHash"`
 	// Direct transfer payer data (new flow, no on-chain payer tx needed)
-	RS      *hexutil.Bytes `json:"rs"`
-	Seq     []uint64       `json:"seq"`
-	CmtANew *common.Hash   `json:"cmtANew"`
-	SnAOld  *common.Hash   `json:"snAOld"`
-	ProofA  *hexutil.Bytes `json:"proofA"`
+	RS         *hexutil.Bytes  `json:"rs"`
+	Seq        []uint64        `json:"seq"`
+	CmtANew    *common.Hash    `json:"cmtANew"`
+	SnAOld     *common.Hash    `json:"snAOld"`
+	ProofA     *hexutil.Bytes  `json:"proofA"`
+	ProofRoot  *common.Hash    `json:"proofRoot"`
+	ProofBlock *hexutil.Uint64 `json:"proofBlock"`
 }
 
 // setDefaults is a helper function that fills in default values for unspecified tx fields.
@@ -1781,6 +1783,9 @@ func (s *PublicTransactionPoolAPI) SendCreateAccountTransaction(ctx context.Cont
 }
 
 func (s *PublicTransactionPoolAPI) SendTransferTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) {
+	if args.RS == nil || args.CmtANew == nil || args.SnAOld == nil || args.ProofA == nil || args.ProofRoot == nil || args.ProofBlock == nil {
+		return common.Hash{}, errors.New("Transfer requires direct payer proof with proofRoot and proofBlock; legacy payer-on-chain flow is unsupported")
+	}
 	if zktx.SNfile == nil {
 		fmt.Println("SNfile does not exist")
 		return common.Hash{}, nil
@@ -2099,6 +2104,9 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiver(ctx context.Context, arg
 // sendTransferReceiverWithArgs implements receiver flow with payer data passed directly in args
 // (instead of looking up payer's on-chain tx via txHash)
 func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Context, args SendTxArgs) (common.Hash, error) {
+	if args.Value == nil || args.Value.ToInt().Sign() <= 0 || args.Value.ToInt().BitLen() > 64 || len(*args.ProofA) != zktx.TransferProofHexSize {
+		return common.Hash{}, errors.New("invalid Transfer amount or payer proof length")
+	}
 	if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
 		return common.Hash{}, errors.New("SequenceNumber or SequenceNumberAfter nil")
 	}
@@ -2127,11 +2135,15 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Cont
 	rS := common.BytesToHash(*args.RS)
 	cmtS := zktx.GenCMTStransfer(valueS, &rS)
 
-	// Dedup seq to avoid duplicate CMTs in merkle tree
-	// rt is the current global Poseidon state Merkle tree root. seq is no
-	// longer used to build a per-tx tree.
-	var CMTSForMerkle []*common.Hash
-	rtCmt := zktx.GetSMTRoot()
+	rtCmt := *args.ProofRoot
+	readBlock := s.commitmentBlockReader(ctx)
+	anchor, err := core.ValidateTransferRoot(s.b.CurrentBlock(), readBlock, []uint64{uint64(*args.ProofBlock)}, rtCmt)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	if state.Exist(common.BytesToAddress(args.SnAOld.Bytes())) {
+		return common.Hash{}, errors.New("payer serial number already spent")
+	}
 
 	// Verify payer's proof_A (type=0)
 	if err := zktx.VerifyTransferProof(cmtS, args.SnAOld, args.CmtANew, &rtCmt, valueS, 0, []byte(*args.ProofA)); err != nil {
@@ -2160,6 +2172,16 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Cont
 	tx.SetZKAddress(&args.From)
 
 	SNb := zktx.SequenceNumberAfter
+	if SNb.Value > ^uint64(0)-valueS {
+		return common.Hash{}, errors.New("receiver balance overflow")
+	}
+	if *SNb.SN == *args.SnAOld {
+		return common.Hash{}, errors.New("payer and receiver must be distinct accounts")
+	}
+	_, witness, err := core.CommitmentWitnessAt(anchor, readBlock, *SNb.CMT)
+	if err != nil {
+		return common.Hash{}, err
+	}
 	fmt.Printf("DEBUG receiver state: Value=%d CMT=%x SN=%x\n", SNb.Value, SNb.CMT[:], SNb.SN[:])
 
 	// NOTE: legacy "receiver cmt in block CMTs" check removed; proof_B proves
@@ -2187,13 +2209,13 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Cont
 	tx.SetZKValue(valueS)
 	tx.SetRTcmt(rtCmt)
 
-	tx.SetCMTBlocks(nil)
+	tx.SetCMTBlocks([]uint64{uint64(*args.ProofBlock)})
 	tx.SetZKNounce(1)
 
 	txCreateStart := time.Now()
-	proofB := zktx.GenTransferProof(SNb.Value, SNb.Random, newSNb, newRandomB, SNb.CMT, SNb.SN, newCMTB, newValueB, SK, valueS, &rS, CMTSForMerkle, rtCmt.Bytes(), 1)
+	proofB := zktx.GenTransferProofAt(SNb.Value, SNb.Random, newSNb, newRandomB, SNb.CMT, SNb.SN, newCMTB, newValueB, SK, valueS, &rS, rtCmt.Bytes(), 1, witness)
 
-	if string(proofB[0:10]) == "0000000000" {
+	if len(proofB) < 10 || string(proofB[0:10]) == "0000000000" {
 		return common.Hash{}, errors.New("can't generate receiver transfer proof")
 	}
 	tx.SetZKProof2(proofB)
@@ -2268,9 +2290,8 @@ func (s *PublicTransactionPoolAPI) GetAccountState(ctx context.Context) (map[str
 	}, nil
 }
 
-// GetPayerNextState generates payer A's transfer proof and returns (cmt_A_new, sn_A_old, proof_A)
-// without submitting any transaction. Membership of cmt_A_old is proven against the
-// global Poseidon state Merkle tree (no seq argument needed).
+// GetPayerNextState returns the payer proof and its verified block-boundary root.
+// Both accounts must remain reserved until the combined transaction is confirmed.
 func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hexutil.Bytes, value hexutil.Uint64) (map[string]interface{}, error) {
 	if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
 		return nil, errors.New("SequenceNumber or SequenceNumberAfter nil")
@@ -2314,14 +2335,15 @@ func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hex
 	rS := common.BytesToHash(rs)
 	cmtS := zktx.GenCMTStransfer(valueS, &rS)
 
-	// Membership of cmt_A_old is proven against the global Poseidon state
-	// Merkle tree; no per-tx Merkle construction needed.
-	var CMTSForMerkle []*common.Hash
-	RTcmt := zktx.GetSMTRoot()
+	anchor := s.b.CurrentBlock()
+	RTcmt, witness, err := core.CommitmentWitnessAt(anchor, s.commitmentBlockReader(ctx), *SN.CMT)
+	if err != nil {
+		return nil, err
+	}
 	RTcmtBytes := RTcmt.Bytes()
 
 	// Generate proof_A (type=0)
-	proofA := zktx.GenTransferProof(SN.Value, SN.Random, newSN, newRandom, SN.CMT, SN.SN, newCMT, newValue, SK, valueS, &rS, CMTSForMerkle, RTcmtBytes, 0)
+	proofA := zktx.GenTransferProofAt(SN.Value, SN.Random, newSN, newRandom, SN.CMT, SN.SN, newCMT, newValue, SK, valueS, &rS, RTcmtBytes, 0, witness)
 
 	if len(proofA) < 10 || string(proofA[0:10]) == "0000000000" {
 		return nil, errors.New("can't generate transfer proof")
@@ -2332,6 +2354,9 @@ func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hex
 		return nil, errors.New("proof verification failed: " + err.Error())
 	}
 	fmt.Println("***** GetPayerNextState: proof verification SUCCEEDED")
+	if _, err := core.ValidateTransferRoot(s.b.CurrentBlock(), s.commitmentBlockReader(ctx), []uint64{anchor.NumberU64()}, RTcmt); err != nil {
+		return nil, err // Reorg during proving: do not freeze a now-unusable payer state.
+	}
 
 	// Save backup before modifying local state
 	zktx.SequenceNumberBackup = &zktx.Sequence{
@@ -2365,10 +2390,25 @@ func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hex
 	}
 
 	return map[string]interface{}{
-		"cmtANew": newCMT.Hex(),
-		"snAOld":  SN.SN.Hex(),
-		"proofA":  hexutil.Bytes(proofA),
+		"cmtANew":    newCMT.Hex(),
+		"snAOld":     SN.SN.Hex(),
+		"proofA":     hexutil.Bytes(proofA),
+		"proofRoot":  RTcmt.Hex(),
+		"proofBlock": hexutil.Uint64(anchor.NumberU64()),
 	}, nil
+}
+
+func (s *PublicTransactionPoolAPI) commitmentBlockReader(ctx context.Context) core.CommitmentBlockReader {
+	return func(hash common.Hash, number uint64) *types.Block {
+		if ctx.Err() != nil {
+			return nil
+		}
+		block, err := s.b.GetBlock(ctx, hash)
+		if err != nil || block == nil || block.NumberU64() != number {
+			return nil
+		}
+		return block
+	}
 }
 
 func (s *PublicTransactionPoolAPI) RevertTransferState(ctx context.Context) (string, error) {

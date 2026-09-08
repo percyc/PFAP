@@ -39,12 +39,18 @@ func transactionNodesAvailable(s model.State, tx model.Transaction) error {
 		if from.Status != "running" {
 			return errNodeUnavailable
 		}
+		if tx.WorkloadID != "" && (from.IsMiner || (from.Mining != nil && *from.Mining)) {
+			return fmt.Errorf("%w: 矿工不参与自动交易", errNodeUnavailable)
+		}
 		if tx.Type != "public" && from.PrivateStateError != "" {
 			return fmt.Errorf("%w: %s", errNodeUnavailable, from.PrivateStateError)
 		}
 		if tx.Type == "transfer" || tx.Type == "public" {
 			if to == nil {
 				return errors.New("destination node not found in experiment")
+			}
+			if tx.WorkloadID != "" && (to.IsMiner || (to.Mining != nil && *to.Mining)) {
+				return fmt.Errorf("%w: 矿工不参与自动交易", errNodeUnavailable)
 			}
 			if tx.Type == "transfer" && from.ID == to.ID {
 				return errors.New("payer and receiver must be different nodes")

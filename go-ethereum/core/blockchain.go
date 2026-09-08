@@ -1157,6 +1157,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 			return i, events, coalescedLogs, err
 		}
 		// Process block using the parent state as reference point.
+		pfapValidationStarted := time.Now()
 		receipts, logs, usedGas, err := bc.processor.Process(block, state, bc.vmConfig)
 		if err != nil {
 			bc.reportBlock(block, receipts, err)
@@ -1169,6 +1170,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 			return i, events, coalescedLogs, err
 		}
 		proctime := time.Since(bstart)
+		// Execution + post-state validation only; excludes consensus/header
+		// checks, networking, proof generation and database commit.
+		fmt.Printf("PFAP_BLOCK_EXECUTION_VALIDATION hash=%s us=%d\n", block.Hash().Hex(), time.Since(pfapValidationStarted).Nanoseconds()/1000)
 
 		// Write the block to the chain and get the status.
 		status, err := bc.WriteBlockWithState(block, receipts, state)

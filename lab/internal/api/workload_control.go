@@ -15,6 +15,36 @@ var errWorkloadStopped = errors.New("workload stopped submitting")
 
 func (a *API) workloadAction(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) == 3 && parts[2] == "prepare" && r.Method == http.MethodPost {
+		a.prepareRunAccounts(w, r)
+		return
+	}
+	if len(parts) == 3 && parts[2] == "preflight" && r.Method == http.MethodPost {
+		var plan model.Workload
+		if err := decode(r, &plan); err != nil {
+			fail(w, 400, err)
+			return
+		}
+		var problems = []string{"实验不存在"}
+		a.store.View(func(s model.State) {
+			for _, e := range s.Experiments {
+				if e.ID == plan.ExperimentID {
+					problems = runProblems(s, e, plan, true, time.Now())
+					for _, other := range s.Workloads {
+						if other.ExperimentID == e.ID && runActive(other) {
+							problems = append(problems, "该实验已有自动交易运行或收尾中")
+						}
+					}
+				}
+			}
+		})
+		jsonOut(w, 200, map[string]any{"ready": len(problems) == 0, "problems": problems, "checkedAt": time.Now(), "source": "最近两分钟内的节点状态采样；启动时再次核验"})
+		return
+	}
+	if len(parts) == 4 && parts[3] == "report" && r.Method == http.MethodGet {
+		a.runReadAPI(w, r, parts[2])
+		return
+	}
 	if len(parts) != 4 || parts[3] != "stop" {
 		fail(w, 404, errors.New("unknown workload action"))
 		return
@@ -54,6 +84,10 @@ func (a *API) stopWorkloadSubmission(workloadID string) (model.Workload, error) 
 				return nil // idempotent; terminal rules never start again
 			}
 			w.StopRequested = true
+			if w.Strategy == "ready-pool" {
+				w.Phase = "draining"
+				w.InvalidReason = "用户提前停止；不能视为完整稳态窗口"
+			}
 			if w.SubmissionStoppedAt.IsZero() {
 				w.SubmissionStoppedAt = time.Now()
 			}
