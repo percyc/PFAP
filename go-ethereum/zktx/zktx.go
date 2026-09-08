@@ -190,6 +190,7 @@ func GenCMT(value uint64, sn []byte, r []byte) *common.Hash {
 	defer C.free(unsafe.Pointer(r_c))
 
 	cmtA_c := C.genCMT(value_c, sn_c, r_c)
+	defer C.smtFree(cmtA_c)
 	cmtA_go := C.GoString(cmtA_c)
 	//res := []byte(cmtA_go)
 	res, _ := hex.DecodeString(cmtA_go)
@@ -476,6 +477,7 @@ func GenCMTStransfer(ValueS uint64, RS *common.Hash) *common.Hash {
 	defer C.free(unsafe.Pointer(rs_c))
 
 	cmtS_c := C.genCMTStransfer(values_c, rs_c)
+	defer C.smtFree(cmtS_c)
 	cmtS_go := C.GoString(cmtS_c)
 	res, _ := hex.DecodeString(cmtS_go)
 	reshash := common.BytesToHash(res)

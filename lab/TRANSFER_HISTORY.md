@@ -1,5 +1,10 @@
 # Transfer historical commitment roots
 
+Follow-up: the first seven-node live run exposed a native commitment-string
+termination defect, now corrected and regression-tested. The live run did not
+pass; see [live validation record](VALIDATION_HISTORY_20260908.md). A fresh-chain
+multi-node rerun remains required; the local proof tests below are not a substitute.
+
 ## Protocol and deployment
 
 This change is a **consensus upgrade for fresh experiments**, not a transparent

@@ -15,8 +15,8 @@ func transactionRPCAmount(kind, value string) (string, error) {
 	if kind == "public" {
 		bits = 256
 	}
-	if !ok || parsed.Sign() <= 0 || parsed.BitLen() > bits {
-		return "", errors.New("交易金额不是有效范围内的正整数，未调用节点 RPC")
+	if !ok || parsed.Sign() < 0 || (kind != "public" && parsed.Sign() == 0) || parsed.BitLen() > bits {
+		return "", errors.New("交易金额超出有效范围（匿名交易必须为正整数），未调用节点 RPC")
 	}
 	return "0x" + parsed.Text(16), nil
 }

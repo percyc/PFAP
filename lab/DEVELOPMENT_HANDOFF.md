@@ -283,6 +283,15 @@ bin/pfap-lab               b5d5e285784534e8e5ddddafdd6b188942f66b9789e69a68dafc3
 
 ## Transfer 历史根协议改造（2026-09-08）
 
+后续实测更新：`lab/VALIDATION_HISTORY_20260908.md`。7 节点实验
+`exp-c0debc45c804` 已全部停止，预热未通过，未进入正式测量。
+`tx-e609041afff6` 的付款状态已冻结、无哈希，必须保持 unknown，禁止重发或复用。
+另一笔 `tx-17cedc367c86` 已确认且 ReadyAt 有效。实测发现并修复 RPC 金额格式
+问题及原生 genCMTStransfer/genCMT 的摘要尾部未初始化问题，后者在固定输入
+循环中确实复现、修复后 10,000 次重复与真实证明测试通过。仍需新链实测，
+不得开始 100 节点正式压测或把失败预热改成成功。原运行停止时 invalidReason
+被通用停止说明覆盖，原始失败原因在交易和验证日志中，详见上述记录。
+
 新增 `lab/TRANSFER_HISTORY.md` 描述实现、性能边界和复测命令。本次涉及
 geth + 原生 SMT/Transfer + Lab 参数传递，不是只更新 Web。必须统一新运行包
 和新版 Lab，并使用独立新链；不要混用版本、覆盖旧实验数据或重发冻结账户。

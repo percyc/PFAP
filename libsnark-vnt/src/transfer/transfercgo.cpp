@@ -283,9 +283,9 @@ char *genCMT(uint64_t value, char *sn_string, char *r_string)
     uint256 cmtA = note.cm();
     std::string cmtA_c = cmtA.ToString();
 
-    char *p = new char[67];
-    cmtA_c.copy(p, 66, 0);
-    *(p + 66) = '\0';
+    char *p = new char[cmtA_c.size() + 1];
+    cmtA_c.copy(p, cmtA_c.size(), 0);
+    p[cmtA_c.size()] = '\0';
 
     return p;
 }
@@ -298,9 +298,9 @@ char *genCMTStransfer(uint64_t value_s, char *r_s_string)
 
     std::string cmtS_c = cmtS.ToString();
 
-    char *p = new char[67];
-    cmtS_c.copy(p, 66, 0);
-    *(p + 66) = '\0';
+    char *p = new char[cmtS_c.size() + 1];
+    cmtS_c.copy(p, cmtS_c.size(), 0);
+    p[cmtS_c.size()] = '\0';
 
     return p;
 }

@@ -22,6 +22,9 @@ func TestTransactionRPCAmount(t *testing.T) {
 	if _, err := transactionRPCAmount("public", "18446744073709551616"); err != nil {
 		t.Fatal(err)
 	}
+	if got, err := transactionRPCAmount("public", "0"); err != nil || got != "0x0" {
+		t.Fatalf("zero-value public transaction: %s %v", got, err)
+	}
 }
 
 func TestAmountDecodeNeverExecuted(t *testing.T) {

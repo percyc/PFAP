@@ -27,6 +27,20 @@ func TestSMTSnapshotIsolation(t *testing.T) {
 	}
 }
 
+func TestTransferCMTSDeterministic(t *testing.T) {
+	rs := common.HexToHash("01")
+	first := *GenCMTStransfer(1, &rs)
+	account := *GenCMT(1, rs.Bytes(), rs.Bytes())
+	for i := 0; i < 1000; i++ {
+		if got := *GenCMTStransfer(1, &rs); got != first {
+			t.Fatalf("identical inputs changed commitment at iteration %d: %s != %s", i, got.Hex(), first.Hex())
+		}
+		if got := *GenCMT(1, rs.Bytes(), rs.Bytes()); got != account {
+			t.Fatalf("identical account inputs changed commitment at iteration %d", i)
+		}
+	}
+}
+
 // Opt-in because this uses the real unchanged proving key and takes minutes.
 func TestTransferHistoricalWitnessRealProof(t *testing.T) {
 	if os.Getenv("PFAP_TEST_REAL_PROOFS") != "1" {
