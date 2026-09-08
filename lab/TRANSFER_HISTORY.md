@@ -2,8 +2,10 @@
 
 Follow-up: the first seven-node live run exposed a native commitment-string
 termination defect, now corrected and regression-tested. The live run did not
-pass; see [live validation record](VALIDATION_HISTORY_20260908.md). A fresh-chain
-multi-node rerun remains required; the local proof tests below are not a substitute.
+pass; see [live validation record](VALIDATION_HISTORY_20260908.md). The subsequent
+[fresh-chain R2 validation](VALIDATION_HISTORY_R2_20260908.md) passed two live runs,
+including a tree change before receiver verification. Eleven Transfers completed
+without frozen accounts; the 100-node one-hour performance test is still pending.
 
 ## Protocol and deployment
 
