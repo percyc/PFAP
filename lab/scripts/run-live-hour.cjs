@@ -2,12 +2,18 @@
 // Usage: node lab/scripts/run-live-hour.cjs EXPERIMENT_ID OUTPUT_DIRECTORY
 const fs = require('node:fs');
 const path = require('node:path');
-const [eid, output] = process.argv.slice(2);
+const [eid, output, mode] = process.argv.slice(2);
+if(mode && mode!=='--resume-preparation') throw Error('Unknown mode');
+const resume=mode==='--resume-preparation';
 if (!/^exp-[a-f0-9]+$/.test(eid || '') || !output) throw Error('Specify experiment ID and output directory');
 fs.mkdirSync(output, {recursive:true});
 const marker=path.join(output,'started.json');
-if(fs.existsSync(marker)) throw Error('Already started: inspect persisted progress; do not replay');
-fs.writeFileSync(marker,JSON.stringify({eid,startedAt:new Date().toISOString()}),{flag:'wx'});
+if(resume){
+ if(!fs.existsSync(marker)||JSON.parse(fs.readFileSync(marker)).eid!==eid)throw Error('Resume marker missing or belongs to another experiment');
+}else{
+ if(fs.existsSync(marker)) throw Error('Already started: inspect persisted progress; do not replay');
+ fs.writeFileSync(marker,JSON.stringify({eid,startedAt:new Date().toISOString()}),{flag:'wx'});
+}
 const base='http://127.0.0.1:8090';
 const sha='c3933f1bd7be12d3b9b1cb96ae92547e9c5a338a66186599ef05d8e72e509070';
 let cookie;
@@ -30,7 +36,11 @@ async function wait(stage,fn,seconds){
 async function refresh(id){await api(`/experiments/${eid}/nodes/${id}/state`);}
 async function tx(type,from,to,value){
  await refresh(from);if(to)await refresh(to);
- const t=await api('/transactions',{experimentId:eid,type,fromNode:from,toNode:to,value});
+ const prior=(await api('/transactions')).filter(t=>t.experimentId===eid&&t.type===type&&t.fromNode===from&&(t.toNode||'')===(to||''));
+ if(prior.length>1||prior.some(t=>t.status!=='confirmed'||t.error||!t.hash||(type!=='createAccount'&&BigInt(t.value)!==BigInt(value))))throw Error('Preparation record requires inspection; no retry');
+ if(prior.length&&!resume)throw Error('Unexpected existing preparation');
+ const t=prior[0]||await api('/transactions',{experimentId:eid,type,fromNode:from,toNode:to,value});
+ if(prior.length)log('reuse-confirmed-preparation',{id:t.id,type});
  log('transaction',{id:t.id,type,from,to});
  await wait('confirmation',async()=>{
   const s=await state(),e=experiment(s),current=s.transactions.find(v=>v.id===t.id);
@@ -60,7 +70,8 @@ async function exports(run){
  const r=await fetch(base+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:fs.readFileSync('lab/data/password','utf8').trim()}),signal:AbortSignal.timeout(30000)});
  if(!r.ok)throw Error('Login failed');cookie=r.headers.get('set-cookie').split(';')[0];
  const initial=await state();
- if(initial.transactions.some(t=>t.experimentId===eid)||initial.workloads.some(w=>w.experimentId===eid))throw Error('Not a fresh experiment');
+ const existing=initial.transactions.filter(t=>t.experimentId===eid);
+ if(initial.workloads.some(w=>w.experimentId===eid)||(!resume&&existing.length)||existing.some(t=>t.status!=='confirmed'||t.error||!t.hash||!['public','createAccount','mint'].includes(t.type)))throw Error('Not a fresh or fully confirmed preparation-only experiment');
  await wait('network',async()=>{
   const e=experiment(await state());
   if(['failed','stopped','stop-failed','interrupted'].includes(e.status))throw Error(e.error||e.status);

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -91,5 +92,57 @@ func TestMonitorNodeRoundEmptyAndRecovering(t *testing.T) {
 		monitorNodeRound(nodes, func(context.Context, model.Node) {
 			t.Error("unexpected node sample")
 		})
+	}
+}
+
+func TestMonitorNodeBatchesCommitEachGroupOnce(t *testing.T) {
+	nodes := make([]model.Node, 100)
+	for i := range nodes {
+		nodes[i] = model.Node{ID: fmt.Sprint(i), Status: "running"}
+	}
+	state := model.State{}
+	commits := 0
+	monitorNodeBatches(nodes, func(ctx context.Context, node model.Node, enqueue func(func(*model.State) error) error) {
+		if ctx.Err() != nil {
+			t.Error("expired sample context")
+		}
+		_ = enqueue(func(s *model.State) error {
+			s.Events = append(s.Events, model.Event{ID: node.ID})
+			return nil
+		})
+	}, func(update func(*model.State) error) error {
+		before := len(state.Events)
+		if err := update(&state); err != nil {
+			return err
+		}
+		if count := len(state.Events) - before; count < 1 || count > monitorNodeConcurrency {
+			t.Fatalf("batch size %d", count)
+		}
+		commits++
+		return nil
+	})
+	seen := map[string]bool{}
+	for _, e := range state.Events {
+		if seen[e.ID] {
+			t.Fatal("duplicate observation")
+		}
+		seen[e.ID] = true
+	}
+	if commits != 13 || len(seen) != 100 {
+		t.Fatalf("commits=%d observations=%d", commits, len(seen))
+	}
+}
+
+func TestMonitorNodeBatchesStopOnPersistenceFailure(t *testing.T) {
+	nodes := make([]model.Node, 20)
+	commits := 0
+	monitorNodeBatches(nodes, func(_ context.Context, _ model.Node, enqueue func(func(*model.State) error) error) {
+		_ = enqueue(func(*model.State) error { return nil })
+	}, func(func(*model.State) error) error {
+		commits++
+		return errors.New("disk unavailable")
+	})
+	if commits != 1 {
+		t.Fatalf("continued after failed persistence: %d commits", commits)
 	}
 }

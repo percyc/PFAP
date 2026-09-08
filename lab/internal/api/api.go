@@ -1367,13 +1367,17 @@ func (a *API) monitor(id string) {
 		if !running {
 			return
 		}
-		monitorNodeRound(exp.Nodes, func(ctx context.Context, node model.Node) {
-			_ = a.sampleNode(ctx, exp, node, servers[node.ServerID], "monitor")
-		})
+		monitorNodeBatches(exp.Nodes, func(ctx context.Context, node model.Node, commit func(func(*model.State) error) error) {
+			_ = a.sampleNodeCommit(ctx, exp, node, servers[node.ServerID], "monitor", commit)
+		}, a.store.Update)
 	}
 }
 
 func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, reason string) error {
+	return a.sampleNodeCommit(ctx, exp, node, server, reason, a.store.Update)
+}
+
+func (a *API) sampleNodeCommit(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, reason string, commit func(func(*model.State) error) error) error {
 	started := time.Now()
 	expr := `(function(){var z=null,e="";try{z=eth.getAccountState()}catch(x){e=x.toString()}return JSON.stringify({block:eth.blockNumber.toString(),peers:net.peerCount.toString(),mining:eth.mining,account:eth.accounts[0],publicBalance:eth.getBalance(eth.accounts[0]).toString(10),zk:z,zkError:e})})()`
 	out, err := a.orch.Attach(ctx, exp, node, server, expr)
@@ -1440,7 +1444,7 @@ func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.N
 		}
 	})
 	now := time.Now()
-	err = a.store.Update(func(s *model.State) error {
+	err = commit(func(s *model.State) error {
 		for i := range s.Experiments {
 			if s.Experiments[i].ID != exp.ID {
 				continue
