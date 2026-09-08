@@ -1347,10 +1347,16 @@ func (a *API) deploy(id string, e model.Experiment, servers map[string]model.Ser
 }
 
 func (a *API) monitor(id string) {
+	go a.monitorLane(id, true)
+	a.monitorLane(id, false)
+}
+
+func (a *API) monitorLane(id string, proving bool) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		var exp model.Experiment
+		var nodes []model.Node
 		servers := map[string]model.Server{}
 		running := false
 		a.store.View(func(s model.State) {
@@ -1363,11 +1369,25 @@ func (a *API) monitor(id string) {
 			for _, x := range s.Servers {
 				servers[x.ID] = x
 			}
+			nodes = monitorLaneNodes(s, exp, proving)
 		})
 		if !running {
 			return
 		}
-		monitorNodeBatches(exp.Nodes, func(ctx context.Context, node model.Node, commit func(func(*model.State) error) error) {
+		concurrency := monitorNodeConcurrency
+		if proving {
+			concurrency = 2
+		}
+		monitorNodeBatchesLimit(nodes, concurrency, func(ctx context.Context, node model.Node, commit func(func(*model.State) error) error) {
+			// Admission can move a node into proof generation while it waits in
+			// this round's queue. Recheck before starting an expensive RPC.
+			matchesLane := false
+			a.store.View(func(s model.State) {
+				matchesLane = monitorNodeProving(s, exp.ID, node.ID) == proving
+			})
+			if !matchesLane {
+				return
+			}
 			_ = a.sampleNodeCommit(ctx, exp, node, servers[node.ServerID], "monitor", commit)
 		}, a.store.Update)
 	}

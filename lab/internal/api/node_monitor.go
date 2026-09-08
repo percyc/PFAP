@@ -16,10 +16,15 @@ const monitorNodeTimeout = 10 * time.Second
 // error handling, or the per-node obsolete-observation guards. Manual samples
 // still commit immediately. Failed saves do not publish any part of the batch.
 func monitorNodeBatches(nodes []model.Node, sample func(context.Context, model.Node, func(func(*model.State) error) error), commit func(func(*model.State) error) error) {
-	for start := 0; start < len(nodes); start += monitorNodeConcurrency {
+	monitorNodeBatchesLimit(nodes, monitorNodeConcurrency, sample, commit)
+}
+
+func monitorNodeBatchesLimit(nodes []model.Node, concurrency int, sample func(context.Context, model.Node, func(func(*model.State) error) error), commit func(func(*model.State) error) error) {
+	concurrency = max(1, min(concurrency, monitorNodeConcurrency))
+	for start := 0; start < len(nodes); start += concurrency {
 		var mu sync.Mutex
 		var updates []func(*model.State) error
-		monitorNodeRound(nodes[start:min(start+monitorNodeConcurrency, len(nodes))], func(ctx context.Context, node model.Node) {
+		monitorNodeRound(nodes[start:min(start+concurrency, len(nodes))], func(ctx context.Context, node model.Node) {
 			sample(ctx, node, func(update func(*model.State) error) error {
 				mu.Lock()
 				updates = append(updates, update)
@@ -40,6 +45,36 @@ func monitorNodeBatches(nodes []model.Node, sample func(context.Context, model.N
 			}
 		}
 	}
+}
+
+// Proof RPCs can hold the private-account lock for minutes. Keep their monitor
+// queue independent so idle/readiness/observer samples never wait behind it.
+// Submitted, settling and uncertain transactions remain in the ordinary lane:
+// their state must be observed promptly to reconcile or complete confirmation.
+func monitorLaneNodes(s model.State, exp model.Experiment, proving bool) []model.Node {
+	busy := make(map[string]bool)
+	for _, tx := range s.Transactions {
+		if tx.ExperimentID == exp.ID && tx.Status == "proving" {
+			busy[tx.FromNode] = true
+			busy[tx.ToNode] = true
+		}
+	}
+	var nodes []model.Node
+	for _, node := range exp.Nodes {
+		if busy[node.ID] == proving {
+			nodes = append(nodes, node)
+		}
+	}
+	return nodes
+}
+
+func monitorNodeProving(s model.State, experimentID, nodeID string) bool {
+	for _, tx := range s.Transactions {
+		if tx.ExperimentID == experimentID && tx.Status == "proving" && (tx.FromNode == nodeID || tx.ToNode == nodeID) {
+			return true
+		}
+	}
+	return false
 }
 
 // monitorNodeRound waits for the entire bounded round, so slow samples cannot

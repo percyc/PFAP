@@ -146,3 +146,84 @@ func TestMonitorNodeBatchesStopOnPersistenceFailure(t *testing.T) {
 		t.Fatalf("continued after failed persistence: %d commits", commits)
 	}
 }
+
+func TestMonitorLaneNodes(t *testing.T) {
+	exp := model.Experiment{ID: "current", Nodes: []model.Node{
+		{ID: "payer"}, {ID: "receiver"}, {ID: "idle"}, {ID: "submitted"}, {ID: "uncertain"},
+	}}
+	s := model.State{Transactions: []model.Transaction{
+		{ExperimentID: exp.ID, Status: "proving", FromNode: "payer", ToNode: "receiver"},
+		{ExperimentID: "other", Status: "proving", FromNode: "idle"},
+		{ExperimentID: exp.ID, Status: "submitted", FromNode: "submitted"},
+		{ExperimentID: exp.ID, Status: "unknown", FromNode: "uncertain"},
+	}}
+	for _, proving := range []bool{false, true} {
+		got := monitorLaneNodes(s, exp, proving)
+		want := []string{"idle", "submitted", "uncertain"}
+		if proving {
+			want = []string{"payer", "receiver"}
+		}
+		if len(got) != len(want) {
+			t.Fatalf("proving=%v got %v", proving, got)
+		}
+		for i := range want {
+			if monitorNodeProving(s, exp.ID, got[i].ID) != proving {
+				t.Fatal("per-sample classification differs from round classification")
+			}
+			if got[i].ID != want[i] {
+				t.Fatalf("proving=%v node %d: %s != %s", proving, i, got[i].ID, want[i])
+			}
+		}
+	}
+}
+
+func TestMonitorProofLaneDoesNotBlockOrdinaryLane(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	done := make(chan struct{})
+	commit := func(update func(*model.State) error) error { return update(&model.State{}) }
+	go func() {
+		monitorNodeBatchesLimit(make([]model.Node, 6), 2, func(_ context.Context, _ model.Node, _ func(func(*model.State) error) error) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+		}, commit)
+		close(done)
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("proof lane did not start")
+		}
+	}
+	ordinary := make(chan struct{})
+	go func() {
+		monitorNodeBatchesLimit(make([]model.Node, 100), 8, func(_ context.Context, _ model.Node, enqueue func(func(*model.State) error) error) {
+			_ = enqueue(func(*model.State) error { return nil })
+		}, commit)
+		close(ordinary)
+	}()
+	select {
+	case <-ordinary:
+	case <-time.After(time.Second):
+		t.Fatal("ordinary lane blocked behind proofs")
+	}
+	select {
+	case <-done:
+		t.Fatal("proof lane returned before samples completed")
+	case <-started:
+		t.Fatal("proof lane exceeded two concurrent samples")
+	default:
+	}
+	once.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("proof lane did not drain")
+	}
+}
