@@ -1,5 +1,14 @@
 # Fresh durable-account 100-node experiment — in progress
 
+## Live recovery verified, 18:17 +08:00
+
+The original-directory resume completed at 18:16:17. At 18:17 all 100 nodes
+report running and each has 99 peers; the minimum sampled block is 78. All five
+selected miners (2, 23, 43, 63, 83), including the previously failing node 63,
+report mining=true. The guarded runner passed its network/runtime checks and
+started the first Public funding batch. Formal measurement has not started;
+funding, private-account creation, Mint and warmup still precede that window.
+
 ## Recovery checkpoint, 18:08 +08:00
 
 Deployment reached full-mesh configuration at 17:28, but the mining-state read
