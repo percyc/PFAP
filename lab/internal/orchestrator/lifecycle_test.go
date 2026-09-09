@@ -423,9 +423,24 @@ func TestResumeReconnectsAfterAllProcessesStart(t *testing.T) {
 		t.Fatalf("nodes=%+v err=%v", nodes, err)
 	}
 	for _, path := range []string{dir, peerDir} {
-		if !strings.Contains(testRead(t, filepath.Join(path, "mock-attach.log")), "admin.addPeer(") {
+		log := testRead(t, filepath.Join(path, "mock-attach.log"))
+		if !strings.Contains(log, "admin.addPeer(") {
 			t.Fatal("topology was not restored for both nodes")
 		}
+		if strings.Count(log, "admin.nodeInfo.enode") != 1 || strings.Count(log, "admin.addPeer(") != 1 {
+			t.Fatalf("resume repeated identity reads or peer writes: %s", log)
+		}
+	}
+}
+
+func TestResumeSnapshotRejectsMissingPeerIdentity(t *testing.T) {
+	o, exp, node, server, _ := recoveryFixture(t, 1)
+	_, _, peer, peerServer, _ := recoveryFixture(t, 2)
+	exp.Nodes = []model.Node{node, peer}
+	exp.Topology = "full-mesh"
+	err := o.reconnectFromSnapshot(context.Background(), exp, node, server, map[string]model.Server{server.ID: server, peerServer.ID: peerServer}, map[string]string{node.ID: "enode://self@127.0.0.1:1"})
+	if err == nil || !strings.Contains(err.Error(), "missing recovered peer identity") {
+		t.Fatalf("incomplete topology accepted: %v", err)
 	}
 }
 

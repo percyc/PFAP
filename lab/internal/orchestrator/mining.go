@@ -13,11 +13,25 @@ import (
 // miner asynchronously, so a successful console call must be followed by an
 // observed eth.mining value, not treated as an acknowledgement by itself.
 func (o Orchestrator) SetMining(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, enabled bool) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// Starting involves multiple SSH/IPC calls and a disk preflight. On shared
+	// hosts a single 15-second budget can expire even after IPC printed false.
+	// Keep stop responsive and always respect the caller's earlier deadline.
+	limit := 15 * time.Second
+	if enabled {
+		limit = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
+	attach := func(expression string) (string, error) {
+		out, err := o.Attach(ctx, exp, node, server, expression)
+		if err != nil && ctx.Err() != nil {
+			return out, fmt.Errorf("mining control deadline/cancellation (budget %s; remote state unconfirmed): %w: %v", limit, ctx.Err(), err)
+		}
+		return out, err
+	}
 	expression := "miner.stop(); eth.mining"
 	if enabled {
-		out, err := o.Attach(ctx, exp, node, server, "eth.mining")
+		out, err := attach("eth.mining")
 		if err != nil {
 			return fmt.Errorf("read mining state on %s: %w (%s)", node.Name, err, strings.TrimSpace(out))
 		}
@@ -34,7 +48,7 @@ func (o Orchestrator) SetMining(ctx context.Context, exp model.Experiment, node 
 		expression = "miner.setEtherbase(eth.accounts[0]); miner.start(1); eth.mining"
 	}
 	for {
-		out, err := o.Attach(ctx, exp, node, server, expression)
+		out, err := attach(expression)
 		if err != nil {
 			return fmt.Errorf("set mining=%t on %s: %w (%s)", enabled, node.Name, err, strings.TrimSpace(out))
 		}

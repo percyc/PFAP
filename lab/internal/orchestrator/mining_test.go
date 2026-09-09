@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +50,21 @@ func TestSetMiningWaitsForObservedState(t *testing.T) {
 		if log != command+"\neth.mining\n" {
 			t.Fatalf("should command once then confirm asynchronous state, got %q", log)
 		}
+	}
+}
+
+func TestSetMiningAllowsSlowReadBeyondOldBudget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-time startup budget regression")
+	}
+	o, exp, node, server, _ := recoveryFixture(t, 2)
+	geth := filepath.Join(server.WorkDir, "artifacts", exp.ArtifactSHA, "pfap-runtime", "bin", "geth")
+	// exec keeps cancellation attached to the actual slow process.
+	if err := os.WriteFile(geth, []byte("#!/bin/bash\nexec bash -c 'sleep 16; echo true'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.SetMining(context.Background(), exp, node, server, true); err != nil {
+		t.Fatalf("healthy slow miner rejected: %v", err)
 	}
 }
 
@@ -101,8 +117,8 @@ func TestSetMiningCancellationStopsHungAttach(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if err := o.SetMining(ctx, exp, node, server, true); err == nil {
-		t.Fatal("hung attach ignored cancellation")
+	if err := o.SetMining(ctx, exp, node, server, true); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "remote state unconfirmed") {
+		t.Fatalf("hung attach must preserve deadline and uncertain state: %v", err)
 	}
 	if time.Since(started) > 2*time.Second {
 		t.Fatal("cancellation left the attach process behind")

@@ -1,5 +1,32 @@
 # Fresh durable-account 100-node experiment — in progress
 
+## Recovery checkpoint, 18:08 +08:00
+
+Deployment reached full-mesh configuration at 17:28, but the mining-state read
+on node 63 failed with `ssh: signal: killed: false (false)`. The original
+SetMining operation shared a 15-second deadline across all SSH/IPC/disk calls.
+This is consistent with an exhausted control deadline, not proof of a geth
+crash: node 63's retained log shows normal block imports and subsequent orderly
+shutdown. Deployment cleanup stopped all 100 nodes. No transactions or workload
+runs had been created, so no formal measurement exists.
+
+The controller now gives mining startup 90 seconds (stop remains 15 seconds),
+respects earlier caller deadlines, and preserves cancellation/deadline causes
+with an explicit unconfirmed-remote-state message. A slow 16-second read and
+short caller cancellation are covered by regression tests. Whole-network resume
+now reads each identity once and submits one acknowledged peer batch per node,
+instead of repeated per-pair SSH reads and bidirectional writes. Missing peer
+identities fail closed; single-node recovery is unchanged. Peer admission is
+still not evidence of live connectivity: the runner requires all 99 peers.
+
+Full `go test -race ./...` passed after these changes; the log is in the evidence
+directory. At a checkpoint with no active experiments/runs, controller binary
+and private state were backed up, and the controller was restarted (PID 1348714).
+Only the controller changed; node runtime SHA and keys are unchanged.
+The original experiment was resumed via its lifecycle API, and the one-shot
+runner was continued using its guarded `--resume-preparation` mode. Recovery is
+in progress; do not interpret this checkpoint as a successful one-hour result.
+
 ## Switch checkpoint (2026-09-09, UTC+08:00)
 
 The user explicitly authorized fresh accounts after being warned that stopping

@@ -255,6 +255,39 @@ func consoleTrue(out string) bool {
 	return len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "true"
 }
 
+// Whole-network recovery sends one acknowledged batch per node. The single-node
+// recovery path still reconnects both ends because other nodes are not visited.
+func (o Orchestrator) reconnectFromSnapshot(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, servers map[string]model.Server, enodes map[string]string) error {
+	if _, ok := enodes[node.ID]; !ok {
+		return fmt.Errorf("missing recovered identity for %s", node.Name)
+	}
+	var commands []string
+	for _, peer := range exp.Nodes {
+		if peer.ID == node.ID || (exp.Topology != "full-mesh" && peer.ServerID != node.ServerID) {
+			continue
+		}
+		raw, ok := enodes[peer.ID]
+		if !ok {
+			return fmt.Errorf("missing recovered peer identity for %s", peer.Name)
+		}
+		address, err := recoveryEnode(raw, peer, servers[peer.ServerID], server)
+		if err != nil {
+			return err
+		}
+		commands = append(commands, "if (!admin.addPeer("+strconv.Quote(address)+")) throw new Error('addPeer rejected');")
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	step, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := o.Attach(step, exp, node, server, "(function(){"+strings.Join(commands, "")+"return true;})()")
+	if err != nil || !consoleTrue(out) {
+		return fmt.Errorf("reconnect batch on %s unconfirmed: %s (%v)", node.Name, strings.TrimSpace(out), err)
+	}
+	return nil
+}
+
 // recoveryEnode picks an address from the destination's point of view. A
 // controller server named "local" is not a routable peer address.
 func recoveryEnode(raw string, node model.Node, owner, destination model.Server) (string, error) {

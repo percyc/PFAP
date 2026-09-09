@@ -307,12 +307,22 @@ func (o Orchestrator) Resume(ctx context.Context, exp *model.Experiment, servers
 			active.Nodes = append(active.Nodes, nodes[i])
 		}
 	}
+	// Snapshot each live identity once, instead of O(N²) SSH identity reads.
+	enodes := make(map[string]string)
+	for _, node := range active.Nodes {
+		raw, err := o.recoveryAttach(ctx, active, node, servers[node.ServerID], "admin.nodeInfo.enode")
+		if err != nil {
+			failures = append(failures, fmt.Errorf("read %s enode: %w", node.Name, err))
+			continue
+		}
+		enodes[node.ID] = raw
+	}
 	for i := range nodes {
 		if !ready[i] {
 			continue
 		}
 		node, server := nodes[i], servers[nodes[i].ServerID]
-		connectErr := o.reconnectRecoveredNode(ctx, active, node, server, servers, emit)
+		connectErr := o.reconnectFromSnapshot(ctx, active, node, server, servers, enodes)
 		mining := model.NodeIsMiner(*exp, node)
 		miningErr := o.SetMining(ctx, *exp, node, server, mining)
 		if miningErr == nil {
