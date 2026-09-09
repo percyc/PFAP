@@ -10,6 +10,10 @@
 
 ## 结果导出
 
+100 节点一小时的一次性执行脚本现在要求显式版本：`PFAP_RUNTIME_SHA=已验证的64位sha256 node lab/scripts/run-live-hour.cjs 实验ID 输出目录`。当前通过恢复验收的运行包 SHA 为 `85e1e473abd3fe3d6c56e429e56d4e0e44ece170fb12761f609e4e8cac7b6f71`。脚本检查 100 台不同服务器各一个节点、1 个观察节点、5 个不同宿主机组的矿工、94 个交易节点，并拒绝与其他运行/部署/恢复/停止中的实验共用服务器；数据库检查不能代替部署前的实际进程核验。
+
+准备阶段按宿主机组轮转排列节点，Public/CreateAccount 每批最多 5 个；Mint 暂时仍串行，不能把这一点误写成正式 Transfer 的全网串行。正式 Transfer 使用就绪账户池跨节点并发。准备、预热、3600 秒正式窗口、收尾分别记录；所有初始化、密钥问题和未知交易必须先处理。恢复准备要求输出目录内的原标记同时匹配实验和运行包；旧版不含 SHA 的标记不会被静默接受或改写。
+
 - 实验管理中的“实验报告 HTML / CSV 数据包 / JSON”导出整个实验；单次自动运行卡片中的对应入口仅导出该次运行。
 - `GET /api/experiments/{id}/report?format=html|csv|json`；`GET /api/workloads/{id}/report?format=html|csv|json`。实验导出默认 JSON，下载 schemaVersion=2；运行报告不带 format 时仍是页面使用的窗口统计接口，但 workload 配置也经过字段白名单处理。
 - HTML 可直接阅读并打印为 PDF。CSV 下载为 ZIP，包含 metrics、transactions、blocks、minutes、events 五张表以及 report.html / report.json。指标表附单位、样本数、定义、公式和缺失说明；各次运行独立展示，不平均 TPS / 分位数。历史传统负载没有正式窗口，不伪造稳态指标。

@@ -1,7 +1,9 @@
 // Explicit one-shot live experiment runner. Never retries writes or unknown txs.
-// Usage: node lab/scripts/run-live-hour.cjs EXPERIMENT_ID OUTPUT_DIRECTORY
+// Usage: PFAP_RUNTIME_SHA=verified_sha node lab/scripts/run-live-hour.cjs EXPERIMENT_ID OUTPUT_DIRECTORY
 const fs = require('node:fs');
 const path = require('node:path');
+const {runtimeSHA,validateLayout,requireExclusiveServers}=require('./live-hour-policy.cjs');
+const sha=runtimeSHA(process.env.PFAP_RUNTIME_SHA);
 const [eid, output, mode] = process.argv.slice(2);
 if(mode && mode!=='--resume-preparation') throw Error('Unknown mode');
 const resume=mode==='--resume-preparation';
@@ -9,13 +11,13 @@ if (!/^exp-[a-f0-9]+$/.test(eid || '') || !output) throw Error('Specify experime
 fs.mkdirSync(output, {recursive:true});
 const marker=path.join(output,'started.json');
 if(resume){
- if(!fs.existsSync(marker)||JSON.parse(fs.readFileSync(marker)).eid!==eid)throw Error('Resume marker missing or belongs to another experiment');
+ const prior=fs.existsSync(marker)?JSON.parse(fs.readFileSync(marker)):null;
+ if(!prior||prior.eid!==eid||prior.runtimeSha!==sha)throw Error('Resume marker missing or experiment/runtime differs');
 }else{
  if(fs.existsSync(marker)) throw Error('Already started: inspect persisted progress; do not replay');
- fs.writeFileSync(marker,JSON.stringify({eid,startedAt:new Date().toISOString()}),{flag:'wx'});
+ fs.writeFileSync(marker,JSON.stringify({eid,runtimeSha:sha,startedAt:new Date().toISOString()}),{flag:'wx'});
 }
 const base='http://127.0.0.1:8090';
-const sha='c3933f1bd7be12d3b9b1cb96ae92547e9c5a338a66186599ef05d8e72e509070';
 let cookie;
 const log=(stage,details={})=>console.log(JSON.stringify({at:new Date().toISOString(),stage,...details}));
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
@@ -70,17 +72,19 @@ async function exports(run){
  const r=await fetch(base+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:fs.readFileSync('lab/data/password','utf8').trim()}),signal:AbortSignal.timeout(30000)});
  if(!r.ok)throw Error('Login failed');cookie=r.headers.get('set-cookie').split(';')[0];
  const initial=await state();
+ requireExclusiveServers(experiment(initial),initial.experiments);
  const existing=initial.transactions.filter(t=>t.experimentId===eid);
  if(initial.workloads.some(w=>w.experimentId===eid)||(!resume&&existing.length)||existing.some(t=>t.status!=='confirmed'||t.error||!t.hash||!['public','createAccount','mint'].includes(t.type)))throw Error('Not a fresh or fully confirmed preparation-only experiment');
  await wait('network',async()=>{
   const e=experiment(await state());
+  if(e.artifactSha&&e.artifactSha!==sha)throw Error('Experiment runtime differs from PFAP_RUNTIME_SHA');
   if(['failed','stopped','stop-failed','interrupted'].includes(e.status))throw Error(e.error||e.status);
   if(e.status==='running'&&e.nodes.length===100&&e.nodes.every(n=>n.status==='running'&&n.runtimeSha===sha&&n.peers===99&&n.block>=12))return true;
   return {status:e.status,running:e.nodes.filter(n=>n.status==='running').length,connected:e.nodes.filter(n=>n.peers===99).length};
  },7200);
- const s=await state(),e=experiment(s),observer=e.nodes.find(n=>s.servers.find(v=>v.id===n.serverId)?.host==='local');
- const miners=e.nodes.filter(n=>n.isMiner),traders=e.nodes.filter(n=>!n.isMiner&&n.id!==observer?.id);
- if(!observer||miners.length!==5||traders.length!==94)throw Error('Unexpected roles');
+ const s=await state(),e=experiment(s);
+ requireExclusiveServers(e,s.experiments);
+ const {observer,miners,traders}=validateLayout(e,s.servers,sha);
  log('roles',{observer:observer.id,miners:miners.map(n=>n.id),traders:traders.map(n=>n.id)});
  for(let i=0;i<traders.length;i+=5){
   await batch(traders.slice(i,i+5).map((n,j)=>()=>tx('public',miners[j].id,n.id,'10000000000000000')));
