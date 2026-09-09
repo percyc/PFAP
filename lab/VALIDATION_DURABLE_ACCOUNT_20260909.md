@@ -47,3 +47,20 @@ regeneration; real restart validation is still pending at this checkpoint.
 The old 100-node experiment and its uncertain accounts remain preserved. A fresh
 small independent network will first verify CreateAccount/Mint/Transfer across
 process restarts. No completed one-hour performance result is claimed here.
+
+## Live validation in progress (14:00 +08:00)
+
+- Source `e149d03`, runtime SHA256
+  `85e1e473abd3fe3d6c56e429e56d4e0e44ece170fb12761f609e4e8cac7b6f71`.
+- Fresh experiment `exp-627c5ea52f82`, network ID 55671, P2P/RPC bases 32000/42000.
+  Four servers: controller-local observer, db2-03 miner, db1-03/pv4-03 traders.
+  These are independent datadirs; the old 100-node network remains untouched.
+- Controller PID 1267169; controller-only update activated durable-state sampling
+  and warning handling. Existing uncertain transaction states were not reset.
+- One-shot validation script `/tmp/pfap-durable-live.cjs`, output
+  `/tmp/pfap-durable-live.log`. Do not rerun after accepted transactions. Planned
+  test: fund/create both accounts; validated PID/datadir SIGKILL and recovery of
+  both traders; Mint; Transfer; SIGKILL/recovery again; reverse Transfer; Redeem.
+  Every transaction must confirm before the next checkpoint, with six-block depth.
+- At this checkpoint the network is connected and producing blocks; first
+  CreateAccount confirmed. No successful restart result is claimed yet.
