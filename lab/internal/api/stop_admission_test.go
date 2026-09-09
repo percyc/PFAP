@@ -45,6 +45,38 @@ func TestStopWaitsForMaintenanceAndThenAdmits(t *testing.T) {
 	}
 }
 
+func TestRecoveryWaitsForMaintenanceAndThenAdmits(t *testing.T) {
+	a, _ := newRecoveryTestAPI(t)
+	a.lifecycleMu.Lock()
+	done := make(chan error, 1)
+	go func() { _, _, _, err := a.beginNodeRecovery("experiment", "node-1"); done <- err }()
+	deadline := time.After(time.Second)
+	for a.stopWaiters.Load() == 0 {
+		select {
+		case <-deadline:
+			a.lifecycleMu.Unlock()
+			t.Fatal("recovery did not queue")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if recoveryTestState(a).Experiments[0].Nodes[0].Status != "unreachable" {
+		a.lifecycleMu.Unlock()
+		t.Fatal("recovery changed state before admission")
+	}
+	a.lifecycleMu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not resume")
+	}
+	if a.stopWaiters.Load() != 0 || recoveryTestState(a).Experiments[0].Nodes[0].Status != "recovering" {
+		t.Fatal("recovery not admitted cleanly")
+	}
+}
+
 func TestDeployWaitsForMaintenanceBeforeCheckingState(t *testing.T) {
 	a := hostGroupTestAPI(t)
 	a.lifecycleMu.Lock()

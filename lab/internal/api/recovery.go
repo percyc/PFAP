@@ -73,8 +73,12 @@ func (a *API) beginNodeRecovery(experimentID, nodeID string) (model.Experiment, 
 	var exp model.Experiment
 	var node model.Node
 	servers := map[string]model.Server{}
-	if !a.lifecycleMu.TryLock() {
-		return exp, node, servers, errLifecycleBusy
+	// Recovery is a user operation too: queued maintenance must yield instead
+	// of repeatedly winning the lock between every node's log rotation.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.waitForStopAdmission(ctx); err != nil {
+		return exp, node, servers, err
 	}
 	defer a.lifecycleMu.Unlock()
 	err := a.store.Update(func(s *model.State) error {
