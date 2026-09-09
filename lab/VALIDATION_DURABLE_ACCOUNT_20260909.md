@@ -1,5 +1,34 @@
 # Durable private-account recovery — 2026-09-09
 
+## Result: isolated restart regression passed (14:21 +08:00)
+
+All nine transactions confirmed with no failure/unknown: 2 Public, 2 CreateAccount,
+2 Mint, 2 Transfer and 1 Redeem. Both traders survived two SIGKILL/recovery cycles
+each (four abrupt terminations total). After the Transfer recovery checkpoint,
+the reverse Transfer also confirmed (`tx-259610e0b714`), followed by Redeem
+`tx-a34e2d1695f6`. Final balances exactly match expectations: node 3 = 999999,
+node 4 = 1000000. No reinitialization, state rollback or transaction replay was
+used. This validates tested restart paths, not every possible power-loss timing.
+
+All eight pk/vk files compare identical to the previous deployed runtime.
+Evidence directory: `lab/data/durable-account.sCZj85/`; saved live log, executed
+runner and compatible-build log. Reusable runner is
+`lab/scripts/validate-private-restart.cjs` (parameterized from the executed runner,
+with additional CLI/directory/final-balance guards; not re-executed against used
+accounts). Experiment HTML/JSON/CSV ZIP export and stop checks are recorded below.
+
+Final checks: `experiment.json`, `experiment.html`, `experiment.zip` exported
+after stop; ZIP integrity passed `python3 -m zipfile -t`, JSON schemaVersion=2.
+All four validation nodes and their experiment are confirmed stopped. The Lab
+controller remains up. Original experiment `exp-3b7637ce1061` still has 100
+running nodes on its original runtime; it was not restarted, overwritten or
+silently included in this validation's metrics.
+
+This is a four-node functional recovery test, **not** the requested 100-node
+one-hour performance result. The original 100-node experiment remains untouched,
+including its uncertain accounts; new performance testing must use sound fresh
+accounts and must not count old failed warmup or preparation as a formal window.
+
 ## Implementation and safety contract
 
 - Each process has one private account. A mutex covers private transaction
@@ -64,3 +93,14 @@ process restarts. No completed one-hour performance result is claimed here.
   Every transaction must confirm before the next checkpoint, with six-block depth.
 - At this checkpoint the network is connected and producing blocks; first
   CreateAccount confirmed. No successful restart result is claimed yet.
+
+### Restart evidence at 14:14 +08:00
+
+Both traders were SIGKILLed after their CreateAccount confirmations and recovered
+from the same datadirs, then each successfully minted 1000000. Transfer
+`tx-8ce06d54f579` subsequently confirmed. Both were SIGKILLed and recovered again;
+post-restart balances were exactly node 3 = 999999, node 4 = 1000001, with no
+private-state error or legacy-key warning. This directly exercises the previously
+observed stale receiver balance failure. No replacement CreateAccount was sent.
+Reverse Transfer `tx-259610e0b714` is now admitted; its result and final Redeem
+remain pending. Four real abrupt process terminations have been tested so far.
