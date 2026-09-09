@@ -177,6 +177,9 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 		zktx.SNS = SNS.SNS
 		zktx.Stage = SNS.Stage
 	}
+	if err := zktx.RestorePrivateAccount(DBdir, SNS != nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Private account recovery is read-only; original files preserved: %v\n", err)
+	}
 	utils.RegisterEthService(stack, &cfg.Eth)
 
 	if ctx.GlobalBool(utils.DashboardEnabledFlag.Name) {

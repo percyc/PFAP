@@ -532,3 +532,30 @@ func TestRecoveredNodeRequiresCommitmentTreeReadiness(t *testing.T) {
 		})
 	}
 }
+
+func TestDurableRecoveredNodeClearsLegacyWarningOnlyWhenReady(t *testing.T) {
+	for _, ready := range []string{"true", "false"} {
+		t.Run(ready, func(t *testing.T) {
+			a, _ := newRecoveryTestAPI(t)
+			exp, node, server, bin := configureRecoverySample(t, a, "0x10")
+			_ = a.store.Update(func(s *model.State) error {
+				s.Experiments[0].Nodes[0].RecoveryWarning = "legacy recovery warning"
+				return nil
+			})
+			path := filepath.Join(bin, "sample.json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = []byte(strings.Replace(string(data), `"balance":"0x7"`, `"durablePrivateState":true,"commitmentReady":`+ready+`,"balance":"0x7"`, 1))
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			_ = a.sampleNode(context.Background(), exp, node, server, "recovery")
+			warning := recoveryTestState(a).Experiments[0].Nodes[0].RecoveryWarning
+			if (warning == "") != (ready == "true") {
+				t.Fatal("durable recovery warning cleared without verified state")
+			}
+		})
+	}
+}

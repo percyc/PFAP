@@ -17,10 +17,8 @@
 package ethapi
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -1392,6 +1390,11 @@ func (s *PublicTransactionPoolAPI) StateDB(ctx context.Context) (*state.StateDB,
 // SendMintTransaction creates a mint transaction for the given argument, sign it and submit it to the
 // transaction pool.
 func (s *PublicTransactionPoolAPI) SendMintTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) {
+	unlock, err := s.beginPrivateMutation(ctx, false)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	defer unlock()
 	// if zktx.Stage == zktx.Send {
 	// 	fmt.Println("cannot send mintTx after sendTx")
 	// 	return common.Hash{}, nil
@@ -1467,8 +1470,7 @@ func (s *PublicTransactionPoolAPI) SendMintTransaction(ctx context.Context, args
 
 	SK := zktx.AccountSK
 	if SK == nil {
-		SK_addr := zktx.ZKTxAddress.Hash()
-		SK = &SK_addr
+		return common.Hash{}, errors.New("private account secret unavailable; refusing legacy fallback")
 	}
 	newSN := zktx.ComputePRF(SK.Bytes(), SN.SN.Bytes())
 	newValue := SN.Value + args.Value.ToInt().Uint64()
@@ -1508,26 +1510,9 @@ func (s *PublicTransactionPoolAPI) SendMintTransaction(ctx context.Context, args
 		return common.Hash{}, err
 	}
 
-	hash, err := submitTransaction(ctx, s.b, signed)
-	if err == nil {
-		zktx.SequenceNumber = zktx.SequenceNumberAfter
-		zktx.SequenceNumberAfter = &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
-		zktx.Stage = zktx.Mint
-		SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Mint}
-		SNSBytes, err := rlp.EncodeToBytes(SNS)
-
-		if err != nil {
-			fmt.Println("encode sns error")
-			return common.Hash{}, nil
-		}
-		SNSString := hex.EncodeToString(SNSBytes)
-		zktx.SNfile.Seek(0, 0) //write in the first line of the file
-		wt := bufio.NewWriter(zktx.SNfile)
-
-		wt.WriteString(SNSString)
-		wt.WriteString("\n") //write a line
-		wt.Flush()
-	}
+	nextState := &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
+	nextAccount := zktx.SequenceS{*zktx.SequenceNumberAfter, *nextState, zktx.SNS, nil, nil, zktx.Mint}
+	hash, err := s.persistAndSubmitPrivate(ctx, signed, nextAccount, zktx.AccountSK)
 
 	fmt.Println("***** Create mint transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
 
@@ -1568,6 +1553,11 @@ func (s *PublicTransactionPoolAPI) GetPubKeyRLP(ctx context.Context, address com
 // SendRedeemTransaction creates a Redeem transaction for the given argument, sign it and submit it to the
 // transaction pool.
 func (s *PublicTransactionPoolAPI) SendRedeemTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) {
+	unlock, err := s.beginPrivateMutation(ctx, false)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	defer unlock()
 	// if zktx.Stage == zktx.Send {
 	// 	fmt.Println("cannot send Redeem after sendTx")
 	// 	return common.Hash{}, nil
@@ -1637,8 +1627,7 @@ func (s *PublicTransactionPoolAPI) SendRedeemTransaction(ctx context.Context, ar
 
 	SK := zktx.AccountSK
 	if SK == nil {
-		SK_addr := zktx.ZKTxAddress.Hash()
-		SK = &SK_addr
+		return common.Hash{}, errors.New("private account secret unavailable; refusing legacy fallback")
 	}
 	newSN := zktx.ComputePRF(SK.Bytes(), SN.SN.Bytes())
 	newValue := SN.Value - args.Value.ToInt().Uint64()
@@ -1673,26 +1662,9 @@ func (s *PublicTransactionPoolAPI) SendRedeemTransaction(ctx context.Context, ar
 		return common.Hash{}, err
 	}
 
-	hash, err := submitTransaction(ctx, s.b, signed)
-	if err == nil {
-		zktx.SequenceNumber = zktx.SequenceNumberAfter
-		zktx.SequenceNumberAfter = &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
-		zktx.Stage = zktx.Redeem
-		SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Redeem}
-
-		SNSBytes, err := rlp.EncodeToBytes(SNS)
-		if err != nil {
-			fmt.Println("encode sns error")
-			return common.Hash{}, nil
-		}
-		SNSString := hex.EncodeToString(SNSBytes)
-		zktx.SNfile.Seek(0, 0) //write in the first line of the file
-		wt := bufio.NewWriter(zktx.SNfile)
-
-		wt.WriteString(SNSString)
-		wt.WriteString("\n") //write a line
-		wt.Flush()
-	}
+	nextState := &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
+	nextAccount := zktx.SequenceS{*zktx.SequenceNumberAfter, *nextState, zktx.SNS, nil, nil, zktx.Redeem}
+	hash, err := s.persistAndSubmitPrivate(ctx, signed, nextAccount, zktx.AccountSK)
 
 	fmt.Println("***** Create redeem transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
 
@@ -1702,6 +1674,11 @@ func (s *PublicTransactionPoolAPI) SendRedeemTransaction(ctx context.Context, ar
 //=============================================================================
 
 func (s *PublicTransactionPoolAPI) SendCreateAccountTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) {
+	unlock, err := s.beginPrivateMutation(ctx, true)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	defer unlock()
 	if zktx.SNfile == nil {
 		fmt.Println("SNfile does not exist")
 		return common.Hash{}, nil
@@ -1757,25 +1734,9 @@ func (s *PublicTransactionPoolAPI) SendCreateAccountTransaction(ctx context.Cont
 		return common.Hash{}, err
 	}
 
-	hash, err := submitTransaction(ctx, s.b, signed)
-	if err == nil {
-		zktx.AccountSK = skA
-		zktx.SequenceNumber = &zktx.Sequence{SN: snA, CMT: cmtA, Random: rA, Value: 0}
-		zktx.SequenceNumberAfter = zktx.SequenceNumber
-		zktx.Stage = zktx.Origin
-		SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, nil, nil, nil, zktx.Origin}
-		SNSBytes, err := rlp.EncodeToBytes(SNS)
-		if err != nil {
-			fmt.Println("encode sns error")
-			return common.Hash{}, nil
-		}
-		SNSString := hex.EncodeToString(SNSBytes)
-		zktx.SNfile.Seek(0, 0)
-		wt := bufio.NewWriter(zktx.SNfile)
-		wt.WriteString(SNSString)
-		wt.WriteString("\n")
-		wt.Flush()
-	}
+	nextState := &zktx.Sequence{SN: snA, CMT: cmtA, Random: rA, Value: 0}
+	nextAccount := zktx.SequenceS{*nextState, *nextState, nil, nil, nil, zktx.Origin}
+	hash, err := s.persistAndSubmitPrivate(ctx, signed, nextAccount, skA)
 
 	fmt.Println("***** Create createAccount transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
 
@@ -1783,6 +1744,11 @@ func (s *PublicTransactionPoolAPI) SendCreateAccountTransaction(ctx context.Cont
 }
 
 func (s *PublicTransactionPoolAPI) SendTransferTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) {
+	unlock, err := s.beginPrivateMutation(ctx, false)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	defer unlock()
 	if args.RS == nil || args.CmtANew == nil || args.SnAOld == nil || args.ProofA == nil || args.ProofRoot == nil || args.ProofBlock == nil {
 		return common.Hash{}, errors.New("Transfer requires direct payer proof with proofRoot and proofBlock; legacy payer-on-chain flow is unsupported")
 	}
@@ -1861,8 +1827,7 @@ func (s *PublicTransactionPoolAPI) sendTransferPayer(ctx context.Context, args S
 
 	SK := zktx.AccountSK
 	if SK == nil {
-		SK_addr := zktx.ZKTxAddress.Hash()
-		SK = &SK_addr
+		return common.Hash{}, errors.New("private account secret unavailable; refusing legacy fallback")
 	}
 
 	valueS := args.Value.ToInt().Uint64()
@@ -1919,24 +1884,9 @@ func (s *PublicTransactionPoolAPI) sendTransferPayer(ctx context.Context, args S
 		return common.Hash{}, err
 	}
 
-	hash, err := submitTransaction(ctx, s.b, signed)
-	if err == nil {
-		zktx.SequenceNumber = zktx.SequenceNumberAfter
-		zktx.SequenceNumberAfter = &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
-		zktx.Stage = zktx.Transfer
-		SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Transfer}
-		SNSBytes, err := rlp.EncodeToBytes(SNS)
-		if err != nil {
-			fmt.Println("encode sns error")
-			return common.Hash{}, nil
-		}
-		SNSString := hex.EncodeToString(SNSBytes)
-		zktx.SNfile.Seek(0, 0)
-		wt := bufio.NewWriter(zktx.SNfile)
-		wt.WriteString(SNSString)
-		wt.WriteString("\n")
-		wt.Flush()
-	}
+	nextState := &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
+	nextAccount := zktx.SequenceS{*zktx.SequenceNumberAfter, *nextState, zktx.SNS, nil, nil, zktx.Transfer}
+	hash, err := s.persistAndSubmitPrivate(ctx, signed, nextAccount, zktx.AccountSK)
 
 	fmt.Println("***** Create transfer (payer) transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
 	return hash, err
@@ -2020,8 +1970,7 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiver(ctx context.Context, arg
 
 	SK := zktx.AccountSK
 	if SK == nil {
-		SK_addr := zktx.ZKTxAddress.Hash()
-		SK = &SK_addr
+		return common.Hash{}, errors.New("private account secret unavailable; refusing legacy fallback")
 	}
 
 	newSNb := zktx.ComputePRF(SK.Bytes(), SNb.SN.Bytes())
@@ -2078,24 +2027,9 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiver(ctx context.Context, arg
 		return common.Hash{}, err
 	}
 
-	hash, err := submitTransaction(ctx, s.b, signed)
-	if err == nil {
-		zktx.SequenceNumber = zktx.SequenceNumberAfter
-		zktx.SequenceNumberAfter = &zktx.Sequence{SN: newSNb, CMT: newCMTB, Random: newRandomB, Value: newValueB}
-		zktx.Stage = zktx.Transfer
-		SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Transfer}
-		SNSBytes, err := rlp.EncodeToBytes(SNS)
-		if err != nil {
-			fmt.Println("encode sns error")
-			return common.Hash{}, nil
-		}
-		SNSString := hex.EncodeToString(SNSBytes)
-		zktx.SNfile.Seek(0, 0)
-		wt := bufio.NewWriter(zktx.SNfile)
-		wt.WriteString(SNSString)
-		wt.WriteString("\n")
-		wt.Flush()
-	}
+	nextState := &zktx.Sequence{SN: newSNb, CMT: newCMTB, Random: newRandomB, Value: newValueB}
+	nextAccount := zktx.SequenceS{*zktx.SequenceNumberAfter, *nextState, zktx.SNS, nil, nil, zktx.Transfer}
+	hash, err := s.persistAndSubmitPrivate(ctx, signed, nextAccount, zktx.AccountSK)
 
 	fmt.Println("***** Create transfer (receiver) transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
 	return hash, err
@@ -2189,8 +2123,7 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Cont
 
 	SK := zktx.AccountSK
 	if SK == nil {
-		SK_addr := zktx.ZKTxAddress.Hash()
-		SK = &SK_addr
+		return common.Hash{}, errors.New("private account secret unavailable; refusing legacy fallback")
 	}
 
 	newSNb := zktx.ComputePRF(SK.Bytes(), SNb.SN.Bytes())
@@ -2236,24 +2169,9 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Cont
 		return common.Hash{}, err
 	}
 
-	hash, err := submitTransaction(ctx, s.b, signed)
-	if err == nil {
-		zktx.SequenceNumber = zktx.SequenceNumberAfter
-		zktx.SequenceNumberAfter = &zktx.Sequence{SN: newSNb, CMT: newCMTB, Random: newRandomB, Value: newValueB}
-		zktx.Stage = zktx.Transfer
-		SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Transfer}
-		SNSBytes, err := rlp.EncodeToBytes(SNS)
-		if err != nil {
-			fmt.Println("encode sns error")
-			return common.Hash{}, nil
-		}
-		SNSString := hex.EncodeToString(SNSBytes)
-		zktx.SNfile.Seek(0, 0)
-		wt := bufio.NewWriter(zktx.SNfile)
-		wt.WriteString(SNSString)
-		wt.WriteString("\n")
-		wt.Flush()
-	}
+	nextState := &zktx.Sequence{SN: newSNb, CMT: newCMTB, Random: newRandomB, Value: newValueB}
+	nextAccount := zktx.SequenceS{*zktx.SequenceNumberAfter, *nextState, zktx.SNS, nil, nil, zktx.Transfer}
+	hash, err := s.persistAndSubmitPrivate(ctx, signed, nextAccount, zktx.AccountSK)
 
 	fmt.Println("***** Create transfer (receiver with args) transaction Cost Time (ms): ", time.Since(txCreateStart).Nanoseconds()/1000000, " Tx Size (bytes): ", signed.Size())
 	return hash, err
@@ -2261,10 +2179,15 @@ func (s *PublicTransactionPoolAPI) sendTransferReceiverWithArgs(ctx context.Cont
 
 // GetAccountState returns the current private account state: (balance, commitment, lastTxBlockNumber)
 func (s *PublicTransactionPoolAPI) GetAccountState(ctx context.Context) (map[string]interface{}, error) {
+	zktx.AccountMu.Lock()
+	defer zktx.AccountMu.Unlock()
+	recoveryKind, recoveryHash, recoveryError := zktx.PrivateAccountRecoveryInfo()
+	if recoveryError != "" {
+		return nil, errors.New(recoveryError)
+	}
 	if zktx.SequenceNumberAfter == nil || zktx.SequenceNumberAfter.CMT == nil || zktx.SequenceNumberAfter.SN == nil {
 		return nil, errors.New("no account state available")
 	}
-	fmt.Printf("DEBUG getAccountState: Balance=%d CMT=%x SN=%x\n", zktx.SequenceNumberAfter.Value, zktx.SequenceNumberAfter.CMT[:], zktx.SequenceNumberAfter.SN[:])
 
 	// Find the block containing the current CMT by scanning recent blocks
 	blockNumber := uint64(0)
@@ -2283,16 +2206,24 @@ func (s *PublicTransactionPoolAPI) GetAccountState(ctx context.Context) (map[str
 	}
 
 	return map[string]interface{}{
-		"balance":           hexutil.Uint64(zktx.SequenceNumberAfter.Value),
-		"commitment":        zktx.SequenceNumberAfter.CMT.Hex(),
-		"lastTxBlockNumber": hexutil.Uint64(blockNumber),
-		"commitmentReady":   zktx.ContainsCMT(zktx.SequenceNumberAfter.CMT),
+		"durablePrivateState":    recoveryKind == "payer" || recoveryKind == "transaction",
+		"privateRecoveryKind":    recoveryKind,
+		"privateTransactionHash": recoveryHash,
+		"balance":                hexutil.Uint64(zktx.SequenceNumberAfter.Value),
+		"commitment":             zktx.SequenceNumberAfter.CMT.Hex(),
+		"lastTxBlockNumber":      hexutil.Uint64(blockNumber),
+		"commitmentReady":        zktx.ContainsCMT(zktx.SequenceNumberAfter.CMT),
 	}, nil
 }
 
 // GetPayerNextState returns the payer proof and its verified block-boundary root.
 // Both accounts must remain reserved until the combined transaction is confirmed.
 func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hexutil.Bytes, value hexutil.Uint64) (map[string]interface{}, error) {
+	unlock, err := s.beginPrivateMutation(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if zktx.SequenceNumber == nil || zktx.SequenceNumberAfter == nil {
 		return nil, errors.New("SequenceNumber or SequenceNumberAfter nil")
 	}
@@ -2321,8 +2252,7 @@ func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hex
 
 	SK := zktx.AccountSK
 	if SK == nil {
-		SK_addr := zktx.ZKTxAddress.Hash()
-		SK = &SK_addr
+		return nil, errors.New("private account secret unavailable; refusing legacy fallback")
 	}
 
 	// Compute new state
@@ -2358,35 +2288,10 @@ func (s *PublicTransactionPoolAPI) GetPayerNextState(ctx context.Context, rs hex
 		return nil, err // Reorg during proving: do not freeze a now-unusable payer state.
 	}
 
-	// Save backup before modifying local state
-	zktx.SequenceNumberBackup = &zktx.Sequence{
-		SN:     zktx.SequenceNumber.SN,
-		CMT:    zktx.SequenceNumber.CMT,
-		Random: zktx.SequenceNumber.Random,
-		Value:  zktx.SequenceNumber.Value,
-	}
-	zktx.SequenceNumberAfterBackup = &zktx.Sequence{
-		SN: zktx.SequenceNumberAfter.SN, CMT: zktx.SequenceNumberAfter.CMT,
-		Random: zktx.SequenceNumberAfter.Random, Value: zktx.SequenceNumberAfter.Value,
-		Valid: zktx.SequenceNumberAfter.Valid,
-	}
-	zktx.StageBackup = zktx.Stage
-
-	// Update local state (payer's node)
-	zktx.SequenceNumber = zktx.SequenceNumberAfter
-	zktx.SequenceNumberAfter = &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
-	zktx.Stage = zktx.Transfer
-	SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Transfer}
-	SNSBytes, err := rlp.EncodeToBytes(SNS)
-	if err != nil {
-		fmt.Println("encode sns error")
-	} else {
-		SNSString := hex.EncodeToString(SNSBytes)
-		zktx.SNfile.Seek(0, 0)
-		wt := bufio.NewWriter(zktx.SNfile)
-		wt.WriteString(SNSString)
-		wt.WriteString("\n")
-		wt.Flush()
+	nextState := &zktx.Sequence{SN: newSN, CMT: newCMT, Random: newRandom, Value: newValue}
+	nextAccount := zktx.SequenceS{*zktx.SequenceNumberAfter, *nextState, zktx.SNS, nil, nil, zktx.Transfer}
+	if err := zktx.PersistPrivateTransition(nextAccount, zktx.AccountSK, "payer", common.Hash{}, nil); err != nil {
+		return nil, err // Never return a proof whose frozen state is not durable.
 	}
 
 	return map[string]interface{}{
@@ -2412,28 +2317,7 @@ func (s *PublicTransactionPoolAPI) commitmentBlockReader(ctx context.Context) co
 }
 
 func (s *PublicTransactionPoolAPI) RevertTransferState(ctx context.Context) (string, error) {
-	if zktx.SequenceNumberBackup == nil || zktx.SequenceNumberAfterBackup == nil {
-		return "", errors.New("no backup state to revert")
-	}
-	zktx.SequenceNumber = zktx.SequenceNumberBackup
-	zktx.SequenceNumberAfter = zktx.SequenceNumberAfterBackup
-	zktx.Stage = zktx.StageBackup
-	zktx.SequenceNumberBackup = nil
-	zktx.SequenceNumberAfterBackup = nil
-
-	SNS := zktx.SequenceS{*zktx.SequenceNumber, *zktx.SequenceNumberAfter, zktx.SNS, nil, nil, zktx.Stage}
-	SNSBytes, err := rlp.EncodeToBytes(SNS)
-	if err != nil {
-		return "", err
-	}
-	SNSString := hex.EncodeToString(SNSBytes)
-	zktx.SNfile.Seek(0, 0)
-	wt := bufio.NewWriter(zktx.SNfile)
-	wt.WriteString(SNSString)
-	wt.WriteString("\n")
-	wt.Flush()
-
-	return "ok", nil
+	return "", errors.New("unsafe rollback disabled: a payer proof may already be in flight; preserve the durable reservation")
 }
 
 // SendRawTransaction will add the signed transaction to the transaction pool.

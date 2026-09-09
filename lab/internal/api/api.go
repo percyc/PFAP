@@ -1428,10 +1428,11 @@ func (a *API) sampleNodeCommit(ctx context.Context, exp model.Experiment, node m
 		Account       string `json:"account"`
 		PublicBalance string `json:"publicBalance"`
 		ZK            *struct {
-			Balance         string `json:"balance"`
-			Commitment      string `json:"commitment"`
-			LastTxBlock     string `json:"lastTxBlockNumber"`
-			CommitmentReady *bool  `json:"commitmentReady"`
+			Balance             string `json:"balance"`
+			Commitment          string `json:"commitment"`
+			LastTxBlock         string `json:"lastTxBlockNumber"`
+			CommitmentReady     *bool  `json:"commitmentReady"`
+			DurablePrivateState bool   `json:"durablePrivateState"`
 		} `json:"zk"`
 		ZKError string `json:"zkError"`
 	}
@@ -1495,6 +1496,9 @@ func (a *API) sampleNodeCommit(ctx context.Context, exp model.Experiment, node m
 				}
 				n.LastSeen = now
 				if sample.ZK != nil {
+					if sample.ZK.DurablePrivateState && sample.ZKError == "" && privacyErr == nil {
+						n.RecoveryWarning = "" // Verified versioned secret/state loaded, not a legacy fallback.
+					}
 					n.ZKBalance = sample.ZK.Balance
 					n.Commitment = sample.ZK.Commitment
 					n.LastTxBlock = sample.ZK.LastTxBlock
