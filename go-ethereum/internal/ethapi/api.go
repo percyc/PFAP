@@ -1040,13 +1040,14 @@ func newRPCTransactionFromBlockHash(b *types.Block, hash common.Hash) *RPCTransa
 
 // PublicTransactionPoolAPI exposes methods for the RPC interface
 type PublicTransactionPoolAPI struct {
-	b         Backend
-	nonceLock *AddrLocker
+	b               Backend
+	nonceLock       *AddrLocker
+	accountLocation commitmentLocation
 }
 
 // NewPublicTransactionPoolAPI creates a new RPC service with methods specific for the transaction pool.
 func NewPublicTransactionPoolAPI(b Backend, nonceLock *AddrLocker) *PublicTransactionPoolAPI {
-	return &PublicTransactionPoolAPI{b, nonceLock}
+	return &PublicTransactionPoolAPI{b: b, nonceLock: nonceLock}
 }
 
 // GetBlockTransactionCountByNumber returns the number of transactions in the block with the given block number.
@@ -2189,20 +2190,11 @@ func (s *PublicTransactionPoolAPI) GetAccountState(ctx context.Context) (map[str
 		return nil, errors.New("no account state available")
 	}
 
-	// Find the block containing the current CMT by scanning recent blocks
-	blockNumber := uint64(0)
-	currentBlock := s.b.CurrentBlock().Number().Uint64()
-	for i := uint64(0); i <= currentBlock && blockNumber == 0; i++ {
-		block, err := s.b.BlockByNumber(ctx, rpc.BlockNumber(currentBlock-i))
-		if err != nil || block == nil {
-			continue
-		}
-		for _, cmt := range block.CMTS() {
-			if *cmt == *zktx.SequenceNumberAfter.CMT {
-				blockNumber = block.NumberU64()
-				break
-			}
-		}
+	blockNumber, err := s.accountLocation.locate(ctx, s.b.CurrentBlock(), *zktx.SequenceNumberAfter.CMT, func(number uint64) (*types.Block, error) {
+		return s.b.BlockByNumber(ctx, rpc.BlockNumber(number))
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return map[string]interface{}{

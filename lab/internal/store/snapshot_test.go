@@ -33,6 +33,21 @@ func BenchmarkLiveSnapshot(b *testing.B) {
 			_ = cloneSnapshot(state)
 		}
 	})
+	b.Run("DurableUpdate", func(b *testing.B) {
+		s, err := Open(b.TempDir() + "/state.json")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := s.Update(func(v *model.State) error { *v = state; return nil }); err != nil {
+			b.Fatal(err)
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := s.Update(func(*model.State) error { return nil }); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func TestCloneSnapshotNestedContainers(t *testing.T) {
