@@ -95,6 +95,46 @@ func TestMonitorNodeRoundEmptyAndRecovering(t *testing.T) {
 	}
 }
 
+func TestMonitorRollingSlotsDoNotWaitForSlowBatchPeer(t *testing.T) {
+	nodes := make([]model.Node, 20)
+	for i := range nodes {
+		nodes[i].ID = fmt.Sprint(i)
+	}
+	release := make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	progress := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		monitorNodeBatches(nodes, func(_ context.Context, n model.Node, enqueue func(func(*model.State) error) error) {
+			if n.ID == "0" {
+				<-release
+			}
+			if n.ID == "19" {
+				progress <- struct{}{}
+			}
+			_ = enqueue(func(*model.State) error { return nil })
+		}, func(f func(*model.State) error) error { return f(&model.State{}) })
+		close(done)
+	}()
+	select {
+	case <-progress:
+	case <-time.After(3 * time.Second):
+		t.Fatal("slow first node blocked later samples")
+	}
+	once.Do(func() { close(release) })
+	<-done
+}
+
+func TestMonitorOldestObservationFirst(t *testing.T) {
+	now := time.Now()
+	e := model.Experiment{Nodes: []model.Node{{ID: "fresh", LastSeen: now}, {ID: "old", LastSeen: now.Add(-time.Minute)}, {ID: "never"}}}
+	nodes := monitorLaneNodes(model.State{}, e, false)
+	if nodes[0].ID != "never" || nodes[1].ID != "old" {
+		t.Fatal("monitor did not prioritize stale observations")
+	}
+}
+
 func TestMonitorNodeBatchesCommitEachGroupOnce(t *testing.T) {
 	nodes := make([]model.Node, 100)
 	for i := range nodes {

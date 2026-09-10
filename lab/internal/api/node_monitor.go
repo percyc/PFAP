@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,29 +21,67 @@ func monitorNodeBatches(nodes []model.Node, sample func(context.Context, model.N
 }
 
 func monitorNodeBatchesLimit(nodes []model.Node, concurrency int, sample func(context.Context, model.Node, func(func(*model.State) error) error), commit func(func(*model.State) error) error) {
+	eligible := make([]model.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Status != "recovering" {
+			eligible = append(eligible, node)
+		}
+	}
+	nodes = eligible
 	concurrency = max(1, min(concurrency, monitorNodeConcurrency))
-	for start := 0; start < len(nodes); start += concurrency {
-		var mu sync.Mutex
-		var updates []func(*model.State) error
-		monitorNodeRound(nodes[start:min(start+concurrency, len(nodes))], func(ctx context.Context, node model.Node) {
+	type result struct{ updates []func(*model.State) error }
+	results := make(chan result, concurrency)
+	next, active := 0, 0
+	launch := func() bool {
+		if next == len(nodes) {
+			return false
+		}
+		node := nodes[next]
+		next++
+		active++
+		go func() {
+			var mu sync.Mutex
+			var updates []func(*model.State) error
+			ctx, cancel := context.WithTimeout(context.Background(), monitorNodeTimeout)
+			defer cancel()
 			sample(ctx, node, func(update func(*model.State) error) error {
 				mu.Lock()
 				updates = append(updates, update)
 				mu.Unlock()
 				return nil
 			})
-		})
-		if len(updates) > 0 {
-			if err := commit(func(s *model.State) error {
-				for _, update := range updates {
-					if err := update(s); err != nil {
-						return err
+			results <- result{updates}
+		}()
+		return true
+	}
+	for active < concurrency && launch() {
+	}
+	var updates []func(*model.State) error
+	failed := false
+	for active > 0 {
+		r := <-results
+		active--
+		if failed {
+			continue
+		}
+		updates = append(updates, r.updates...)
+		if len(updates) >= concurrency || (active == 0 && next == len(nodes)) {
+			if len(updates) > 0 {
+				if err := commit(func(s *model.State) error {
+					for _, update := range updates {
+						if err := update(s); err != nil {
+							return err
+						}
 					}
+					return nil
+				}); err != nil {
+					failed = true // Drain outstanding work without publishing after failure.
 				}
-				return nil
-			}); err != nil {
-				return // Store health exposes persistence failure; next round retries sampling.
 			}
+			updates = nil
+		}
+		if !failed {
+			launch()
 		}
 	}
 }
@@ -65,6 +104,7 @@ func monitorLaneNodes(s model.State, exp model.Experiment, proving bool) []model
 			nodes = append(nodes, node)
 		}
 	}
+	sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].LastSeen.Before(nodes[j].LastSeen) })
 	return nodes
 }
 

@@ -5,8 +5,9 @@ const path = require('node:path');
 const {runtimeSHA,validateLayout,requireExclusiveServers}=require('./live-hour-policy.cjs');
 const sha=runtimeSHA(process.env.PFAP_RUNTIME_SHA);
 const [eid, output, mode] = process.argv.slice(2);
-if(mode && mode!=='--resume-preparation') throw Error('Unknown mode');
+if(mode && !['--resume-preparation','--prepared-run'].includes(mode)) throw Error('Unknown mode');
 const resume=mode==='--resume-preparation';
+const prepared=mode==='--prepared-run';
 if (!/^exp-[a-f0-9]+$/.test(eid || '') || !output) throw Error('Specify experiment ID and output directory');
 fs.mkdirSync(output, {recursive:true});
 const marker=path.join(output,'started.json');
@@ -74,7 +75,9 @@ async function exports(run){
  const initial=await state();
  requireExclusiveServers(experiment(initial),initial.experiments);
  const existing=initial.transactions.filter(t=>t.experimentId===eid);
- if(initial.workloads.some(w=>w.experimentId===eid)||(!resume&&existing.length)||existing.some(t=>t.status!=='confirmed'||t.error||!t.hash||!['public','createAccount','mint'].includes(t.type)))throw Error('Not a fresh or fully confirmed preparation-only experiment');
+ if(prepared){
+  if(initial.workloads.some(w=>w.experimentId===eid&&!['completed','completed-with-errors','cancelled','canceled','interrupted'].includes(w.status))||existing.some(t=>t.status!=='confirmed'||t.error||!t.hash||(t.type==='transfer'&&(!t.readyAt||t.readyAt.startsWith('0001-')))))throw Error('Prepared experiment still has unresolved transactions or active runs');
+ }else if(initial.workloads.some(w=>w.experimentId===eid)||(!resume&&existing.length)||existing.some(t=>t.status!=='confirmed'||t.error||!t.hash||!['public','createAccount','mint'].includes(t.type)))throw Error('Not a fresh or fully confirmed preparation-only experiment');
  await wait('network',async()=>{
   const e=experiment(await state());
   if(e.artifactSha&&e.artifactSha!==sha)throw Error('Experiment runtime differs from PFAP_RUNTIME_SHA');
@@ -86,6 +89,9 @@ async function exports(run){
  requireExclusiveServers(e,s.experiments);
  const {observer,miners,traders}=validateLayout(e,s.servers,sha);
  log('roles',{observer:observer.id,miners:miners.map(n=>n.id),traders:traders.map(n=>n.id)});
+ if(prepared){
+  for(const n of traders)for(const type of ['createAccount','mint'])if(!existing.some(t=>t.fromNode===n.id&&t.type===type))throw Error('Missing confirmed preparation for '+n.id);
+ }else{
  for(let i=0;i<traders.length;i+=5){
   await batch(traders.slice(i,i+5).map((n,j)=>()=>tx('public',miners[j].id,n.id,'10000000000000000')));
   log('funded',{done:Math.min(i+5,traders.length),total:traders.length});
@@ -97,9 +103,10 @@ async function exports(run){
  for(let i=0;i<traders.length;i++){
   await tx('mint',traders[i].id,'','1000000');log('minted',{done:i+1,total:traders.length});
  }
+ }
  // Monitor provides fresh samples without a long serial 100-node refresh sweep.
  await wait('fresh-accounts',async()=>{
-  const e=experiment(await state());const ready=e.nodes.filter(n=>traders.some(t=>t.id===n.id)&&n.status==='running'&&n.mining===false&&Date.now()-Date.parse(n.lastSeen)<90000&&BigInt(n.zkBalance||'0')>=1000000n);
+  const e=experiment(await state());const ready=e.nodes.filter(n=>traders.some(t=>t.id===n.id)&&n.status==='running'&&n.mining===false&&!n.stateError&&!n.privateStateError&&Date.now()-Date.parse(n.lastSeen)<90000&&BigInt(n.zkBalance||'0')>=(prepared?1n:1000000n));
   return ready.length===94?true:{ready:ready.length,total:94};
  },600);
  const run=await api('/workloads',{experimentId:eid,name:'100 nodes / 94 traders / 1 hour',type:'transfer',value:'1',strategy:'ready-pool',mode:'saturation',nodeIds:traders.map(n=>n.id),observerNodeId:observer.id,warmupSeconds:600,durationSeconds:3600,confirmations:6,ratePerSecond:1});
