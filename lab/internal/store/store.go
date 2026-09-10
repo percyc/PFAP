@@ -56,7 +56,8 @@ type fileOperations struct {
 type Store struct {
 	mu        sync.RWMutex
 	path      string
-	data      []byte // Immutable JSON: neither callbacks nor views can retain aliases.
+	data      []byte      // Immutable JSON: neither callbacks nor views can retain aliases.
+	snapshot  model.State // Immutable decoded representation of the same committed JSON.
 	persisted bool
 	health    Health
 	files     fileOperations
@@ -77,7 +78,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		path: path, data: data, health: Health{BackupPath: path + ".bak"},
+		path: path, data: data, snapshot: initial, health: Health{BackupPath: path + ".bak"},
 		files: fileOperations{
 			createTemp: func(dir, pattern string) (syncedFile, error) { return os.CreateTemp(dir, pattern) },
 			rename:     os.Rename,
@@ -95,28 +96,21 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	s.data, s.persisted = b, true
+	s.snapshot = initial
 	return s, nil
 }
 
 func (s *Store) View(fn func(model.State)) {
 	s.mu.RLock()
-	b := s.data
+	committed := s.snapshot
 	s.mu.RUnlock()
-	var snapshot model.State
-	// Every committed snapshot has already been validated as a model.State.
-	if err := json.Unmarshal(b, &snapshot); err != nil {
-		panic(fmt.Sprintf("invalid committed store snapshot: %v", err))
-	}
-	fn(snapshot)
+	fn(cloneSnapshot(committed))
 }
 
 func (s *Store) Update(fn func(*model.State) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var next model.State
-	if err := json.Unmarshal(s.data, &next); err != nil {
-		return s.persistenceError(fmt.Errorf("copy store state: %w", err))
-	}
+	next := cloneSnapshot(s.snapshot)
 	if err := fn(&next); err != nil {
 		return err
 	}
@@ -136,7 +130,7 @@ func (s *Store) Update(fn func(*model.State) error) error {
 	if err := json.Unmarshal(b, &validated); err != nil {
 		return s.persistenceError(fmt.Errorf("validate store state: %w", err))
 	}
-	if err := s.save(b); err != nil {
+	if err := s.save(b, validated); err != nil {
 		return s.persistenceError(err)
 	}
 	s.health.Degraded = false
@@ -153,7 +147,7 @@ func (s *Store) persistenceError(err error) error {
 	return err
 }
 
-func (s *Store) save(b []byte) error {
+func (s *Store) save(b []byte, validated model.State) error {
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create store directory: %w", err)
@@ -183,6 +177,7 @@ func (s *Store) save(b []byte) error {
 	// Rename is the commit point. A later directory-sync error must not leave
 	// memory behind the visible primary, even though durability is uncertain.
 	s.data, s.persisted = b, true
+	s.snapshot = validated
 	if err := s.files.syncDir(dir); err != nil {
 		return fmt.Errorf("sync store directory after commit: %w", err)
 	}
