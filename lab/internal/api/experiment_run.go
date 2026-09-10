@@ -50,6 +50,44 @@ func runTradingNode(n model.Node) bool {
 	return n.Status == "running" && !n.IsMiner && n.Mining != nil && !*n.Mining
 }
 
+func runSampleFresh(n model.Node, now time.Time) bool {
+	return !n.LastSeen.IsZero() && now.Sub(n.LastSeen) <= 2*time.Minute
+}
+
+func admissionSampleDue(w model.Workload, now time.Time) bool {
+	text, _ := w.Configuration["admissionSampleAt"].(string)
+	last, err := time.Parse(time.RFC3339Nano, text)
+	return err != nil || now.Sub(last) >= 10*time.Second
+}
+
+func recordAdmissionSample(s model.State, e model.Experiment, w *model.Workload, now time.Time) {
+	if !admissionSampleDue(*w, now) {
+		return
+	}
+	busy, eligible := 0, 0
+	stale := []string{}
+	for _, n := range runNodes(e, *w) {
+		if transactionNodesBusy(s.Transactions, n.ID, "") {
+			busy++
+			continue
+		}
+		if !runSampleFresh(n, now) {
+			stale = append(stale, n.ID)
+			continue
+		}
+		if runTradingNode(n) && n.StateError == "" && n.PrivateStateError == "" {
+			eligible++
+		}
+	}
+	if w.Configuration == nil {
+		w.Configuration = map[string]any{}
+	}
+	samples, _ := w.Configuration["admissionSamples"].([]any)
+	samples = append(samples, map[string]any{"at": now.Format(time.RFC3339Nano), "phase": w.Phase, "busyAccounts": busy, "eligibleAccounts": eligible, "staleIdleNodeIds": stale})
+	w.Configuration["admissionSamples"] = samples
+	w.Configuration["admissionSampleAt"] = now.Format(time.RFC3339Nano)
+}
+
 // Preconditions use timestamped monitor data and are checked again at admission.
 func runProblems(s model.State, e model.Experiment, w model.Workload, initial bool, now time.Time) []string {
 	var problems []string
@@ -88,6 +126,9 @@ func runProblems(s model.State, e model.Experiment, w model.Workload, initial bo
 		case n.PrivateStateError != "" || n.StateError != "":
 			reason = "节点或隐私状态异常"
 		case n.LastSeen.IsZero() || now.Sub(n.LastSeen) > 2*time.Minute:
+			if !initial {
+				continue
+			} // Quarantine from admission, not a whole-run fault.
 			reason = "状态采样过期，请查询节点状态"
 		case n.Peers == 0:
 			reason = "没有 P2P 连接"
@@ -200,6 +241,10 @@ func (a *API) createRun(w http.ResponseWriter, r *http.Request, input model.Work
 // Longest-idle sender first, lowest-balance eligible receiver next. Selection
 // and reservations are committed together, so disjoint transfers may overlap.
 func chooseRunPair(s model.State, e model.Experiment, w model.Workload) (model.Node, model.Node, bool) {
+	return chooseRunPairAt(s, e, w, time.Now())
+}
+
+func chooseRunPairAt(s model.State, e model.Experiment, w model.Workload, now time.Time) (model.Node, model.Node, bool) {
 	last := map[string]time.Time{}
 	for _, t := range s.Transactions {
 		if t.ExperimentID == e.ID {
@@ -212,7 +257,7 @@ func chooseRunPair(s model.State, e model.Experiment, w model.Workload) (model.N
 	}
 	var free []model.Node
 	for _, n := range runNodes(e, w) {
-		if runTradingNode(n) && !transactionNodesBusy(s.Transactions, n.ID, "") {
+		if runTradingNode(n) && runSampleFresh(n, now) && n.StateError == "" && n.PrivateStateError == "" && !transactionNodesBusy(s.Transactions, n.ID, "") {
 			free = append(free, n)
 		}
 	}
@@ -284,8 +329,8 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 				}
 			}
 			if !fault {
-				_, _, ok := chooseRunPair(s, e, w)
-				idlePoll = !ok
+				_, _, ok := chooseRunPairAt(s, e, w, now)
+				idlePoll = !ok && !admissionSampleDue(w, now)
 			}
 		}
 	})
@@ -311,6 +356,7 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 				}
 			}
 			fault := ""
+			recordAdmissionSample(*s, e, w, now)
 			if w.BlockError != "" {
 				fault = w.BlockError
 			}
@@ -366,7 +412,7 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 				return nil
 			}
 			w.Attempted++
-			payer, receiver, ok := chooseRunPair(*s, e, *w)
+			payer, receiver, ok := chooseRunPairAt(*s, e, *w, now)
 			if !ok {
 				w.SkippedBusy++
 				return nil

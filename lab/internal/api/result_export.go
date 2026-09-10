@@ -100,7 +100,7 @@ func safeSystemInfo(value any) map[string]any {
 	return out
 }
 func safeConfiguration(c map[string]any) map[string]any {
-	out := fields(c, "networkId minerCount minerMode artifactSha recoveryArtifactSha capturedAt scheduler blockSampling blockSamplingConfirmations blockWarmupReorgs blockWarmupResetAt")
+	out := fields(c, "networkId minerCount minerMode artifactSha recoveryArtifactSha capturedAt scheduler blockSampling blockSamplingConfirmations blockWarmupReorgs blockWarmupResetAt admissionSamples admissionSampleAt")
 	for _, key := range []string{"nodes", "servers"} {
 		list := []map[string]any{}
 		b, _ := json.Marshal(c[key])
