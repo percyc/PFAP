@@ -37,6 +37,12 @@ func TestRunMinerRolesRejected(t *testing.T) {
 				}
 			})
 			tx, _, err := a.runFlowTick("w", now)
+			if role == "unknown" {
+				if err != nil || tx == nil || tx.FromNode == "a" || tx.ToNode == "a" {
+					t.Fatalf("unknown-role account must be excluded while healthy peers continue: %+v %v", tx, err)
+				}
+				return
+			}
 			if err != nil || tx != nil {
 				t.Fatalf("role change admitted transaction: %v", err)
 			}

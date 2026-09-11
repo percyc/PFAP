@@ -54,6 +54,13 @@ func runSampleFresh(n model.Node, now time.Time) bool {
 	return !n.LastSeen.IsZero() && now.Sub(n.LastSeen) <= 2*time.Minute
 }
 
+// Transport/availability faults remove only this trader from admission. They
+// never authorize another transaction or clear a private-account reservation.
+func runTemporarilyUnavailable(n model.Node) bool {
+	return n.Status != "running" || n.Mining == nil || n.Peers == 0 ||
+		strings.HasPrefix(n.StateError, "ssh:") || strings.HasPrefix(n.StateError, "节点状态查询超时")
+}
+
 func admissionSampleDue(w model.Workload, now time.Time) bool {
 	text, _ := w.Configuration["admissionSampleAt"].(string)
 	last, err := time.Parse(time.RFC3339Nano, text)
@@ -66,9 +73,14 @@ func recordAdmissionSample(s model.State, e model.Experiment, w *model.Workload,
 	}
 	busy, eligible := 0, 0
 	stale := []string{}
+	unavailable := []string{}
 	for _, n := range runNodes(e, *w) {
 		if transactionNodesBusy(s.Transactions, n.ID, "") {
 			busy++
+			continue
+		}
+		if runTemporarilyUnavailable(n) {
+			unavailable = append(unavailable, n.ID)
 			continue
 		}
 		if !runSampleFresh(n, now) {
@@ -83,7 +95,7 @@ func recordAdmissionSample(s model.State, e model.Experiment, w *model.Workload,
 		w.Configuration = map[string]any{}
 	}
 	samples, _ := w.Configuration["admissionSamples"].([]any)
-	samples = append(samples, map[string]any{"at": now.Format(time.RFC3339Nano), "phase": w.Phase, "busyAccounts": busy, "eligibleAccounts": eligible, "staleIdleNodeIds": stale})
+	samples = append(samples, map[string]any{"at": now.Format(time.RFC3339Nano), "phase": w.Phase, "busyAccounts": busy, "eligibleAccounts": eligible, "staleIdleNodeIds": stale, "unavailableIdleNodeIds": unavailable})
 	w.Configuration["admissionSamples"] = samples
 	w.Configuration["admissionSampleAt"] = now.Format(time.RFC3339Nano)
 }
@@ -114,6 +126,10 @@ func runProblems(s model.State, e model.Experiment, w model.Workload, initial bo
 	for _, n := range nodes {
 		reason := ""
 		busy := transactionNodesBusy(s.Transactions, n.ID, "")
+		if !initial && !n.IsMiner && !(n.Mining != nil && *n.Mining) &&
+			(n.PrivateStateError == "" || busy) && runTemporarilyUnavailable(n) {
+			continue // Account remains unavailable; healthy peers may proceed.
+		}
 		switch {
 		case n.Status != "running":
 			reason = "节点不在线"
@@ -257,7 +273,7 @@ func chooseRunPairAt(s model.State, e model.Experiment, w model.Workload, now ti
 	}
 	var free []model.Node
 	for _, n := range runNodes(e, w) {
-		if runTradingNode(n) && runSampleFresh(n, now) && n.StateError == "" && n.PrivateStateError == "" && !transactionNodesBusy(s.Transactions, n.ID, "") {
+		if runTradingNode(n) && !runTemporarilyUnavailable(n) && runSampleFresh(n, now) && n.StateError == "" && n.PrivateStateError == "" && !transactionNodesBusy(s.Transactions, n.ID, "") {
 			free = append(free, n)
 		}
 	}

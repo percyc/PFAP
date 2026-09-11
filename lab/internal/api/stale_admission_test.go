@@ -64,3 +64,53 @@ func TestPrivacyFaultStillStopsRun(t *testing.T) {
 		t.Fatal("privacy fault ignored")
 	}
 }
+
+func TestUnavailableTraderDoesNotStopHealthyPairs(t *testing.T) {
+	for _, kind := range []string{"offline", "peers", "timeout", "ssh", "mining-unknown"} {
+		t.Run(kind, func(t *testing.T) {
+			a, now := runFixture(t)
+			saveTestState(t, a, func(s *model.State) {
+				n := &s.Experiments[0].Nodes[0]
+				switch kind {
+				case "offline":
+					n.Status = "unreachable"
+				case "peers":
+					n.Peers = 0
+				case "timeout":
+					n.StateError = "节点状态查询超时"
+				case "ssh":
+					n.StateError = "ssh: connection failed"
+				case "mining-unknown":
+					n.Mining = nil
+				}
+			})
+			a.store.View(func(s model.State) {
+				if len(runProblems(s, s.Experiments[0], s.Workloads[0], true, now)) == 0 {
+					t.Fatal("initial admission relaxed")
+				}
+			})
+			tx, done, err := a.runFlowTick("w", now)
+			if err != nil || done || tx == nil || tx.FromNode == "a" || tx.ToNode == "a" {
+				t.Fatalf("unavailable trader stopped or joined traffic: %+v %v %v", tx, done, err)
+			}
+			a.store.View(func(s model.State) {
+				sample := s.Workloads[0].Configuration["admissionSamples"].([]any)[0].(map[string]any)
+				if len(sample["unavailableIdleNodeIds"].([]any)) != 1 {
+					t.Fatal("missing unavailable audit")
+				}
+			})
+		})
+	}
+}
+
+func TestUnavailablePrivateFaultStillStops(t *testing.T) {
+	a, now := runFixture(t)
+	saveTestState(t, a, func(s *model.State) {
+		s.Experiments[0].Nodes[0].Status = "unreachable"
+		s.Experiments[0].Nodes[0].PrivateStateError = "bad state"
+	})
+	tx, done, err := a.runFlowTick("w", now)
+	if err != nil || !done || tx != nil {
+		t.Fatal("private fault hidden by transport fault")
+	}
+}
