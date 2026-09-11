@@ -1,48 +1,27 @@
 # PFAP Lab
 
-## 隐私账户持久化与重启验证
+PFAP Lab 是 PFAP 多节点实验的 Web 控制面，也是推荐的复现实验入口。它管理本机/SSH 服务器、同一 runtime 的部署、节点与矿工角色、账户准备、自动交易和独立测量窗口，最后导出单次运行或整个实验的结果。
 
-新运行包以节点 datadir 内的 `private-account-v1.json` 保存原随机账户密钥、下一 SN 状态和待核验交易记录；先原子落盘并同步，再广播或返回付款证明。该文件是私密数据（权限 0600，并非加密文件），备份必须保留，不能放进公开实验报告，也不能删除后重复初始化。新版不再用公开地址派生的替代密钥恢复旧账户；旧版已丢失的随机密钥无法由此补回。已有新版账户禁止降级运行包。
+**先用 Lab 完成实验流程；命令行用于首次构建、固定流程自动化和底层排查。** 当前面向单实验人员与可信局域网，不是公网多租户平台。
 
-`eth.getPrivateRecovery()` 只读返回记录类别、交易哈希和错误，不暴露秘密，也不重发交易。记录存在不代表交易上链；仍须核验规范链回执和双方账户状态。结果不明时保留占用，不自动回滚付款状态。
+[项目主页与实际截图](../README.md) · [一键自动化运行](ONE_CLICK_EXPERIMENT.md) · [底层 CLI / RPC](../docs/COMMAND_LINE.md)
 
-专用验收：先新建独立 4 节点实验（节点 1 观察、节点 2 矿工、节点 3/4 为远程交易节点，各服务器一个进程），再从仓库根目录运行 `node lab/scripts/validate-private-restart.cjs EXPERIMENT_ID`。脚本仅接受无既有交易的新实验，会对两个交易进程执行 SIGKILL，检查恢复后继续 Mint、双向 Transfer、Redeem；不要用于正在进行的正式实验，不要在失败后直接重跑。运行结束不自动停止网络，需导出报告后停止该验证实验。详见 [真实重启验收记录](VALIDATION_DURABLE_ACCOUNT_20260909.md)。
+## Web 复现路线
 
-## 结果导出
+1. 构建 runtime 与 Lab 并启动控制面，按下节完成控制机与 worker 安装。
+2. 在“服务器”添加主机、核对 SSH 指纹、检查连接，标注物理宿主机并设置各节点可达的 P2P 地址。
+3. 在“实验”创建独立部署并指定矿工。首次建议 4 节点：1 矿工、1 观察、2 交易；验证通过再扩大。100 节点的一小时基线使用 5 矿工、1 观察、94 交易节点，每个服务器配置 1 进程。
+4. 在“交易”选择实验，先准备公开余额及手续费，再执行 CreateAccount 初始化和 Mint 补足隐私余额。已经初始化的账户不要重复开户。
+5. 在“自动实验流程”选非矿工交易节点、独立观察节点、预热/测量时长和确认深度；通过准备检查后明确启动。分别观察预热、正式测量及收尾，不把累计交易或历史平均 TPS 当作正式窗口统计。
+6. 等待收尾完成，导出单次运行或整个实验报告；不再使用时手动停止实验节点。Web 运行结束不会自动停整网；一键脚本在成功收尾、导出后会核验停网。
 
-100 节点一小时的一次性执行脚本现在要求显式版本：`PFAP_RUNTIME_SHA=已验证的64位sha256 node lab/scripts/run-live-hour.cjs 实验ID 输出目录`。当前通过恢复验收的运行包 SHA 为 `85e1e473abd3fe3d6c56e429e56d4e0e44ece170fb12761f609e4e8cac7b6f71`。脚本检查 100 台不同服务器各一个节点、1 个观察节点、5 个不同宿主机组的矿工、94 个交易节点，并拒绝与其他运行/部署/恢复/停止中的实验共用服务器；数据库检查不能代替部署前的实际进程核验。
+正式 Transfer 使用跨账户对并发，每个账户同时只能参与一笔在途匿名交易。付款证明携带历史树根及区块锚，收款方验证合法的历史规范链树根；早期“树根变化导致仅一对串行验证”的记录是修复前历史，不代表当前限制。未知交易和隐私状态错误仍须核验，不能盲目重发或解锁。
 
-准备阶段按宿主机组轮转排列节点，Public/CreateAccount 每批最多 5 个；Mint 暂时仍串行，不能把这一点误写成正式 Transfer 的全网串行。正式 Transfer 使用就绪账户池跨节点并发。准备、预热、3600 秒正式窗口、收尾分别记录；所有初始化、密钥问题和未知交易必须先处理。恢复准备要求输出目录内的原标记同时匹配实验和运行包；旧版不含 SHA 的标记不会被静默接受或改写。
-
-- 实验管理中的“实验报告 HTML / CSV 数据包 / JSON”导出整个实验；单次自动运行卡片中的对应入口仅导出该次运行。
-- `GET /api/experiments/{id}/report?format=html|csv|json`；`GET /api/workloads/{id}/report?format=html|csv|json`。实验导出默认 JSON，下载 schemaVersion=2；运行报告不带 format 时仍是页面使用的窗口统计接口，但 workload 配置也经过字段白名单处理。
-- HTML 可直接阅读并打印为 PDF。CSV 下载为 ZIP，包含 metrics、transactions、blocks、minutes、events 五张表以及 report.html / report.json。指标表附单位、样本数、定义、公式和缺失说明；各次运行独立展示，不平均 TPS / 分位数。历史传统负载没有正式窗口，不伪造稳态指标。
-- 导出排除凭据、SSH 身份文件路径、私密 SN / 承诺 / 证明 / 隐私余额、原始命令 / Receipt / 错误日志 / 事件正文。事件保留时间、类别、级别；异常保留分类标记。CSV 对公式前导字符加单引号保护。
-- 构建档案明确标记为导出时当前档案，不冒充历史运行包的构建证据；服务器当前配置与运行开始时保存的配置快照分别保留。缺失耗时为 null / 空值，不能解读为零开销。
-
-PFAP Lab 是 PFAP 多节点实验的 Web 控制面。它可以在本机或多台 SSH 服务器上部署同一份不可变 runtime，启动每台机器上的多个 geth 节点，建立 full-mesh 网络，执行预设交易或自动负载，并保存交易凭证、账户状态及性能数据。
-
-当前实现面向单实验人员、可信局域网和可复现实验，不是公网多租户平台。
-
-真实端到端验证过程与已知限制见 [`VALIDATION_20260908.md`](VALIDATION_20260908.md)。短时功能通过不等同于高负载或统计平稳验证；目前 Transfer 的跨账户对并发存在状态树根变化风险，验证使用一对交易节点串行、矿工与观察节点独立。
+最近完成的一小时结果及口径见 [一键实验说明中的基线记录](ONE_CLICK_EXPERIMENT.md)。早期 [2026-09-08 验证记录](VALIDATION_20260908.md) 保留为历史证据；任何单次成功都不等于已验证最大容量或长期可靠性。
 
 ## 快速开始
 
-在仓库根目录执行：
-
-```bash
-cd /home/percy/pfap/PFAP
-
-# geth / C++ 有变化时重建对应组件；仅 Web 变化可跳过 geth
-./build.sh geth
-./build.sh bundle
-./build.sh lab
-
-# 监听所有网卡，适合可信局域网
-./lab/run-lan.sh
-```
-
-`run-lan.sh` 默认监听 `0.0.0.0:8090`，首次启动会生成随机 Web 密码到 `lab/data/password`。密码不会写入项目文档，该文件权限应保持 `0600`。控制服务重启后登录 Cookie 会失效，需要重新登录。
+以下命令在仓库根目录执行；已完成安装且 runtime 未变化时，无需重新编译或生成密钥。
 
 ### 新控制机首次安装（推荐）
 
@@ -52,8 +31,8 @@ cd /home/percy/pfap/PFAP
 git clone <PFAP repository URL>
 cd PFAP
 
-# 首次会构建 Ubuntu 22.04 编译镜像；之后复用 Docker 和增量编译缓存
-./scripts/build-compatible-runtime.sh
+# 首次安装、创建全新网络：编译并生成所有节点共享的 pk/vk
+./scripts/build-compatible-runtime.sh --generate-keys
 
 # 构建并启动 Web 控制面
 ./build.sh lab
@@ -68,7 +47,7 @@ docker run --rm -v "$PWD/dist:/dist:ro" pfap-runtime-builder:ubuntu22 \
   LD_LIBRARY_PATH=/tmp/pfap/pfap-runtime/lib /tmp/pfap/pfap-runtime/bin/geth version'
 ```
 
-不要在普通更新中执行 `./build.sh keys`：重新生成 pk/vk 会改变证明参数。只有电路约束改变并计划创建全新实验网络时才应重新生成密钥。
+仓库不跟踪生成的 `prfKey` 文件，首次安装若省略密钥生成，打包会报缺少密钥。上面的 `--generate-keys` 仅用于首次创建全新网络；已经有密钥的普通重建应使用 `./scripts/build-compatible-runtime.sh`，保留原密钥。不要在普通更新中执行 `./build.sh keys` 或 `--generate-keys`：重新生成 pk/vk 会改变证明参数。电路约束变化需要新参数和新网络，不能沿用旧链状态。
 
 需要明确轮换密钥时，先停止所有使用旧 runtime 的实验，再执行：
 
@@ -86,6 +65,26 @@ docker run --rm -v "$PWD/dist:/dist:ro" pfap-runtime-builder:ubuntu22 \
   -data ./lab/data/lab.json \
   -password-file ./lab/data/password
 ```
+
+## 隐私账户持久化与重启验证
+
+新运行包以节点 datadir 内的 `private-account-v1.json` 保存原随机账户密钥、下一 SN 状态和待核验交易记录；先原子落盘并同步，再广播或返回付款证明。该文件是私密数据（权限 0600，并非加密文件），备份必须保留，不能放进公开实验报告，也不能删除后重复初始化。新版不再用公开地址派生的替代密钥恢复旧账户；旧版已丢失的随机密钥无法由此补回。已有新版账户禁止降级运行包。
+
+`eth.getPrivateRecovery()` 只读返回记录类别、交易哈希和错误，不暴露秘密，也不重发交易。记录存在不代表交易上链；仍须核验规范链回执和双方账户状态。结果不明时保留占用，不自动回滚付款状态。
+
+专用验收：先新建独立 4 节点实验（节点 1 观察、节点 2 矿工、节点 3/4 为远程交易节点，各服务器一个进程），再从仓库根目录运行 `node lab/scripts/validate-private-restart.cjs EXPERIMENT_ID`。脚本仅接受无既有交易的新实验，会对两个交易进程执行 SIGKILL，检查恢复后继续 Mint、双向 Transfer、Redeem；不要用于正在进行的正式实验，不要在失败后直接重跑。运行结束不自动停止网络，需导出报告后停止该验证实验。详见 [真实重启验收记录](VALIDATION_DURABLE_ACCOUNT_20260909.md)。
+
+## 结果导出
+
+建议优先使用 Web 的单次运行或整个实验导出按钮。需要自动化复跑已部署的固定 100 节点布局时，使用 `node lab/scripts/run-experiment.cjs --help`，具体命令、模式、失败处理和结果位置见 [一键运行实验](ONE_CLICK_EXPERIMENT.md)。脚本自动计算本地 runtime SHA 并核对实验及全部节点，不把某个历史版本写成永远适用的“当前版本”。
+
+一键脚本的准备阶段按宿主机组轮转排列节点，Public/CreateAccount 每批最多 5 个；Mint 暂时仍串行，不能把这一点误写成正式 Transfer 的全网串行。正式 Transfer 使用就绪账户池跨节点并发。准备、预热、3600 秒正式窗口、收尾分别记录；所有初始化、密钥问题和未知交易必须先处理。底层维护脚本的恢复准备要求输出目录内的原标记同时匹配实验和运行包；旧版不含 SHA 的标记不会被静默接受或改写。
+
+- 实验管理中的“实验报告 HTML / CSV 数据包 / JSON”导出整个实验；单次自动运行卡片中的对应入口仅导出该次运行。
+- `GET /api/experiments/{id}/report?format=html|csv|json`；`GET /api/workloads/{id}/report?format=html|csv|json`。实验导出默认 JSON，下载 schemaVersion=2；运行报告不带 format 时仍是页面使用的窗口统计接口，但 workload 配置也经过字段白名单处理。
+- HTML 可直接阅读并打印为 PDF。CSV 下载为 ZIP，包含 metrics、transactions、blocks、minutes、events 五张表以及 report.html / report.json。指标表附单位、样本数、定义、公式和缺失说明；各次运行独立展示，不平均 TPS / 分位数。历史传统负载没有正式窗口，不伪造稳态指标。
+- 导出排除凭据、SSH 身份文件路径、私密 SN / 承诺 / 证明 / 隐私余额、原始命令 / Receipt / 错误日志 / 事件正文。事件保留时间、类别、级别；异常保留分类标记。CSV 对公式前导字符加单引号保护。
+- 构建档案明确标记为导出时当前档案，不冒充历史运行包的构建证据；服务器当前配置与运行开始时保存的配置快照分别保留。缺失耗时为 null / 空值，不能解读为零开销。
 
 ## 构建产物
 
