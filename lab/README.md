@@ -399,6 +399,8 @@ PFAP 证明通常远慢于投递间隔。节点繁忙时自动规则会跳过本
 开发交接、关键源码和当前验证状态见 [`DEVELOPMENT_HANDOFF.md`](DEVELOPMENT_HANDOFF.md)。
 # 自动实验流程（2026-09）
 
+100 节点的一键命令、只读预检查、日志/报告、失败处理及已完成一小时实验结果，见 [一键运行实验](ONE_CLICK_EXPERIMENT.md)。入口：`node lab/scripts/run-experiment.cjs --help`。该入口操作明确指定的既有部署，不会自动创建或覆盖实验。
+
 交易页的“自动实验流程”默认使用完整 Transfer 模式，传统 Mint / Redeem / Public 定时测试保留在流程下拉框中。操作顺序：
 
 1. 先启动实验，选择交易节点和区块观察节点。建议观察节点不参与挖矿，宿主机资源独立。

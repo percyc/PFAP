@@ -2,6 +2,7 @@
 // Usage: PFAP_RUNTIME_SHA=verified_sha node lab/scripts/run-live-hour.cjs EXPERIMENT_ID OUTPUT_DIRECTORY
 const fs = require('node:fs');
 const path = require('node:path');
+process.chdir(path.resolve(__dirname,'../..'));
 const {runtimeSHA,validateLayout,requireExclusiveServers}=require('./live-hour-policy.cjs');
 const sha=runtimeSHA(process.env.PFAP_RUNTIME_SHA);
 const [eid, output, mode] = process.argv.slice(2);
@@ -20,6 +21,7 @@ if(resume){
 }
 const base='http://127.0.0.1:8090';
 let cookie;
+let acceptedRun;
 const log=(stage,details={})=>console.log(JSON.stringify({at:new Date().toISOString(),stage,...details}));
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function request(url,body){
@@ -62,12 +64,16 @@ async function batch(jobs){
  if(failures.length)throw Error(failures.map(v=>v.reason.message).join('; '));
 }
 async function exports(run){
+ const errors=[];
  for(const [name,url] of [['experiment','/experiments/'+eid],...(run?[['run','/workloads/'+run]]:[])]){
   for(const format of ['json','html','csv']){
-   const r=await request('/api'+url+'/report?format='+format);
-   fs.writeFileSync(path.join(output,name+'.'+(format==='csv'?'zip':format)),Buffer.from(await r.arrayBuffer()));
+   try {
+    const r=await request('/api'+url+'/report?format='+format);
+    fs.writeFileSync(path.join(output,name+'.'+(format==='csv'?'zip':format)),Buffer.from(await r.arrayBuffer()));
+   } catch(e) { errors.push(name+'/'+format+': '+e.message); }
   }
  }
+ if(errors.length)throw Error(errors.join('; '));
 }
 (async()=>{
  const r=await fetch(base+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:fs.readFileSync('lab/data/password','utf8').trim()}),signal:AbortSignal.timeout(30000)});
@@ -110,6 +116,7 @@ async function exports(run){
   return ready.length===94?true:{ready:ready.length,total:94};
  },600);
  const run=await api('/workloads',{experimentId:eid,name:'100 nodes / 94 traders / 1 hour',type:'transfer',value:'1',strategy:'ready-pool',mode:'saturation',nodeIds:traders.map(n=>n.id),observerNodeId:observer.id,warmupSeconds:600,durationSeconds:3600,confirmations:6,ratePerSecond:1});
+ acceptedRun=run.id;
  fs.writeFileSync(path.join(output,'run-id.txt'),run.id);log('run-started',{id:run.id});
  await wait('run',async()=>{
   const w=(await api('/workloads')).find(w=>w.id===run.id);if(!w)throw Error('Missing run');
@@ -124,4 +131,8 @@ async function exports(run){
  await api('/experiments/'+eid+'/stop',{});
  await wait('stopping',async()=>{const e=experiment(await state());if(e.status==='stop-failed')throw Error(e.error);return e.status==='stopped'&&e.nodes.every(n=>n.status==='stopped')?true:{status:e.status,stopped:e.nodes.filter(n=>n.status==='stopped').length};},3600);
  await exports(run.id);log('COMPLETE',{eid,run:run.id});
-})().catch(e=>{log('HALTED',{error:e.message,note:'No replay or state rollback. Inspect persisted transactions and running nodes.'});process.exitCode=1;});
+})().catch(async e=>{
+ log('HALTED',{error:e.message,note:'No replay or state rollback. Inspect persisted transactions and running nodes.'});
+ if(cookie)try{await exports(acceptedRun);}catch(exportError){log('EXPORT_FAILED',{error:exportError.message});}
+ process.exitCode=1;
+});
