@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/pfapmetrics"
 	"github.com/ethereum/go-ethereum/zktx"
 	"gopkg.in/karalabe/cookiejar.v2/collections/prque"
 )
@@ -554,6 +555,7 @@ func (pool *TxPool) local() map[common.Address]types.Transactions {
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
 func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
+	pfapAdmissionStarted := time.Now()
 	// Heuristic limit, reject transactions over 32KB to prevent DOS attacks
 
 	txCode := tx.TxCode()
@@ -647,6 +649,9 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		}
 	}
 	verProofEnd := time.Now()
+	if txCode == types.TransferTx || txCode == types.PublicTx {
+		pfapmetrics.Admission(tx.Hash().Hex(), pfapAdmissionStarted, verProofEnd)
+	}
 	fmt.Println("***** Verify transaction Cost Time (ms): ", verProofEnd.Sub(verProofStart).Nanoseconds()/1000000, " Tx Size (bytes): ", tx.Size())
 
 	// Transfer membership is valid only under a verified ancestral block root.

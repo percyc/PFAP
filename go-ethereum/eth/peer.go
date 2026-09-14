@@ -27,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/pfapmetrics"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
@@ -200,7 +201,16 @@ func (p *peer) SendTransactions(txs types.Transactions) error {
 	for _, tx := range txs {
 		p.knownTxs.Add(tx.Hash())
 	}
-	return p2p.Send(p.rw, TxMsg, txs)
+	started := time.Now()
+	err := p2p.Send(p.rw, TxMsg, txs)
+	if err == nil {
+		for _, tx := range txs {
+			if tx.Code() == types.TransferTx || tx.Code() == types.PublicTx {
+				pfapmetrics.Broadcast(tx.Hash().Hex(), started)
+			}
+		}
+	}
+	return err
 }
 
 // AsyncSendTransactions queues list of transactions propagation to a remote

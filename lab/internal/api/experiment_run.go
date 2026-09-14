@@ -175,8 +175,15 @@ func (a *API) createRun(w http.ResponseWriter, r *http.Request, input model.Work
 	// Whitelist fields: clients cannot forge phases, timestamps or result counters.
 	v := model.Workload{ID: id("load"), ExperimentID: input.ExperimentID, Name: input.Name, Type: "transfer", Value: input.Value, Strategy: "ready-pool", Mode: input.Mode, NodeIDs: input.NodeIDs, WarmupSeconds: input.WarmupSeconds, DurationSeconds: input.DurationSeconds, Confirmations: input.Confirmations, RatePerSecond: input.RatePerSecond, Status: "queued", Phase: "preparing", CreatedAt: time.Now()}
 	v.ObserverNodeID = input.ObserverNodeID
+	if input.Type == "mixed" {
+		if input.TransferPercent < 0 || input.TransferPercent > 100 || input.TransferPercent%20 != 0 {
+			fail(w, 400, errors.New("混合实验 Transfer 比例必须为 0、20、40、60、80 或 100"))
+			return
+		}
+		v.Type, v.TransferPercent = "mixed", input.TransferPercent
+	}
 	value, ok := amount(v.Value)
-	if !ok || value.Sign() == 0 || value.BitLen() > 64 || input.Type != "transfer" || v.DurationSeconds < 1 || v.DurationSeconds > 604800 || v.WarmupSeconds < 1 || v.WarmupSeconds > 7200 || v.Confirmations < 1 || v.Confirmations > 64 || len(v.NodeIDs) < 2 || len(v.NodeIDs) > 300 || (v.Mode != "saturation" && v.Mode != "rate") || math.IsNaN(v.RatePerSecond) || math.IsInf(v.RatePerSecond, 0) || (v.Mode == "rate" && (v.RatePerSecond < 0.01 || v.RatePerSecond > 100)) {
+	if !ok || value.Sign() == 0 || value.BitLen() > 64 || (input.Type != "transfer" && input.Type != "mixed") || v.DurationSeconds < 1 || v.DurationSeconds > 604800 || v.WarmupSeconds < 1 || v.WarmupSeconds > 7200 || v.Confirmations < 1 || v.Confirmations > 64 || len(v.NodeIDs) < 2 || len(v.NodeIDs) > 300 || (v.Mode != "saturation" && v.Mode != "rate") || math.IsNaN(v.RatePerSecond) || math.IsInf(v.RatePerSecond, 0) || (v.Mode == "rate" && (v.RatePerSecond < 0.01 || v.RatePerSecond > 100)) {
 		fail(w, 400, errors.New("请检查 Transfer 数值、节点、负载模式、预热时间、测量时间和确认深度"))
 		return
 	}
@@ -345,7 +352,7 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 				}
 			}
 			if !fault {
-				_, _, ok := chooseRunPairAt(s, e, w, now)
+				_, _, _, ok := chooseRunTask(s, e, w, now)
 				idlePoll = !ok && !admissionSampleDue(w, now)
 			}
 		}
@@ -428,7 +435,7 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 				return nil
 			}
 			w.Attempted++
-			payer, receiver, ok := chooseRunPairAt(*s, e, *w, now)
+			txType, payer, receiver, ok := chooseRunTask(*s, e, *w, now)
 			if !ok {
 				w.SkippedBusy++
 				return nil
@@ -436,7 +443,11 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 			p, _ := amount(payer.ZKBalance)
 			q, _ := amount(receiver.ZKBalance)
 			value, _ := amount(w.Value)
-			tx := model.Transaction{ID: newRunTxID(), WorkloadID: id, Sequence: w.Submitted + 1, ExperimentID: w.ExperimentID, Type: "transfer", FromNode: payer.ID, ToNode: receiver.ID, Value: w.Value, Status: "queued", RunPhase: w.Phase, SubmittedAt: now, ExpectedPayerBalance: new(big.Int).Sub(p, value).String(), ExpectedReceiverBalance: new(big.Int).Add(q, value).String()}
+			tx := model.Transaction{ID: newRunTxID(), WorkloadID: id, Sequence: w.Submitted + 1, ExperimentID: w.ExperimentID, Type: txType, FromNode: payer.ID, ToNode: receiver.ID, Value: w.Value, Status: "queued", RunPhase: w.Phase, SubmittedAt: now}
+			if txType == "transfer" {
+				tx.ExpectedPayerBalance = new(big.Int).Sub(p, value).String()
+				tx.ExpectedReceiverBalance = new(big.Int).Add(q, value).String()
+			}
 			s.Transactions = append(s.Transactions, tx)
 			w.Submitted++
 			queued = &tx
@@ -575,10 +586,16 @@ func (a *API) checkRunReadiness(ctx context.Context, txID string) error {
 	}
 	expr := `(function(){var r=eth.getTransactionReceipt(` + strconv.Quote(tx.Hash) + `),b=r?eth.getBlock(r.blockNumber):null,z=eth.getAccountState();return JSON.stringify({transactionHash:r?r.transactionHash:"",hash:r?r.blockHash:"",canonical:b?b.hash:"",head:eth.blockNumber,block:r?r.blockNumber:0,status:r?String(r.status):"",balance:z.balance,stateBlock:z.lastTxBlockNumber,commitmentReady:z.commitmentReady})})()`
 	lastErr := errors.New("等待双方规范链确认、承诺和余额核验")
+	nodeIDs := []string{tx.FromNode, tx.ToNode}
+	if tx.Type == "public" {
+		nodeIDs = []string{tx.FromNode}
+		expr = `(function(){var r=eth.getTransactionReceipt(` + strconv.Quote(tx.Hash) + `),b=r?eth.getBlock(r.blockNumber):null;return JSON.stringify({transactionHash:r?r.transactionHash:"",hash:r?r.blockHash:"",canonical:b?b.hash:"",head:eth.blockNumber,block:r?r.blockNumber:0,status:r?String(r.status):""})})()`
+		lastErr = errors.New("等待普通转账发送节点规范链深度确认")
+	}
 	for ctx.Err() == nil {
 		hashes := []string{}
 		ready := true
-		for _, nodeID := range []string{tx.FromNode, tx.ToNode} {
+		for _, nodeID := range nodeIDs {
 			var n model.Node
 			for _, x := range e.Nodes {
 				if x.ID == nodeID {
@@ -600,7 +617,12 @@ func (a *API) checkRunReadiness(ctx context.Context, txID string) error {
 			if nodeID == tx.ToNode {
 				expected = tx.ExpectedReceiverBalance
 			}
-			if json.Unmarshal([]byte(raw), &sample) != nil || !validRunReadiness(sample, tx.Hash, expected, w.Confirmations) {
+			decodeErr := json.Unmarshal([]byte(raw), &sample)
+			valid := validRunReadiness(sample, tx.Hash, expected, w.Confirmations)
+			if tx.Type == "public" {
+				valid = validPublicRunReadiness(sample, tx.Hash, w.Confirmations)
+			}
+			if decodeErr != nil || !valid {
 				ready = false
 				break
 			}
@@ -610,7 +632,7 @@ func (a *API) checkRunReadiness(ctx context.Context, txID string) error {
 				break
 			}
 		}
-		if ready && len(hashes) == 2 && strings.EqualFold(hashes[0], hashes[1]) {
+		if ready && len(hashes) == len(nodeIDs) && (len(hashes) == 1 || strings.EqualFold(hashes[0], hashes[1])) {
 			return a.store.Update(func(s *model.State) error {
 				for i := range s.Transactions {
 					t := &s.Transactions[i]

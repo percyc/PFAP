@@ -154,6 +154,7 @@ type AccountSnapshot struct {
 }
 
 type Workload struct {
+	TransferPercent      int            `json:"transferPercent"`
 	Configuration        map[string]any `json:"configuration,omitempty"`
 	ObserverNodeID       string         `json:"observerNodeId,omitempty"`
 	Blocks               []RunBlock     `json:"blocks,omitempty"`

@@ -33,6 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/merkle"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/pfapmetrics"
 )
 
 // Ethash proof-of-work protocol constants.
@@ -151,6 +152,7 @@ func (ethash *Ethash) VerifyHeaders(chain consensus.ChainReader, headers []*type
 }
 
 func (ethash *Ethash) verifyHeaderWorker(chain consensus.ChainReader, headers []*types.Header, seals []bool, index int) error {
+	started := time.Now()
 	var parent *types.Header
 	if index == 0 {
 		parent = chain.GetHeader(headers[0].ParentHash, headers[0].Number.Uint64()-1)
@@ -163,7 +165,11 @@ func (ethash *Ethash) verifyHeaderWorker(chain consensus.ChainReader, headers []
 	if chain.GetHeader(headers[index].Hash(), headers[index].Number.Uint64()) != nil {
 		return nil // known block
 	}
-	return ethash.verifyHeader(chain, headers[index], parent, false, seals[index])
+	err := ethash.verifyHeader(chain, headers[index], parent, false, seals[index])
+	if err == nil && seals[index] {
+		pfapmetrics.Header(headers[index].Hash().Hex(), time.Since(started))
+	}
+	return err
 }
 
 // VerifyUncles verifies that the given block's uncles conform to the consensus

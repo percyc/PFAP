@@ -40,6 +40,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/pfapmetrics"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/hashicorp/golang-lru"
@@ -990,6 +991,12 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	// Set new head.
 	if status == CanonStatTy {
 		bc.insert(block)
+		includedAt := time.Now()
+		for _, tx := range block.Transactions() {
+			if tx.Code() == types.TransferTx || tx.Code() == types.PublicTx {
+				pfapmetrics.Included(tx.Hash().Hex(), block.Hash().Hex(), includedAt)
+			}
+		}
 	}
 	bc.futureBlocks.Remove(block.Hash())
 	return status, nil
@@ -1079,9 +1086,11 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		bstart := time.Now()
 
 		err := <-results
+		pfapBodyStarted := time.Now()
 		if err == nil {
 			err = bc.Validator().ValidateBody(block)
 		}
+		pfapBodyElapsed := time.Since(pfapBodyStarted)
 		switch {
 		case err == ErrKnownBlock:
 			// Block and state both already known. However if the current block is below
@@ -1146,6 +1155,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		}
 		// Create a new statedb using the parent block and report an
 		// error if it fails.
+		pfapExecutionStarted := time.Now()
 		var parent *types.Block
 		if i == 0 {
 			parent = bc.GetBlock(block.ParentHash(), block.NumberU64()-1)
@@ -1170,6 +1180,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 			return i, events, coalescedLogs, err
 		}
 		proctime := time.Since(bstart)
+		pfapmetrics.BlockValidation(block.Hash().Hex(), pfapBodyElapsed, time.Since(pfapExecutionStarted))
 		// Execution + post-state validation only; excludes consensus/header
 		// checks, networking, proof generation and database commit.
 		fmt.Printf("PFAP_BLOCK_EXECUTION_VALIDATION hash=%s us=%d\n", block.Hash().Hex(), time.Since(pfapValidationStarted).Nanoseconds()/1000)

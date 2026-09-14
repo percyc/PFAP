@@ -1589,7 +1589,7 @@ func transactionNodesBusy(transactions []model.Transaction, fromNode, toNode str
 		if !activeTransaction(tx.Status) {
 			continue
 		}
-		if tx.FromNode == fromNode || tx.ToNode == fromNode || (toNode != "" && (tx.FromNode == toNode || tx.ToNode == toNode)) {
+		if tx.FromNode == fromNode || (tx.Type != "public" && tx.ToNode == fromNode) || (toNode != "" && (tx.FromNode == toNode || (tx.Type != "public" && tx.ToNode == toNode))) {
 			return true
 		}
 	}
