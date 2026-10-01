@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/pfap/lab/internal/model"
@@ -17,10 +18,10 @@ var errNotBusyMonitorTimeout = errors.New("not a monitor timeout on an occupied 
 // successful sample arrives. Manual/readiness queries and hard failures retain
 // the usual fail-closed behavior.
 func (a *API) preserveBusyMonitorTimeout(ctx context.Context, experimentID, nodeID, reason, message string, started time.Time) (bool, error) {
-	if reason != "monitor" || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if !strings.HasPrefix(reason, "monitor") || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return false, nil
 	}
-	err := a.store.Update(func(s *model.State) error {
+	err := a.store.UpdateCoalesced(func(s *model.State) error {
 		for i := range s.Experiments {
 			e := &s.Experiments[i]
 			if e.ID != experimentID || e.Status != "running" {

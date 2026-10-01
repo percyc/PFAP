@@ -201,7 +201,7 @@ std::string string_proof_as_hex(libsnark::r1cs_gg_ppzksnark_proof<libff::alt_bn1
 }
 
 template <typename ppzksnark_ppT>
-r1cs_gg_ppzksnark_proof<ppzksnark_ppT> generate_transfer_proof(r1cs_gg_ppzksnark_proving_key<ppzksnark_ppT> proving_key,
+r1cs_gg_ppzksnark_proof<ppzksnark_ppT> generate_transfer_proof(const r1cs_gg_ppzksnark_proving_key<ppzksnark_ppT>& proving_key,
                                                            const Note &note_old,
                                                            const Note &note,
                                                            uint64_t v_s,
@@ -384,20 +384,15 @@ char *genTransferproof(uint64_t value,
 
 alt_bn128_pp::init_public_params();
 
-    static r1cs_gg_ppzksnark_proving_key<alt_bn128_pp> cached_pk;
-    static bool pk_loaded = false;
-    if (!pk_loaded) {
-        cached_pk = deserializeProvingKeyFromFile(prfKeyPath("transferpk.txt").c_str());
-        pk_loaded = true;
-    }
-r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
-    keypair.pk = cached_pk;
+    // Immutable, once-initialized key: do not copy a large PK for every proof.
+    static const auto cached_pk =
+        deserializeProvingKeyFromFile(prfKeyPath("transferpk.txt").c_str());
 
     struct timeval proof_start, proof_end;
     double proof_timeuse;
     gettimeofday(&proof_start, NULL);
 
-    libsnark::r1cs_gg_ppzksnark_proof<libff::alt_bn128_pp> proof = generate_transfer_proof<alt_bn128_pp>(keypair.pk,
+    libsnark::r1cs_gg_ppzksnark_proof<libff::alt_bn128_pp> proof = generate_transfer_proof<alt_bn128_pp>(cached_pk,
                                                                                                        note_old,
                                                                                                        note,
                                                                                                        value_s,
@@ -436,12 +431,9 @@ bool verifyTransferproof(char *data, char *cmtS_string, char *sn_old_string, cha
 
     alt_bn128_pp::init_public_params();
 
-    static r1cs_gg_ppzksnark_verification_key<alt_bn128_pp> cached_vk;
-    static bool vk_loaded = false;
-    if (!vk_loaded) {
-        cached_vk = deserializevkFromFile(prfKeyPath("transfervk.txt").c_str());
-        vk_loaded = true;
-    }
+    // Verification can run concurrently on pool and block-validation threads.
+    static const auto cached_vk =
+        deserializevkFromFile(prfKeyPath("transfervk.txt").c_str());
     r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
     keypair.vk = cached_vk;
 

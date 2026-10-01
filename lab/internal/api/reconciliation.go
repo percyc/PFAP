@@ -123,7 +123,7 @@ func (a *API) beginTransactionRPC(txID, stage string) error {
 }
 
 func (a *API) beginTransactionRPCWithPayerState(txID, stage, payerCommitment string) error {
-	return a.store.Update(func(s *model.State) error {
+	return a.store.UpdateCoalesced(func(s *model.State) error {
 		for i := range s.Transactions {
 			tx := &s.Transactions[i]
 			if tx.ID != txID {
@@ -131,6 +131,12 @@ func (a *API) beginTransactionRPCWithPayerState(txID, stage, payerCommitment str
 			}
 			if tx.Status != "queued" && tx.Status != "proving" {
 				return errors.New("交易已停止执行或结果待核验，未发送新指令")
+			}
+			if stage == "payer-proof" && (tx.Type != "transfer" || tx.Status != "queued" || !tx.ProvingAt.IsZero() || !tx.SubmissionAttemptedAt.IsZero()) {
+				return errors.New("付款证明已获执行准入，未重复发送")
+			}
+			if stage == "submit" && !tx.SubmissionAttemptedAt.IsZero() {
+				return errors.New("交易已获提交准入，未重复发送")
 			}
 			if payerCommitment != "" && (stage != "submit" || tx.Type != "transfer" || tx.Status != "proving" || tx.ExecutionStage != "payer-proof" || !tx.SubmissionAttemptedAt.IsZero()) {
 				return errors.New("当前交易不是等待接收方提交的付款证明阶段，未重复发送")

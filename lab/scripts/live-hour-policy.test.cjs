@@ -2,6 +2,19 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {runtimeSHA,spreadTraders,validateLayout,requireExclusiveServers}=require('./live-hour-policy.cjs');
 const sha='a'.repeat(64);
+test('deployment preflight failure preserves its cause when node manifest is absent',()=>{
+ const {networkProgress}=require('./live-hour-policy.cjs');
+ assert.throws(()=>networkProgress({status:'draft',error:'disk preflight: insufficient free disk space'},sha),/disk preflight: insufficient free disk space/);
+ assert.deepEqual(networkProgress({status:'deploying'},sha),{status:'deploying',running:0,connected:0});
+ assert.throws(()=>networkProgress({status:'failed',error:'SSH failed'},sha),/SSH failed/);
+ assert.equal(networkProgress({status:'running',artifactSha:sha,nodes:Array.from({length:100},()=>({status:'running',runtimeSha:sha,peers:99,block:12}))},sha),true);
+});
+test('mixed percent preserves explicit zero and rejects implicit coercion',()=>{
+ const {mixedPercent}=require('./live-hour-policy.cjs');
+ assert.equal(mixedPercent(undefined),null);assert.equal(mixedPercent('0'),0);
+ for(const a of ['20','40','60','80','100'])assert.equal(mixedPercent(a),Number(a));
+ for(const a of ['',null,'-20','120','0.0',' 0','NaN'])assert.throws(()=>mixedPercent(a));
+});
 function fixture(){
  const servers=Array.from({length:100},(_,i)=>({id:'s'+i,host:i===0?'local':'host'+i,hostGroup:'g'+Math.floor(i/20)}));
  const nodes=servers.map((s,i)=>({id:'n'+i,serverId:s.id,isMiner:[1,20,40,60,80].includes(i),runtimeSha:sha}));

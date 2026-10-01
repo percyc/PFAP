@@ -31,6 +31,7 @@ mkdir -p "$build_root/libsnark" "$build_root/gopath" "$build_root/gocache"
 docker run --rm \
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp \
+    -e BUILD_JOBS="${BUILD_JOBS:-2}" \
     -e LIBSNARK_BUILD="/workspace/$build_rel/libsnark" \
     -e CMAKE_EXTRA_FLAGS=-DWITH_PROCPS=OFF \
     -e PFAP_GOPATH="/workspace/$build_rel/gopath" \

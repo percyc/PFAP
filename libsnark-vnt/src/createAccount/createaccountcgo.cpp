@@ -119,7 +119,7 @@ std::string string_proof_as_hex(libsnark::r1cs_gg_ppzksnark_proof<libff::alt_bn1
 
 template <typename ppzksnark_ppT>
 r1cs_gg_ppzksnark_proof<ppzksnark_ppT> generate_createAccount_proof(
-    r1cs_gg_ppzksnark_proving_key<ppzksnark_ppT> proving_key,
+    const r1cs_gg_ppzksnark_proving_key<ppzksnark_ppT>& proving_key,
     uint256 sk_data, uint256 r_A_data, uint256 sn_A_data, uint256 cmtA_data)
 {
     typedef Fr<ppzksnark_ppT> FieldT;
@@ -179,20 +179,15 @@ char *genCreateAccountproof(char *sk_string, char *r_A_string, char *sn_A_string
 
 alt_bn128_pp::init_public_params();
 
-    static r1cs_gg_ppzksnark_proving_key<alt_bn128_pp> cached_pk;
-    static bool pk_loaded = false;
-    if (!pk_loaded) {
-        cached_pk = deserializeProvingKeyFromFile(prfKeyPath("createaccountpk.txt").c_str());
-        pk_loaded = true;
-    }
-    r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
-    keypair.pk = cached_pk;
+    // Immutable, once-initialized key: do not copy a large PK for every proof.
+    static const auto cached_pk =
+        deserializeProvingKeyFromFile(prfKeyPath("createaccountpk.txt").c_str());
 
     struct timeval proof_start, proof_end;
     double proof_timeuse;
     gettimeofday(&proof_start, NULL);
 
-    libsnark::r1cs_gg_ppzksnark_proof<libff::alt_bn128_pp> proof = generate_createAccount_proof<alt_bn128_pp>(keypair.pk, sk, r_A, sn_A, cmtA);
+    libsnark::r1cs_gg_ppzksnark_proof<libff::alt_bn128_pp> proof = generate_createAccount_proof<alt_bn128_pp>(cached_pk, sk, r_A, sn_A, cmtA);
 
     gettimeofday(&proof_end, NULL);
     proof_timeuse = proof_end.tv_sec - proof_start.tv_sec + (proof_end.tv_usec - proof_start.tv_usec)/1000000.0;
@@ -212,12 +207,9 @@ bool verifyCreateAccountproof(char *data, char *cmtA_string)
 
     alt_bn128_pp::init_public_params();
 
-    static r1cs_gg_ppzksnark_verification_key<alt_bn128_pp> cached_vk;
-    static bool vk_loaded = false;
-    if (!vk_loaded) {
-        cached_vk = deserializevkFromFile(prfKeyPath("createaccountvk.txt").c_str());
-        vk_loaded = true;
-    }
+    // Verification can run concurrently on pool and block-validation threads.
+    static const auto cached_vk =
+        deserializevkFromFile(prfKeyPath("createaccountvk.txt").c_str());
     r1cs_gg_ppzksnark_keypair<alt_bn128_pp> keypair;
     keypair.vk = cached_vk;
 

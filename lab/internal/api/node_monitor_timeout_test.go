@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -104,7 +106,12 @@ func TestSampleNodeMonitorTimeoutIntegration(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _ := newRecoveryTestAPI(t)
-			exp, node, server, _ := configureRecoverySample(t, a, "0x10")
+			exp, node, server, bin := configureRecoverySample(t, a, "0x10")
+			// A query that actually starts and times out, not an already
+			// exhausted controller-side deadline before any node contact.
+			if err := os.WriteFile(filepath.Join(bin, "geth"), []byte("#!/bin/sh\nexec sleep 10\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
 			lastSeen := time.Now().Add(-time.Minute)
 			mining := false
 			saveTestState(t, a, func(s *model.State) {
@@ -112,7 +119,7 @@ func TestSampleNodeMonitorTimeoutIntegration(t *testing.T) {
 				s.Experiments[0].Nodes[0].LastSeen = lastSeen
 				s.Transactions = []model.Transaction{{ID: "tx", ExperimentID: exp.ID, FromNode: node.ID, Status: tc.txStatus}}
 			})
-			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
 			if err := a.sampleNode(ctx, exp, node, server, tc.reason); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("expected deadline failure, got %v", err)

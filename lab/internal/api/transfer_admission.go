@@ -1,15 +1,77 @@
 package api
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pfap/lab/internal/model"
 )
 
 const unconfirmedPrivateStateMessage = "已初始化账户未恢复有效的隐私状态或承诺树，已暂停该节点的隐私交易；请检查 SN 读取和承诺树恢复，不要重复 CreateAccount"
+
+// Once the payer is frozen, allow several bounded probes under load before
+// declaring an unknown result. This changes admission waiting, never RPC retry.
+const receiverAdmissionTimeout = 5 * time.Minute
+const receiverAdmissionProbeTimeout = 60 * time.Second
+
+func probeTransferPair(ctx context.Context, timeout time.Duration, probes ...func(context.Context)) {
+	var wg sync.WaitGroup
+	for _, probe := range probes {
+		wg.Add(1)
+		go func(probe func(context.Context)) {
+			defer wg.Done()
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			if probeCtx.Err() == nil {
+				probe(probeCtx)
+			}
+		}(probe)
+	}
+	wg.Wait()
+}
+
+// Retry only a rejected liveness admission, never an RPC. Also used before
+// ordinary transaction submission and payer proof generation. Reservations
+// remain owned by the original execution goroutine throughout this wait.
+func waitTransferReceiverAdmission(ctx context.Context, interval time.Duration, admit func() error, refresh func(context.Context)) error {
+	var lastAdmission error
+	deadlineError := func() error {
+		if lastAdmission != nil {
+			return fmt.Errorf("admission wait ended (last rejection: %v): %w", lastAdmission, ctx.Err())
+		}
+		return ctx.Err()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return deadlineError()
+		}
+		err := admit()
+		if err == nil || err != errNodeUnavailable {
+			return err
+		}
+		lastAdmission = err
+		refresh(ctx)
+		if err := ctx.Err(); err != nil {
+			return deadlineError()
+		}
+		err = admit()
+		if err == nil || err != errNodeUnavailable {
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return deadlineError()
+		case <-timer.C:
+		}
+	}
+}
 
 func (a *API) beginTransferReceiverRPC(txID, payerCommitment string) error {
 	if !transactionHashPattern.MatchString(payerCommitment) {

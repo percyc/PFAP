@@ -75,8 +75,15 @@ func TestTransferHistoricalWitnessRealProof(t *testing.T) {
 	t.Log("receiver proof duration", time.Since(started))
 	cmtS := GenCMTStransfer(1, rs)
 	started = time.Now()
-	if err := VerifyTransferProof(cmtS, snA, newCMTA, &root, 1, 0, proofA); err != nil {
-		t.Fatal(err)
+	// The first verification may occur concurrently in pool/block workers.
+	checks := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func() { checks <- VerifyTransferProof(cmtS, snA, newCMTA, &root, 1, 0, proofA) }()
+	}
+	for i := 0; i < 8; i++ {
+		if err := <-checks; err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := VerifyTransferProof(cmtS, snB, newCMTB, &root, 1, 1, proofB); err != nil {
 		t.Fatal(err)

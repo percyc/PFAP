@@ -9,7 +9,10 @@ import (
 	"github.com/pfap/lab/internal/model"
 )
 
-const monitorNodeConcurrency = 8
+// At 100 nodes, eight 10-second slots can exceed the 90-second run preflight
+// freshness bound. Sixteen bounded ordinary slots keep the worst-case RPC
+// round near 70 seconds; the independent proof lane remains limited to two.
+const monitorNodeConcurrency = 16
 const monitorNodeTimeout = 10 * time.Second
 
 // Persist a small group of successful observations atomically. Avoid one full

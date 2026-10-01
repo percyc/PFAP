@@ -2,8 +2,48 @@ package api
 
 import (
 	"github.com/pfap/lab/internal/model"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestMixedWarmupRequiresOwnBroadcastsForEachPresentType(t *testing.T) {
+	now := time.Now()
+	w := model.Workload{ID: "w", Type: "mixed", TransferPercent: 40, NodeIDs: []string{"a", "b"}}
+	txs := []model.Transaction{{WorkloadID: "w", Type: "public", FromNode: "a", ToNode: "b", Status: "confirmed", ReadyAt: now}}
+	if mixedWarmupReady(txs, w, now) {
+		t.Fatal("incoming funds cannot warm b or Transfer")
+	}
+	txs = append(txs, model.Transaction{WorkloadID: "w", Type: "public", FromNode: "b", ToNode: "a", Status: "confirmed", ReadyAt: now})
+	w.TransferPercent = 0
+	if !mixedWarmupReady(txs, w, now) {
+		t.Fatal("alpha zero must not require Transfer")
+	}
+	w.TransferPercent = 40
+	if mixedWarmupReady(txs, w, now) {
+		t.Fatal("missing Transfer warmup")
+	}
+	for _, owner := range w.NodeIDs {
+		txs = append(txs, model.Transaction{WorkloadID: "w", Type: "transfer", ToNode: owner, Status: "confirmed", ReadyAt: now})
+	}
+	if !mixedWarmupReady(txs, w, now) {
+		t.Fatal("completed mixed warmup rejected")
+	}
+	w.TransferPercent = 100
+	if !mixedWarmupReady(txs[2:], w, now) {
+		t.Fatal("alpha100 must not require Public")
+	}
+	if mixedWarmupReady(txs, w, now.Add(time.Second)) {
+		t.Fatal("stale warmup counted")
+	}
+}
+
+func TestPublicExpressionHasExplicitNonzeroFee(t *testing.T) {
+	x := publicTransactionExpression("0x123", "1")
+	if !strings.Contains(x, `gasPrice:"20000000000"`) || !strings.Contains(x, `gas:21000`) {
+		t.Fatal("public transaction depends on zero-fee anonymous gas oracle", x)
+	}
+}
 
 func TestMixedQuotaEveryFiveBroadcasts(t *testing.T) {
 	for percent := 0; percent <= 100; percent += 20 {

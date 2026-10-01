@@ -1,5 +1,6 @@
 // Isolated seven-node, 20-minute measurement validation. Never replays writes.
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+const {startRunWhenIdle}=require('./run-admission.cjs');
 process.chdir(path.resolve(__dirname,'../..'));
 const base='http://127.0.0.1:8090';
 const mixed=process.argv.includes('--mixed');
@@ -34,9 +35,19 @@ async function reports(){for(const [name,p]of [['experiment','/experiments/'+eid
  await wait('network',async()=>{const e=exp(await state());if(['failed','interrupted','stop-failed'].includes(e.status))throw Error(e.error||e.status);return e.status==='running'&&e.nodes.length===7&&e.nodes.every(n=>n.status==='running'&&n.peers===6&&n.runtimeSha===sha&&n.block>=8)?true:{status:e.status,online:e.nodes.filter(n=>n.status==='running').length,connected:e.nodes.filter(n=>n.peers===6).length};},3600);
  const nodes=exp(await state()).nodes,observer=nodes.find(n=>n.serverId===local.id),miners=nodes.filter(n=>n.isMiner),traders=nodes.filter(n=>!n.isMiner&&n.id!==observer.id);
  if(miners.length!==2||traders.length!==4)throw Error('Role mismatch');
- for(const n of traders){await transaction('public',miners[0].id,n.id,'10000000000000000');await transaction('createAccount',n.id);await transaction('mint',n.id,'','1000000');}
+ // Match the full campaign's funding reserve; initialization and repeated
+ // public transfers must not exhaust the smoke account's gas budget.
+ // Funding remains serial on the miner account. Independent trader accounts
+ // can prepare concurrently; each still confirms CreateAccount before Mint.
+ for(const n of traders) await transaction('public',miners[0].id,n.id,'1000000000000000000');
+ const preparations = await Promise.allSettled(traders.map(async n => {
+  await transaction('createAccount',n.id);
+  await transaction('mint',n.id,'','1000000');
+ }));
+ const failures = preparations.filter(v=>v.status==='rejected');
+ if(failures.length)throw Error(failures.map(v=>v.reason.message).join('; '));
  await wait('fresh-accounts',async()=>{const ns=exp(await state()).nodes.filter(n=>traders.some(t=>t.id===n.id));const ready=ns.filter(n=>n.status==='running'&&n.mining===false&&!n.privateStateError&&!n.stateError&&Date.now()-Date.parse(n.lastSeen)<90000&&BigInt(n.zkBalance||'0')>=1000000n);return ready.length===4?true:{ready:ready.length};},600);
- const w=await api('/workloads',{experimentId:eid,name:mixed?'Mixed alpha40 / short validation':'Node-local metrics / 20 minute window',type:mixed?'mixed':'transfer',transferPercent:mixed?40:100,value:'1',strategy:'ready-pool',mode:'saturation',nodeIds:traders.map(n=>n.id),observerNodeId:observer.id,warmupSeconds:120,durationSeconds:duration,confirmations:6,ratePerSecond:1});runID=w.id;fs.writeFileSync(path.join(output,'run-id.txt'),runID);log('run-started',{eid,runID});
+ const w=await startRunWhenIdle(()=>api('/workloads',{experimentId:eid,name:mixed?'Mixed alpha40 / short validation':'Node-local metrics / 20 minute window',type:mixed?'mixed':'transfer',transferPercent:mixed?40:100,value:'1',strategy:'ready-pool',mode:'saturation',nodeIds:traders.map(n=>n.id),observerNodeId:observer.id,warmupSeconds:120,durationSeconds:duration,confirmations:6,ratePerSecond:1}));runID=w.id;fs.writeFileSync(path.join(output,'run-id.txt'),runID);log('run-started',{eid,runID});
  await wait('run',async()=>{const w=(await api('/workloads')).find(w=>w.id===runID);if(!w)throw Error('Missing run');if(w.invalidReason||w.blockError||!['queued','running','draining','completed'].includes(w.status))throw Error(w.invalidReason||w.blockError||w.status);return w.status==='completed'?true:{status:w.status,phase:w.phase,submitted:w.submitted,start:w.measurementStartedAt,end:w.measurementEndsAt};},5400);
  await reports();const r=JSON.parse(fs.readFileSync(path.join(output,'run.json')));if(!r.runs[0].completeWindow)throw Error('Incomplete window');
  await api('/experiments/'+eid+'/stop',{});

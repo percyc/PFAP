@@ -207,7 +207,7 @@ func fail(w http.ResponseWriter, status int, err error) {
 
 func (a *API) emit(exp, level, kind, message string, fields map[string]any) {
 	e := model.Event{ID: id("evt"), ExperimentID: exp, Level: level, Kind: kind, Message: message, Fields: fields, At: time.Now()}
-	_ = a.store.Update(func(s *model.State) error { s.Events = append(s.Events, e); return nil })
+	_ = a.store.UpdateCoalesced(func(s *model.State) error { s.Events = append(s.Events, e); return nil })
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for ch := range a.subscribers {
@@ -1388,18 +1388,37 @@ func (a *API) monitorLane(id string, proving bool) {
 			if !matchesLane {
 				return
 			}
-			_ = a.sampleNodeCommit(ctx, exp, node, servers[node.ServerID], "monitor", commit)
-		}, a.store.Update)
+			reason := "monitor"
+			if proving {
+				// Private proof generation holds geth's AccountMu for the whole
+				// operation.  A concurrent getAccountState() would contend with
+				// CreateAccount/Mint and can make the write-side TryLock report
+				// "private account busy" before any transaction is created.  The
+				// proving lane therefore samples only public liveness fields.
+				reason = "monitor-proof"
+			}
+			_ = a.sampleNodeCommit(ctx, exp, node, servers[node.ServerID], reason, commit)
+		}, a.store.UpdateCoalesced)
 	}
 }
 
 func (a *API) sampleNode(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, reason string) error {
-	return a.sampleNodeCommit(ctx, exp, node, server, reason, a.store.Update)
+	return a.sampleNodeCommit(ctx, exp, node, server, reason, a.store.UpdateCoalesced)
 }
 
 func (a *API) sampleNodeCommit(ctx context.Context, exp model.Experiment, node model.Node, server model.Server, reason string, commit func(func(*model.State) error) error) error {
+	// Cancellation before any probe is not evidence of a node failure.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	started := time.Now()
-	expr := `(function(){var z=null,e="";try{z=eth.getAccountState()}catch(x){e=x.toString()}return JSON.stringify({block:eth.blockNumber.toString(),peers:net.peerCount.toString(),mining:eth.mining,account:eth.accounts[0],publicBalance:eth.getBalance(eth.accounts[0]).toString(10),zk:z,zkError:e})})()`
+	includePrivateState := reason != "monitor-proof"
+	expr := `(function(){var z=null,e="";` + func() string {
+		if includePrivateState {
+			return `try{z=eth.getAccountState()}catch(x){e=x.toString()}`
+		}
+		return `/* private account state is intentionally not queried while a proof RPC owns AccountMu */`
+	}() + `return JSON.stringify({block:eth.blockNumber.toString(),peers:net.peerCount.toString(),mining:eth.mining,account:eth.accounts[0],publicBalance:eth.getBalance(eth.accounts[0]).toString(10),zk:z,zkError:e})})()`
 	out, err := a.orch.Attach(ctx, exp, node, server, expr)
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -1460,7 +1479,7 @@ func (a *API) sampleNodeCommit(ctx context.Context, exp model.Experiment, node m
 				}
 			}
 		}
-		if privateAccountInitialized(s.Transactions, exp.ID, current) && (sample.ZK == nil || !privateStateOnChain(sample.ZK.LastTxBlock) || (sample.ZK.CommitmentReady != nil && !*sample.ZK.CommitmentReady) || (current.RecoveryWarning != "" && sample.ZK.CommitmentReady == nil)) {
+		if includePrivateState && privateAccountInitialized(s.Transactions, exp.ID, current) && (sample.ZK == nil || !privateStateOnChain(sample.ZK.LastTxBlock) || (sample.ZK.CommitmentReady != nil && !*sample.ZK.CommitmentReady) || (current.RecoveryWarning != "" && sample.ZK.CommitmentReady == nil)) {
 			privacyErr = errors.New(unconfirmedPrivateStateMessage)
 		}
 	})
@@ -1489,10 +1508,12 @@ func (a *API) sampleNodeCommit(ctx context.Context, exp model.Experiment, node m
 				}
 				n.Account = sample.Account
 				n.PublicBalance = sample.PublicBalance
-				n.StateError = sample.ZKError
-				n.PrivateStateError = ""
-				if privacyErr != nil {
-					n.PrivateStateError = privacyErr.Error()
+				if includePrivateState {
+					n.StateError = sample.ZKError
+					n.PrivateStateError = ""
+					if privacyErr != nil {
+						n.PrivateStateError = privacyErr.Error()
+					}
 				}
 				n.LastSeen = now
 				if sample.ZK != nil {
@@ -1502,7 +1523,7 @@ func (a *API) sampleNodeCommit(ctx context.Context, exp model.Experiment, node m
 					n.ZKBalance = sample.ZK.Balance
 					n.Commitment = sample.ZK.Commitment
 					n.LastTxBlock = sample.ZK.LastTxBlock
-					if firstSample || reason != "monitor" || oldBalance != n.ZKBalance || oldCommitment != n.Commitment {
+					if firstSample || !strings.HasPrefix(reason, "monitor") || oldBalance != n.ZKBalance || oldCommitment != n.Commitment {
 						s.AccountSnapshots = append(s.AccountSnapshots, model.AccountSnapshot{ID: id("snap"), ExperimentID: exp.ID, NodeID: node.ID, Account: n.Account, PublicBalance: n.PublicBalance, ZKBalance: n.ZKBalance, Commitment: n.Commitment, LastTxBlock: n.LastTxBlock, ChainBlock: block, Reason: reason, At: now})
 					}
 				}
@@ -1641,7 +1662,7 @@ func (a *API) runTransaction(t model.Transaction) {
 	}
 	defer func() {
 		if t.RunPhase != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), runReadinessTimeout)
 			_ = a.checkRunReadiness(ctx, t.ID)
 			cancel()
 		}
@@ -1766,13 +1787,22 @@ func (a *API) runTransaction(t model.Transaction) {
 			a.finishTx(t.ID, "failed", "", errors.New("destination node/account is required"))
 			return
 		}
-		expr = "eth.sendPublicTransaction({from:eth.accounts[0],to:" + strconv.Quote(toNode.Account) + ",value:" + strconv.Quote(value) + "})"
+		expr = publicTransactionExpression(toNode.Account, value)
 	}
 	if err := a.setTxCommand(t.ID, node.Name+": "+expr); err != nil {
 		_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("交易指令保存失败，未发送交易：%w", err))
 		return
 	}
-	if err := a.beginTransactionRPC(t.ID, "submit"); err != nil {
+	admissionCtx, admissionCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	admissionErr := waitTransferReceiverAdmission(admissionCtx, 2*time.Second, func() error {
+		return a.beginTransactionRPC(t.ID, "submit")
+	}, func(refreshCtx context.Context) {
+		probeTransferPair(refreshCtx, 30*time.Second, func(probeCtx context.Context) {
+			_ = a.sampleNode(probeCtx, exp, node, server, "transaction-recheck:"+t.ID)
+		})
+	})
+	admissionCancel()
+	if err := admissionErr; err != nil {
 		_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("未发送交易：%w", err))
 		return
 	}
@@ -1840,7 +1870,12 @@ func (a *API) runTransaction(t model.Transaction) {
 					_ = a.markTransactionUnknown(t.ID, hash, err)
 					return
 				}
-				a.refreshTransactionNodes(exp, node, toNode, server, t.ID)
+				// Ready-pool execution checks and samples the reserved accounts
+				// in checkRunReadiness before releasing them. Do not duplicate
+				// those probes (or probe an unreserved Public recipient).
+				if t.RunPhase == "" {
+					a.refreshTransactionNodes(exp, node, toNode, server, t.ID)
+				}
 				if t.Type != "public" {
 					a.waitForNextBlock(ctx, exp, node, server, block)
 				}
@@ -1903,7 +1938,23 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		a.finishTx(t.ID, "failed", "", fmt.Errorf("receiver %s has no private account state on chain; run CreateAccount first", receiver.Name))
 		return
 	}
-	if err := a.beginTransactionRPC(t.ID, "payer-proof"); err != nil {
+	// A monitor can change liveness after preflight but before durable RPC
+	// admission. Keep both reservations while rechecking; no proof RPC has
+	// run yet, and the RPC below is executed only once after admission.
+	payerAdmissionCtx, payerAdmissionCancel := context.WithTimeout(ctx, 2*time.Minute)
+	payerAdmissionErr := waitTransferReceiverAdmission(payerAdmissionCtx, 2*time.Second, func() error {
+		return a.beginTransactionRPC(t.ID, "payer-proof")
+	}, func(refreshCtx context.Context) {
+		probeTransferPair(refreshCtx, 30*time.Second,
+			func(probeCtx context.Context) {
+				_ = a.sampleNode(probeCtx, exp, payer, payerServer, "transfer-recheck:"+t.ID)
+			},
+			func(probeCtx context.Context) {
+				_ = a.sampleNode(probeCtx, exp, receiver, receiverServer, "transfer-recheck:"+t.ID)
+			})
+	})
+	payerAdmissionCancel()
+	if err := payerAdmissionErr; err != nil {
 		_ = a.finishTx(t.ID, "failed", "", fmt.Errorf("未开始付款方证明：%w", err))
 		return
 	}
@@ -1936,11 +1987,28 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 		return
 	}
 	expr := "eth.sendTransferTransaction({from:eth.accounts[0],value:" + strconv.Quote(value) + ",rs:'0x01',cmtANew:" + strconv.Quote(proof.CMT) + ",snAOld:" + strconv.Quote(proof.SN) + ",proofA:" + strconv.Quote(proof.Proof) + ",proofRoot:" + strconv.Quote(proof.Root) + ",proofBlock:" + strconv.Quote(proof.Block) + "})"
+	if err := a.saveTransferProof(t, exp.ArtifactSHA, raw); err != nil {
+		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("保存付款证明失败，未提交接收方交易：%w", err))
+		return
+	}
 	payerProofUs, payerVerifyUs := orchestrator.ParseProofTimesMicros(out)
 	if logProofUs, logVerifyUs, timingErr := a.orch.RecentProofTimings(ctx, exp, payer, payerServer); timingErr == nil {
 		payerProofUs, payerVerifyUs = logProofUs, logVerifyUs
 	}
-	if err := a.beginTransferReceiverRPC(t.ID, proof.CMT); err != nil {
+	admissionCtx, admissionCancel := context.WithTimeout(ctx, receiverAdmissionTimeout)
+	admissionErr := waitTransferReceiverAdmission(admissionCtx, 2*time.Second, func() error {
+		return a.beginTransferReceiverRPC(t.ID, proof.CMT)
+	}, func(refreshCtx context.Context) {
+		probeTransferPair(refreshCtx, receiverAdmissionProbeTimeout,
+			func(probeCtx context.Context) {
+				_ = a.sampleNode(probeCtx, exp, payer, payerServer, "transfer-recheck:"+t.ID)
+			},
+			func(probeCtx context.Context) {
+				_ = a.sampleNode(probeCtx, exp, receiver, receiverServer, "transfer-recheck:"+t.ID)
+			})
+	})
+	admissionCancel()
+	if err := admissionErr; err != nil {
 		_ = a.markTransactionUnknown(t.ID, "", fmt.Errorf("付款方已生成状态，接收方提交未执行：%w", err))
 		return
 	}
@@ -1999,7 +2067,9 @@ func (a *API) runTransfer(t model.Transaction, exp model.Experiment, payer, rece
 					_ = a.markTransactionUnknown(t.ID, hash, err)
 					return
 				}
-				a.refreshTransactionNodes(exp, payer, receiver, payerServer, t.ID)
+				if t.RunPhase == "" {
+					a.refreshTransactionNodes(exp, payer, receiver, payerServer, t.ID)
+				}
 				if t.RunPhase == "" {
 					a.waitForNextBlock(ctx, exp, receiver, receiverServer, block)
 				}
@@ -2098,7 +2168,7 @@ func (a *API) confirmTx(id, hash, receipt, block, receiptStatus string, proofUs,
 		finalStatus = "failed"
 		txErr = errors.New("transaction reverted on chain")
 	}
-	return a.store.Update(func(s *model.State) error {
+	return a.store.UpdateCoalesced(func(s *model.State) error {
 		for j := range s.Transactions {
 			if s.Transactions[j].ID == id {
 				if s.Transactions[j].RunPhase != "" && s.Transactions[j].ReadyAt.IsZero() {
@@ -2124,7 +2194,7 @@ func (a *API) confirmTx(id, hash, receipt, block, receiptStatus string, proofUs,
 }
 
 func (a *API) setTransactionBreakdown(id string, values map[string]int64) {
-	_ = a.store.Update(func(s *model.State) error {
+	_ = a.store.UpdateCoalesced(func(s *model.State) error {
 		for i := range s.Transactions {
 			tx := &s.Transactions[i]
 			if tx.ID != id {
@@ -2541,7 +2611,7 @@ func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 	}(), "confirmedTPS": tps, "latencyP50Ms": percentile(latencies, .50), "latencyP95Ms": percentile(latencies, .95), "proofP50Us": percentile(proofsUs, .50), "proofP95Us": percentile(proofsUs, .95), "verifyP50Us": percentile(verifiesUs, .50), "verifyP95Us": percentile(verifiesUs, .95), "chainConfirmP50Us": percentile(chainConfirmUs, .50), "chainConfirmP95Us": percentile(chainConfirmUs, .95)})
 }
 func (a *API) updateTx(id, status, hash, errText string) error {
-	return a.store.Update(func(s *model.State) error {
+	return a.store.UpdateCoalesced(func(s *model.State) error {
 		for i := range s.Transactions {
 			if s.Transactions[i].ID == id {
 				if s.Transactions[i].Receipt != "" || s.Transactions[i].Status == "confirmed" {
@@ -2566,7 +2636,7 @@ func (a *API) updateTx(id, status, hash, errText string) error {
 }
 
 func (a *API) setTxCommand(id, command string) error {
-	return a.store.Update(func(s *model.State) error {
+	return a.store.UpdateCoalesced(func(s *model.State) error {
 		for i := range s.Transactions {
 			if s.Transactions[i].ID == id {
 				s.Transactions[i].Command = command

@@ -14,7 +14,7 @@ func obsoleteNodeSample(exp model.Experiment, node model.Node, started time.Time
 }
 
 func (a *API) setNodeSampleError(experimentID, nodeID, message, reason string, started time.Time) {
-	_ = a.store.Update(func(s *model.State) error {
+	_ = a.store.UpdateCoalesced(func(s *model.State) error {
 		for i := range s.Experiments {
 			e := &s.Experiments[i]
 			if e.ID != experimentID {

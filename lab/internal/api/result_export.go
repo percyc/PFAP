@@ -100,7 +100,7 @@ func safeSystemInfo(value any) map[string]any {
 	return out
 }
 func safeConfiguration(c map[string]any) map[string]any {
-	out := fields(c, "networkId minerCount minerMode artifactSha recoveryArtifactSha capturedAt scheduler blockSampling blockSamplingConfirmations blockWarmupReorgs blockWarmupResetAt admissionSamples admissionSampleAt")
+	out := fields(c, "networkId minerCount minerMode artifactSha recoveryArtifactSha capturedAt scheduler transferPercent publicGasPriceWei publicGasLimit blockSampling blockSamplingConfirmations blockWarmupReorgs blockWarmupResetAt admissionSamples admissionSampleAt")
 	for _, key := range []string{"nodes", "servers"} {
 		list := []map[string]any{}
 		b, _ := json.Marshal(c[key])
@@ -120,7 +120,7 @@ func safeConfiguration(c map[string]any) map[string]any {
 	return out
 }
 func safeRun(w model.Workload) map[string]any {
-	out := fields(object(w), "id experimentId name type value strategy mode nodeIds observerNodeId warmupSeconds durationSeconds confirmations ratePerSecond phase status submitted attempted skippedBusy skippedUnavailable stopRequested createdAt startedAt measurementStartedAt measurementEndsAt submissionStoppedAt finishedAt")
+	out := fields(object(w), "id experimentId name type transferPercent value strategy mode nodeIds observerNodeId warmupSeconds warmupTimeoutSeconds durationSeconds confirmations ratePerSecond phase status submitted attempted skippedBusy skippedUnavailable stopRequested createdAt startedAt measurementStartedAt measurementEndsAt submissionStoppedAt finishedAt")
 	out["initialConfiguration"] = safeConfiguration(w.Configuration)
 	out["hasAnomaly"] = w.Error != "" || w.InvalidReason != "" || w.BlockError != ""
 	out["anomalyFlags"] = map[string]bool{"submissionStopped": w.StopRequested, "windowInvalid": w.InvalidReason != "", "blockCollectionAnomaly": w.BlockError != "", "executionAnomaly": w.Error != ""}

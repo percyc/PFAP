@@ -11,6 +11,7 @@ way to coordinate anonymous transactions across nodes.
 
 [Lab setup & user guide](lab/README.md) ·
 [One-command 100-node workflow](lab/ONE_CLICK_EXPERIMENT.md) ·
+[Native memory validation](lab/NATIVE_MEMORY_VALIDATION.md) ·
 [Advanced CLI / RPC reference](docs/COMMAND_LINE.md)
 
 ## Explore PFAP Lab

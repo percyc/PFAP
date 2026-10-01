@@ -3,11 +3,20 @@ package api
 import (
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pfap/lab/internal/model"
 )
+
+// Anonymous zero-fee traffic can drive eth.gasPrice to zero. Local acceptance
+// then masks remote pool rejection of Public transactions. Use a reproducible
+// 20 Gwei for Lab transfers. miner.start raises the miner pool threshold to
+// eth.DefaultConfig.GasPrice (18 Gwei), NOT core.DefaultTxPoolConfig.PriceLimit.
+func publicTransactionExpression(account, value string) string {
+	return "eth.sendPublicTransaction({from:eth.accounts[0],to:" + strconv.Quote(account) + ",value:" + strconv.Quote(value) + ",gas:21000,gasPrice:\"20000000000\"})"
+}
 
 func validPublicRunReadiness(x readinessSample, hash string, confirmations int) bool {
 	return confirmations > 0 && hash != "" && strings.EqualFold(x.TransactionHash, hash) && x.Hash != "" && strings.EqualFold(x.Hash, x.Canonical) && (x.Status == "0x1" || x.Status == "1") && x.Block > 0 && x.Head >= x.Block && x.Head-x.Block+1 >= uint64(confirmations)
@@ -23,6 +32,37 @@ func mixedNextType(percent, index, count int) string {
 		return "transfer"
 	}
 	return "public"
+}
+
+// Incoming Public funds alone do not warm a node's submission path. Require
+// each broadcaster to finish every type present in the configured mixture.
+func mixedWarmupReady(transactions []model.Transaction, w model.Workload, since time.Time) bool {
+	if w.Type != "mixed" {
+		return true
+	}
+	seen := map[string]map[string]bool{}
+	for _, t := range transactions {
+		if t.WorkloadID != w.ID || t.Status != "confirmed" || t.ReadyAt.IsZero() || t.ReadyAt.Before(since) {
+			continue
+		}
+		owner := t.FromNode
+		if t.Type == "transfer" {
+			owner = t.ToNode
+		}
+		if seen[owner] == nil {
+			seen[owner] = map[string]bool{}
+		}
+		seen[owner][t.Type] = true
+	}
+	for _, n := range w.NodeIDs {
+		if w.TransferPercent > 0 && !seen[n]["transfer"] {
+			return false
+		}
+		if w.TransferPercent < 100 && !seen[n]["public"] {
+			return false
+		}
+	}
+	return true
 }
 
 func chooseRunTask(s model.State, e model.Experiment, w model.Workload, now time.Time) (string, model.Node, model.Node, bool) {

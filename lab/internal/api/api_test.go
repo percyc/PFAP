@@ -110,7 +110,9 @@ func TestBatchTrustRejectsLocalServer(t *testing.T) {
 		state.Servers = []model.Server{{ID: "srv-local", Name: "controller", Host: "local"}}
 		return nil
 	})
-	h := New(s).Handler(http.NotFoundHandler())
+	// This route test must not launch a permanent local-server monitor that
+	// writes to its temporary store concurrently with test cleanup.
+	h := (&API{store: s, subscribers: map[chan model.Event]struct{}{}}).Handler(http.NotFoundHandler())
 	req := httptest.NewRequest(http.MethodPost, "/api/servers/batch/trust-host-keys", strings.NewReader(`{"ids":["srv-local"]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

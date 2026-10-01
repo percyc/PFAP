@@ -134,6 +134,9 @@ func VerifyMintProof(snaold *common.Hash, rtcmt *common.Hash, cmtnew *common.Has
 	cmtA_c := C.CString(common.ToHex(cmtnew[:]))
 	sn_old_c := C.CString(common.ToHex(snaold.Bytes()[:]))
 	rt_c := C.CString(common.ToHex(rtcmt[:]))
+	for _, p := range []*C.char{cproof, cmtA_c, sn_old_c, rt_c} {
+		defer C.free(unsafe.Pointer(p))
+	}
 	value_s_c := C.ulong(value)
 	tf := C.verifyMintproof(cproof, sn_old_c, rt_c, cmtA_c, value_s_c)
 	if tf == false {
@@ -165,6 +168,9 @@ func VerifyRedeemProof(snaold *common.Hash, rtcmt *common.Hash, cmtnew *common.H
 	cmtA_c := C.CString(common.ToHex(cmtnew[:]))
 	sn_old_c := C.CString(common.ToHex(snaold.Bytes()[:]))
 	rt_c := C.CString(common.ToHex(rtcmt[:]))
+	for _, p := range []*C.char{cproof, cmtA_c, sn_old_c, rt_c} {
+		defer C.free(unsafe.Pointer(p))
+	}
 	value_s_c := C.ulong(value)
 
 	tf := C.verifyRedeemproof(cproof, sn_old_c, rt_c, cmtA_c, value_s_c)
@@ -209,6 +215,7 @@ func ComputePRF(sk []byte, r []byte) *common.Hash {
 	defer C.free(unsafe.Pointer(r_c))
 
 	sn_c := C.computePRF(addr_c, r_c)
+	defer C.smtFree(sn_c)
 	sn_go := C.GoString(sn_c)
 	//res := []byte(cmtA_go)
 	res, _ := hex.DecodeString(sn_go)
@@ -225,6 +232,8 @@ func GenRT(CMTSForMerkle []*common.Hash) common.Hash {
 	}
 	cmtsM := C.CString(cmtArray)
 	rtC := C.genRoot(cmtsM, C.int(len(CMTSForMerkle))) //--zy
+	defer C.free(unsafe.Pointer(cmtsM))
+	defer C.smtFree(rtC)
 	rtGo := C.GoString(rtC)
 
 	res, _ := hex.DecodeString(rtGo)   //返回32长度 []byte  一个byte代表两位16进制数
@@ -400,7 +409,14 @@ func GenMintProof(ValueOld uint64, RAold *common.Hash, SNAnew *common.Hash, RAne
 	nC := C.int(len(CMTSForMerkle))
 	RT_c := C.CString(common.ToHex(RTcmt))
 
-	cproof := C.genMintproof(value_c, value_old_c, sn_old_c, r_old_c, sn_c, r_c, cmtA_old_c, cmtA_c, value_s_c, sk_c, cmtsM, nC, RT_c)
+	var cproof *C.char
+	runNativeProof(func() {
+		cproof = C.genMintproof(value_c, value_old_c, sn_old_c, r_old_c, sn_c, r_c, cmtA_old_c, cmtA_c, value_s_c, sk_c, cmtsM, nC, RT_c)
+	})
+	defer C.smtFree(cproof)
+	for _, p := range []*C.char{sn_old_c, r_old_c, sn_c, r_c, cmtA_old_c, cmtA_c, sk_c, cmtsM, RT_c} {
+		defer C.free(unsafe.Pointer(p))
+	}
 
 	var goproof string
 	goproof = C.GoString(cproof)
@@ -432,7 +448,14 @@ func GenRedeemProof(ValueOld uint64, RAold *common.Hash, SNAnew *common.Hash, RA
 	nC := C.int(len(CMTSForMerkle))
 	RT_c := C.CString(common.ToHex(RTcmt))
 
-	cproof := C.genRedeemproof(value_c, value_old_c, sn_old_c, r_old_c, sn_c, r_c, cmtA_old_c, cmtA_c, value_s_c, SK_c, cmtsM, nC, RT_c)
+	var cproof *C.char
+	runNativeProof(func() {
+		cproof = C.genRedeemproof(value_c, value_old_c, sn_old_c, r_old_c, sn_c, r_c, cmtA_old_c, cmtA_c, value_s_c, SK_c, cmtsM, nC, RT_c)
+	})
+	defer C.smtFree(cproof)
+	for _, p := range []*C.char{sn_old_c, r_old_c, sn_c, r_c, cmtA_old_c, cmtA_c, SK_c, cmtsM, RT_c} {
+		defer C.free(unsafe.Pointer(p))
+	}
 
 	var goproof string
 	goproof = C.GoString(cproof)
@@ -528,7 +551,10 @@ func genTransferProof(ValueOld uint64, RAold *common.Hash, SNAnew *common.Hash, 
 		defer C.free(unsafe.Pointer(p))
 	}
 
-	cproof := C.genTransferproof(value_c, value_old_c, sn_old_c, r_old_c, sn_c, r_new_c, cmtA_old_c, cmtA_c, value_s_c, sk_c, r_s_c, cmtsM, nC, RT_c, type_c)
+	var cproof *C.char
+	runNativeProof(func() {
+		cproof = C.genTransferproof(value_c, value_old_c, sn_old_c, r_old_c, sn_c, r_new_c, cmtA_old_c, cmtA_c, value_s_c, sk_c, r_s_c, cmtsM, nC, RT_c, type_c)
+	})
 	defer C.smtFree(cproof)
 	var goproof string
 	goproof = C.GoString(cproof)
@@ -571,7 +597,12 @@ func GenCreateAccountProof(SK *common.Hash, RA *common.Hash, SNA *common.Hash, C
 	sn_A_c := C.CString(common.ToHex(SNA[:]))
 	cmtA_c := C.CString(common.ToHex(CMTA[:]))
 
-	cproof := C.genCreateAccountproof(sk_c, r_A_c, sn_A_c, cmtA_c)
+	var cproof *C.char
+	runNativeProof(func() { cproof = C.genCreateAccountproof(sk_c, r_A_c, sn_A_c, cmtA_c) })
+	defer C.smtFree(cproof)
+	for _, p := range []*C.char{sk_c, r_A_c, sn_A_c, cmtA_c} {
+		defer C.free(unsafe.Pointer(p))
+	}
 	var goproof string
 	goproof = C.GoString(cproof)
 	return []byte(goproof)
@@ -580,6 +611,8 @@ func GenCreateAccountProof(SK *common.Hash, RA *common.Hash, SNA *common.Hash, C
 func VerifyCreateAccountProof(cmtA *common.Hash, proof []byte) error {
 	cproof := C.CString(string(proof))
 	cmtA_c := C.CString(common.ToHex(cmtA[:]))
+	defer C.free(unsafe.Pointer(cproof))
+	defer C.free(unsafe.Pointer(cmtA_c))
 
 	tf := C.verifyCreateAccountproof(cproof, cmtA_c)
 	if tf == false {

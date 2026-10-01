@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pfap/lab/internal/model"
@@ -54,13 +55,17 @@ type fileOperations struct {
 }
 
 type Store struct {
-	mu        sync.RWMutex
-	path      string
-	data      []byte      // Immutable JSON: neither callbacks nor views can retain aliases.
-	snapshot  model.State // Immutable decoded representation of the same committed JSON.
-	persisted bool
-	health    Health
-	files     fileOperations
+	coalescedMu       sync.Mutex
+	coalescedQueue    []*coalescedUpdate
+	coalescedFlushing bool
+	mu                sync.RWMutex
+	path              string
+	data              []byte      // Immutable JSON: neither callbacks nor views can retain aliases.
+	snapshot          model.State // Immutable decoded representation of the same committed JSON.
+	published         atomic.Pointer[model.State]
+	persisted         bool
+	health            Health
+	files             fileOperations
 }
 
 func (s *Store) DataDir() string { return filepath.Dir(s.path) }
@@ -85,6 +90,7 @@ func Open(path string) (*Store, error) {
 			syncDir:    syncDirectory,
 		},
 	}
+	s.published.Store(&initial)
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -97,14 +103,14 @@ func Open(path string) (*Store, error) {
 	}
 	s.data, s.persisted = b, true
 	s.snapshot = initial
+	s.published.Store(&initial)
 	return s, nil
 }
 
 func (s *Store) View(fn func(model.State)) {
-	s.mu.RLock()
-	committed := s.snapshot
-	s.mu.RUnlock()
-	fn(cloneSnapshot(committed))
+	// Readers see a fully committed, immutable snapshot without queuing behind
+	// encoding/fsync of the next update. Mutating admission still uses Update.
+	fn(cloneSnapshot(*s.published.Load()))
 }
 
 func (s *Store) Update(fn func(*model.State) error) error {
@@ -120,7 +126,10 @@ func (s *Store) Update(fn func(*model.State) error) error {
 	if len(next.AccountSnapshots) > 5000 {
 		next.AccountSnapshots = next.AccountSnapshots[len(next.AccountSnapshots)-5000:]
 	}
-	b, err := json.MarshalIndent(next, "", "  ")
+	// This is a hot durable snapshot, not a human-facing export. Avoid writing
+	// indentation on every monitor/admission update; retain all data, backups,
+	// fsyncs and the same atomic commit boundary.
+	b, err := json.Marshal(next)
 	if err != nil {
 		return s.persistenceError(fmt.Errorf("encode store state: %w", err))
 	}
@@ -178,6 +187,7 @@ func (s *Store) save(b []byte, validated model.State) error {
 	// memory behind the visible primary, even though durability is uncertain.
 	s.data, s.persisted = b, true
 	s.snapshot = validated
+	s.published.Store(&validated)
 	if err := s.files.syncDir(dir); err != nil {
 		return fmt.Errorf("sync store directory after commit: %w", err)
 	}

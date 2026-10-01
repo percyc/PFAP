@@ -12,6 +12,17 @@ import (
 	"time"
 )
 
+func TestMixedExportPreservesZeroAlphaAndFeeConfiguration(t *testing.T) {
+	run := safeRun(model.Workload{Type: "mixed", TransferPercent: 0, Configuration: map[string]any{"transferPercent": 0, "publicGasPriceWei": "20000000000", "publicGasLimit": 21000, "scheduler": "mixed", "password": "secret"}})
+	if alpha, ok := run["transferPercent"]; !ok || alpha != float64(0) {
+		t.Fatalf("missing zero alpha: %v", run)
+	}
+	config := run["initialConfiguration"].(map[string]any)
+	if config["transferPercent"] != 0 || config["publicGasPriceWei"] != "20000000000" || config["password"] != nil {
+		t.Fatal(config)
+	}
+}
+
 func TestExportsAreScopedAndRedacted(t *testing.T) {
 	a, now := runFixture(t)
 	saveTestState(t, a, func(s *model.State) {

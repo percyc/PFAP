@@ -14,10 +14,39 @@ test('eight metrics use receiver monotonic sample and equal per-block weighting'
 test('missing samples are explicit, never fabricated as zero',()=>{
  const f=fixture();f.records.receiver=[];f.records.m2=[];const r=summarize(f.report,f.w,f.nodes,f.records);assert.equal(r.completeSamples,false);assert.equal(r.metrics.meanFirstInclusionSeconds,null);assert.deepEqual(r.coverage.missingDelays,['t1']);
 });
-test('reorg, restarts, incomplete window and chain gaps reject the simplified result',()=>{
- for(const change of [f=>f.records.receiver.push({kind:'inclusion',session:'one',hash:'tx1',block:'orphan',ns:1}),f=>f.records.receiver.push({kind:'broadcast',session:'two'}),f=>f.report.runs[0].completeWindow=false,f=>f.report.runs[0].blocks[1].parentHash='wrong']){const f=fixture();change(f);assert.throws(()=>summarize(f.report,f.w,f.nodes,f.records));}
+test('restarts, incomplete window and chain gaps reject the simplified result',()=>{
+ for(const change of [f=>f.records.receiver.push({kind:'broadcast',session:'two'}),f=>f.report.runs[0].completeWindow=false,f=>f.report.runs[0].blocks[1].parentHash='wrong']){const f=fixture();change(f);assert.throws(()=>summarize(f.report,f.w,f.nodes,f.records));}
+});
+test('orphaned first inclusion remains primary with optional final timing separately disclosed',()=>{
+ for(const hasFinal of [true,false]){
+  const f=fixture();if(!hasFinal)f.records.receiver=[];
+  f.records.receiver.push({kind:'inclusion',session:'one',hash:'tx1',block:'orphan',ns:1e9});
+  const r=summarize(f.report,f.w,f.nodes,f.records);
+  assert.equal(r.completeSamples,true);assert.equal(r.metrics.meanFirstInclusionSeconds,1);
+  assert.equal(r.reorgObservations[0].firstReorged,true);
+  assert.equal(r.reorgObservations[0].finalMatchingSeconds,hasFinal?2:null);
+  assert.equal(r.reorgObservations[0].additionalFinalInclusionSeconds,hasFinal?1:null);
+  assert.deepEqual(r.finalInclusionCoverage.missing,hasFinal?[]:['t1']);
+ }
+});
+test('invalid inclusion timing is never silently discarded',()=>{
+ for(const ns of [NaN,Infinity,-1,1.5,Number.MAX_SAFE_INTEGER+1]){
+  const f=fixture();f.records.receiver.push({kind:'inclusion',session:'one',hash:'tx1',block:'b1',ns});
+  assert.throws(()=>summarize(f.report,f.w,f.nodes,f.records),/Invalid inclusion/);
+ }
 });
 test('percentiles preserve documented zero-based floor convention',()=>{assert.equal(percentile([4,1,3,2],.9),3);assert.equal(percentile([],.95),null);});
+test('later competing inclusion is disclosed without replacing canonical first inclusion',()=>{
+ const f=fixture();f.records.receiver.unshift({kind:'inclusion',session:'one',hash:'tx1',block:'other',ns:3e9});
+ const r=summarize(f.report,f.w,f.nodes,f.records);
+ assert.equal(r.completeSamples,true);assert.equal(r.metrics.meanFirstInclusionSeconds,2);
+ assert.equal(r.reorgObservations.length,1);assert.equal(r.reorgObservations[0].firstObservedBlock,'b1');
+ assert.deepEqual(r.reorgObservations[0].observations,[{block:'b1',seconds:2},{block:'other',seconds:3}]);
+});
+test('ambiguous simultaneous competing inclusion remains rejected',()=>{
+ const f=fixture();f.records.receiver.push({kind:'inclusion',session:'one',hash:'tx1',block:'other',ns:2e9});
+ assert.throws(()=>summarize(f.report,f.w,f.nodes,f.records),/Reorg/);
+});
 test('header-time window requires observations on both boundaries',()=>{const f=fixture();f.report.runs[0].blocks.pop();assert.throws(()=>summarize(f.report,f.w,f.nodes,f.records),/bracket/);});
 test('alpha zero uses Public sender timing and preserves zero rather than defaulting to 100',()=>{
  const f=fixture();Object.assign(f.w,{type:'mixed',transferPercent:0,nodeIds:['sender','receiver']});

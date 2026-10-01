@@ -1,7 +1,7 @@
 #ifndef POSEIDON_SMT_HPP_
 #define POSEIDON_SMT_HPP_
 
-#include <map>
+#include <memory>
 #include <vector>
 #include <string>
 #include "poseidon.hpp"
@@ -20,8 +20,8 @@
 //  * Empty subtree roots are precomputed (empty_root[d]) so that proofs and the
 //    root can be produced without materializing 2^256 nodes.
 //
-// Because only ~ (#total ZK txs) leaves are ever set, storage is sparse: we
-// keep a map of "occupied" internal node values keyed by (level, index-as-hex).
+// Immutable path-copying nodes share unchanged subtrees between snapshots.
+// Cloning a tree copies its root pointer, not all historical commitments.
 
 namespace poseidon {
 
@@ -41,9 +41,7 @@ public:
 
     // The current root (height SMT_DEPTH).
     FieldT root() const {
-        auto it = nodes_.find(node_key(SMT_DEPTH, std::vector<bool>()));
-        if (it != nodes_.end()) return it->second;
-        return empty_root_[SMT_DEPTH];
+        return value(root_, SMT_DEPTH);
     }
 
     uint256 root_uint256() const {
@@ -66,27 +64,7 @@ public:
     // Insert a commitment: set its leaf to 1 and update ancestors to the root.
     void insert(const uint256& cmt) {
         std::vector<bool> bits = compute_path_bits(cmt);
-        // Walk from leaf (level 0 of node height) up to the root.
-        // We store node values along the path; siblings stay empty/occupied as-is.
-        // current value at the leaf:
-        FieldT cur = FieldT::one();
-        // path of branch decisions from root to leaf is bits[0..255].
-        // The leaf is at height 0; its parent at height 1, ... root at height 256.
-        // index-prefix for a node at height h is bits[0 .. 256-h-1].
-        // Set leaf node value.
-        set_node(0, prefix(bits, SMT_DEPTH), cur);
-
-        for (size_t h = 1; h <= SMT_DEPTH; h++) {
-            // The node at height h covering our leaf has prefix bits[0..256-h-1].
-            std::vector<bool> pfx = prefix(bits, SMT_DEPTH - h);
-            // Its two children at height h-1: left prefix = pfx + 0, right = pfx + 1.
-            std::vector<bool> lpfx = pfx; lpfx.push_back(false);
-            std::vector<bool> rpfx = pfx; rpfx.push_back(true);
-            FieldT lval = get_node(h-1, lpfx);
-            FieldT rval = get_node(h-1, rpfx);
-            FieldT parent = poseidon_hash2(lval, rval);
-            set_node(h, pfx, parent);
-        }
+        root_ = insert_path(root_, bits, 0);
     }
 
     // Membership proof for a commitment that has been inserted.
@@ -106,17 +84,15 @@ public:
         std::vector<bool> bits = compute_path_bits(cmt);
         pr.path_bits = bits;
         pr.path = uint256_from_field(compute_path_field(cmt));
-        pr.found = (get_node(0, prefix(bits, SMT_DEPTH)) == FieldT::one());
-
         pr.siblings.resize(SMT_DEPTH);
-        for (size_t h = 1; h <= SMT_DEPTH; h++) {
-            std::vector<bool> pfx = prefix(bits, SMT_DEPTH - h);
-            bool bit = bits[SMT_DEPTH - h]; // branch taken at this level (0=left child)
-            std::vector<bool> sibpfx = pfx;
-            sibpfx.push_back(!bit);
-            FieldT sib = get_node(h-1, sibpfx);
-            pr.siblings[h-1] = uint256_from_field(sib);
+        auto node = root_;
+        for (size_t depth = 0; depth < SMT_DEPTH; depth++) {
+            const size_t height = SMT_DEPTH - depth - 1;
+            auto sibling = node ? (bits[depth] ? node->left : node->right) : nullptr;
+            pr.siblings[height] = uint256_from_field(value(sibling, height));
+            node = node ? (bits[depth] ? node->right : node->left) : nullptr;
         }
+        pr.found = node && node->hash == FieldT::one();
         pr.root = root_uint256();
         return pr;
     }
@@ -138,29 +114,33 @@ public:
     }
 
 private:
+    struct Node;
+    using NodePtr = std::shared_ptr<const Node>;
+    struct Node {
+        FieldT hash;
+        NodePtr left, right;
+        Node(const FieldT& h, NodePtr l = nullptr, NodePtr r = nullptr)
+            : hash(h), left(std::move(l)), right(std::move(r)) {}
+    };
     std::vector<FieldT> empty_root_;
-    // key: "height:hexprefix"
-    std::map<std::string, FieldT> nodes_;
+    NodePtr root_;
 
-    static std::vector<bool> prefix(const std::vector<bool>& bits, size_t len) {
-        return std::vector<bool>(bits.begin(), bits.begin() + len);
+    FieldT value(const NodePtr& node, size_t height) const {
+        return node ? node->hash : empty_root_[height];
     }
 
-    static std::string node_key(size_t height, const std::vector<bool>& pfx) {
-        std::string s = std::to_string(height);
-        s.push_back(':');
-        for (bool b : pfx) s.push_back(b ? '1' : '0');
-        return s;
-    }
-
-    void set_node(size_t height, const std::vector<bool>& pfx, const FieldT& v) {
-        nodes_[node_key(height, pfx)] = v;
-    }
-
-    FieldT get_node(size_t height, const std::vector<bool>& pfx) const {
-        auto it = nodes_.find(node_key(height, pfx));
-        if (it != nodes_.end()) return it->second;
-        return empty_root_[height];
+    NodePtr insert_path(const NodePtr& node, const std::vector<bool>& bits, size_t depth) const {
+        if (depth == SMT_DEPTH) {
+            return node ? node : std::make_shared<Node>(FieldT::one());
+        }
+        auto left = node ? node->left : nullptr;
+        auto right = node ? node->right : nullptr;
+        if (bits[depth]) right = insert_path(right, bits, depth + 1);
+        else left = insert_path(left, bits, depth + 1);
+        // Insertion is idempotent, including across shared historical snapshots.
+        if (node && left == node->left && right == node->right) return node;
+        const size_t height = SMT_DEPTH - depth - 1;
+        return std::make_shared<Node>(poseidon_hash2(value(left, height), value(right, height)), left, right);
     }
 };
 

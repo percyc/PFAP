@@ -168,7 +168,7 @@ func TestMonitorNodeBatchesCommitEachGroupOnce(t *testing.T) {
 		}
 		seen[e.ID] = true
 	}
-	if commits != 13 || len(seen) != 100 {
+	if commits != (len(nodes)+monitorNodeConcurrency-1)/monitorNodeConcurrency || len(seen) != 100 {
 		t.Fatalf("commits=%d observations=%d", commits, len(seen))
 	}
 }

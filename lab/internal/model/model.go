@@ -162,6 +162,7 @@ type Workload struct {
 	Mode                 string         `json:"mode,omitempty"`
 	NodeIDs              []string       `json:"nodeIds,omitempty"`
 	WarmupSeconds        int            `json:"warmupSeconds,omitempty"`
+	WarmupTimeoutSeconds int            `json:"warmupTimeoutSeconds,omitempty"`
 	Confirmations        int            `json:"confirmations,omitempty"`
 	Phase                string         `json:"phase,omitempty"`
 	MeasurementStartedAt time.Time      `json:"measurementStartedAt,omitempty"`

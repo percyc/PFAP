@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"net/http"
@@ -175,6 +176,7 @@ func (a *API) createRun(w http.ResponseWriter, r *http.Request, input model.Work
 	// Whitelist fields: clients cannot forge phases, timestamps or result counters.
 	v := model.Workload{ID: id("load"), ExperimentID: input.ExperimentID, Name: input.Name, Type: "transfer", Value: input.Value, Strategy: "ready-pool", Mode: input.Mode, NodeIDs: input.NodeIDs, WarmupSeconds: input.WarmupSeconds, DurationSeconds: input.DurationSeconds, Confirmations: input.Confirmations, RatePerSecond: input.RatePerSecond, Status: "queued", Phase: "preparing", CreatedAt: time.Now()}
 	v.ObserverNodeID = input.ObserverNodeID
+	v.WarmupTimeoutSeconds = input.WarmupTimeoutSeconds
 	if input.Type == "mixed" {
 		if input.TransferPercent < 0 || input.TransferPercent > 100 || input.TransferPercent%20 != 0 {
 			fail(w, 400, errors.New("混合实验 Transfer 比例必须为 0、20、40、60、80 或 100"))
@@ -185,6 +187,10 @@ func (a *API) createRun(w http.ResponseWriter, r *http.Request, input model.Work
 	value, ok := amount(v.Value)
 	if !ok || value.Sign() == 0 || value.BitLen() > 64 || (input.Type != "transfer" && input.Type != "mixed") || v.DurationSeconds < 1 || v.DurationSeconds > 604800 || v.WarmupSeconds < 1 || v.WarmupSeconds > 7200 || v.Confirmations < 1 || v.Confirmations > 64 || len(v.NodeIDs) < 2 || len(v.NodeIDs) > 300 || (v.Mode != "saturation" && v.Mode != "rate") || math.IsNaN(v.RatePerSecond) || math.IsInf(v.RatePerSecond, 0) || (v.Mode == "rate" && (v.RatePerSecond < 0.01 || v.RatePerSecond > 100)) {
 		fail(w, 400, errors.New("请检查 Transfer 数值、节点、负载模式、预热时间、测量时间和确认深度"))
+		return
+	}
+	if err := configureWarmupTimeout(&v); err != nil {
+		fail(w, 400, err)
 		return
 	}
 	seen := map[string]bool{}
@@ -247,6 +253,12 @@ func (a *API) createRun(w http.ResponseWriter, r *http.Request, input model.Work
 					}
 				}
 				v.Configuration = map[string]any{"networkId": e.NetworkID, "minerCount": e.MinerCount, "minerMode": e.MinerMode, "artifactSha": e.ArtifactSHA, "recoveryArtifactSha": e.RecoveryArtifactSHA, "nodes": e.Nodes, "servers": hosts, "capturedAt": time.Now(), "scheduler": "oldest-idle-payer/lowest-balance-receiver-v1"}
+				if v.Type == "mixed" {
+					v.Configuration["scheduler"] = "broadcaster-five-slot-quota/oldest-own-admission/largest-balance-payer-v1"
+					v.Configuration["transferPercent"] = v.TransferPercent
+					v.Configuration["publicGasPriceWei"] = "20000000000"
+					v.Configuration["publicGasLimit"] = 21000
+				}
 				s.Workloads = append(s.Workloads, v)
 				return nil
 			}
@@ -321,6 +333,19 @@ func chooseRunPairAt(s model.State, e model.Experiment, w model.Workload, now ti
 // One bounded scheduling step. Wall-clock deadlines are checked inside the
 // durable admission boundary; a delayed ticker cannot submit beyond the window.
 func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, error) {
+	txs, done, err := a.runFlowBatch(id, 1, func() time.Time { return now })
+	if len(txs) == 0 {
+		return nil, done, err
+	}
+	return txs[0], done, err
+}
+
+// Reserve all currently usable accounts in one durable commit. Each selection
+// sees earlier reservations in this batch, preserving per-account exclusivity
+// and broadcaster quotas. No RPC starts until the entire commit succeeds.
+func (a *API) runFlowBatch(id string, limit int, clock func() time.Time) ([]*model.Transaction, bool, error) {
+	now := clock()
+	limit = max(1, min(limit, 300))
 	// Saturation polls are not offered requests. Avoid rewriting the entire
 	// JSON store while every account is occupied; always recheck atomically
 	// before an actual admission. Phase/fault transitions still take the write path.
@@ -360,7 +385,7 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 	if idlePoll {
 		return nil, false, nil
 	}
-	var queued *model.Transaction
+	var queued []*model.Transaction
 	done := false
 	err := a.store.Update(func(s *model.State) error {
 		for wi := range s.Workloads {
@@ -368,89 +393,94 @@ func (a *API) runFlowTick(id string, now time.Time) (*model.Transaction, bool, e
 			if w.ID != id {
 				continue
 			}
-			if w.Status != "running" || w.StopRequested {
-				done = true
-				return nil
-			}
-			var e model.Experiment
-			for _, candidate := range s.Experiments {
-				if candidate.ID == w.ExperimentID {
-					e = candidate
+			for step := 0; step < limit; step++ {
+				// Recheck the actual deadline for every admission in a long batch.
+				now := clock()
+				if w.Status != "running" || w.StopRequested {
+					done = true
+					return nil
 				}
-			}
-			fault := ""
-			recordAdmissionSample(*s, e, w, now)
-			if w.BlockError != "" {
-				fault = w.BlockError
-			}
-			for _, t := range s.Transactions {
-				if t.WorkloadID == id && (t.Status == "unknown" || t.Status == "failed" || t.Status == "timeout" || (t.Status == "settling" && t.Error != "")) {
-					fault = "交易或双方状态核验异常，已停止新增投递"
+				var e model.Experiment
+				for _, candidate := range s.Experiments {
+					if candidate.ID == w.ExperimentID {
+						e = candidate
+					}
 				}
-			}
-			if problems := runProblems(*s, e, *w, false, now); len(problems) > 0 {
-				fault = strings.Join(problems, "；")
-			}
-			if fault != "" {
-				w.InvalidReason = fault
-				w.StopRequested = true
-				w.Status = "draining"
-				w.Phase = "draining"
-				w.SubmissionStoppedAt = now
-				done = true
-				return nil
-			}
-			if w.Phase == "warmup" && now.Sub(w.StartedAt) >= time.Duration(w.WarmupSeconds)*time.Second {
-				participated := map[string]bool{}
+				fault := ""
+				recordAdmissionSample(*s, e, w, now)
+				if w.BlockError != "" {
+					fault = w.BlockError
+				}
 				for _, t := range s.Transactions {
-					if t.WorkloadID == id && t.Status == "confirmed" && !t.ReadyAt.IsZero() && !t.ReadyAt.Before(runBlockWarmupStart(*w)) {
-						participated[t.FromNode] = true
-						participated[t.ToNode] = true
+					if t.WorkloadID == id && (t.Status == "unknown" || t.Status == "failed" || t.Status == "timeout" || (t.Status == "settling" && t.Error != "")) {
+						fault = "交易或双方状态核验异常，已停止新增投递"
 					}
 				}
-				ready := len(w.Blocks) > 1 && runBlockWarmupReady(*w, now)
-				for _, node := range w.NodeIDs {
-					if !participated[node] {
-						ready = false
-					}
+				if problems := runProblems(*s, e, *w, false, now); len(problems) > 0 {
+					fault = strings.Join(problems, "；")
 				}
-				if ready {
-					w.Phase = "measuring"
-					w.MeasurementStartedAt = now
-					w.MeasurementEndsAt = now.Add(time.Duration(w.DurationSeconds) * time.Second)
-				} else if now.Sub(w.StartedAt) > time.Duration(w.WarmupSeconds+1800)*time.Second {
-					w.InvalidReason = "预热超时：不是所有参与账户都完成了安全交易"
+				if fault != "" {
+					w.InvalidReason = fault
+					w.StopRequested = true
 					w.Status = "draining"
 					w.Phase = "draining"
 					w.SubmissionStoppedAt = now
 					done = true
 					return nil
 				}
+				if w.Phase == "warmup" && now.Sub(w.StartedAt) >= time.Duration(w.WarmupSeconds)*time.Second {
+					participated := map[string]bool{}
+					for _, t := range s.Transactions {
+						if t.WorkloadID == id && t.Status == "confirmed" && !t.ReadyAt.IsZero() && !t.ReadyAt.Before(runBlockWarmupStart(*w)) {
+							participated[t.FromNode] = true
+							participated[t.ToNode] = true
+						}
+					}
+					ready := len(w.Blocks) > 1 && runBlockWarmupReady(*w, now) && mixedWarmupReady(s.Transactions, *w, runBlockWarmupStart(*w))
+					for _, node := range w.NodeIDs {
+						if !participated[node] {
+							ready = false
+						}
+					}
+					if ready {
+						w.Phase = "measuring"
+						w.MeasurementStartedAt = now
+						w.MeasurementEndsAt = now.Add(time.Duration(w.DurationSeconds) * time.Second)
+					} else if now.Sub(w.StartedAt) > runWarmupTimeout(*w) {
+						w.InvalidReason = "预热超时：不是所有参与账户都完成了安全交易"
+						w.StopRequested = true
+						w.Status = "draining"
+						w.Phase = "draining"
+						w.SubmissionStoppedAt = now
+						done = true
+						return nil
+					}
+				}
+				if w.Phase == "measuring" && !now.Before(w.MeasurementEndsAt) {
+					w.Status = "draining"
+					w.Phase = "draining"
+					w.SubmissionStoppedAt = w.MeasurementEndsAt
+					done = true
+					return nil
+				}
+				w.Attempted++
+				txType, payer, receiver, ok := chooseRunTask(*s, e, *w, now)
+				if !ok {
+					w.SkippedBusy++
+					return nil
+				}
+				p, _ := amount(payer.ZKBalance)
+				q, _ := amount(receiver.ZKBalance)
+				value, _ := amount(w.Value)
+				tx := model.Transaction{ID: newRunTxID(), WorkloadID: id, Sequence: w.Submitted + 1, ExperimentID: w.ExperimentID, Type: txType, FromNode: payer.ID, ToNode: receiver.ID, Value: w.Value, Status: "queued", RunPhase: w.Phase, SubmittedAt: now}
+				if txType == "transfer" {
+					tx.ExpectedPayerBalance = new(big.Int).Sub(p, value).String()
+					tx.ExpectedReceiverBalance = new(big.Int).Add(q, value).String()
+				}
+				s.Transactions = append(s.Transactions, tx)
+				w.Submitted++
+				queued = append(queued, &tx)
 			}
-			if w.Phase == "measuring" && !now.Before(w.MeasurementEndsAt) {
-				w.Status = "draining"
-				w.Phase = "draining"
-				w.SubmissionStoppedAt = w.MeasurementEndsAt
-				done = true
-				return nil
-			}
-			w.Attempted++
-			txType, payer, receiver, ok := chooseRunTask(*s, e, *w, now)
-			if !ok {
-				w.SkippedBusy++
-				return nil
-			}
-			p, _ := amount(payer.ZKBalance)
-			q, _ := amount(receiver.ZKBalance)
-			value, _ := amount(w.Value)
-			tx := model.Transaction{ID: newRunTxID(), WorkloadID: id, Sequence: w.Submitted + 1, ExperimentID: w.ExperimentID, Type: txType, FromNode: payer.ID, ToNode: receiver.ID, Value: w.Value, Status: "queued", RunPhase: w.Phase, SubmittedAt: now}
-			if txType == "transfer" {
-				tx.ExpectedPayerBalance = new(big.Int).Sub(p, value).String()
-				tx.ExpectedReceiverBalance = new(big.Int).Add(q, value).String()
-			}
-			s.Transactions = append(s.Transactions, tx)
-			w.Submitted++
-			queued = &tx
 			return nil
 		}
 		done = true
@@ -516,22 +546,19 @@ func (a *API) runExperimentFlow(v model.Workload) {
 		next = now.Add(interval)
 		burst := 1
 		if v.Mode == "saturation" {
-			burst = len(v.NodeIDs) / 2
+			burst = len(v.NodeIDs)
 		}
-		for i := 0; i < burst; i++ {
-			tx, done, err := a.runFlowTick(v.ID, time.Now())
-			if err != nil {
-				a.finishWorkload(v.ID, "interrupted", err.Error())
-				return
-			}
-			if done {
-				a.drainWorkload(v, 0)
-				return
-			}
-			if tx == nil {
-				break
-			}
+		txs, done, err := a.runFlowBatch(v.ID, burst, time.Now)
+		if err != nil {
+			a.finishWorkload(v.ID, "interrupted", err.Error())
+			return
+		}
+		for _, tx := range txs {
 			go a.runTransaction(*tx)
+		}
+		if done {
+			a.drainWorkload(v, 0)
+			return
 		}
 	}
 }
@@ -547,6 +574,11 @@ type readinessSample struct {
 	StateBlock      string `json:"stateBlock"`
 	CommitmentReady bool   `json:"commitmentReady"`
 }
+
+// This is an account-safety wait, not a transaction-latency measurement.
+// Keep both reservations while PoW confirmations and state observations catch
+// up; a short block-production gap must not immediately abort the whole run.
+const runReadinessTimeout = 10 * time.Minute
 
 func validRunReadiness(x readinessSample, hash, expected string, confirmations int) bool {
 	b, ok := amount(x.Balance)
@@ -602,13 +634,17 @@ func (a *API) checkRunReadiness(ctx context.Context, txID string) error {
 					n = x
 				}
 			}
-			out, err := a.orch.Attach(ctx, e, n, servers[n.ServerID], expr)
+			probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			out, err := a.orch.Attach(probeCtx, e, n, servers[n.ServerID], expr)
+			cancel()
 			if err != nil {
+				lastErr = fmt.Errorf("%s 核验查询失败：%w", nodeID, err)
 				ready = false
 				break
 			}
 			raw, err := orchestrator.ExtractJSONString(out)
 			if err != nil {
+				lastErr = fmt.Errorf("%s 核验响应无法解析：%w", nodeID, err)
 				ready = false
 				break
 			}
@@ -623,17 +659,19 @@ func (a *API) checkRunReadiness(ctx context.Context, txID string) error {
 				valid = validPublicRunReadiness(sample, tx.Hash, w.Confirmations)
 			}
 			if decodeErr != nil || !valid {
+				lastErr = fmt.Errorf("%s 状态尚未通过核验：head=%d receiptBlock=%d requiredConfirmations=%d receiptStatus=%s canonical=%t balance=%s expected=%s stateBlock=%s commitmentReady=%t decodeError=%v", nodeID, sample.Head, sample.Block, w.Confirmations, sample.Status, sample.Hash != "" && strings.EqualFold(sample.Hash, sample.Canonical), sample.Balance, expected, sample.StateBlock, sample.CommitmentReady, decodeErr)
 				ready = false
 				break
 			}
 			hashes = append(hashes, sample.Hash)
 			if err := a.sampleNode(ctx, e, n, servers[n.ServerID], "run-readiness:"+tx.ID); err != nil {
+				lastErr = fmt.Errorf("%s 核验后的节点采样失败：%w", nodeID, err)
 				ready = false
 				break
 			}
 		}
 		if ready && len(hashes) == len(nodeIDs) && (len(hashes) == 1 || strings.EqualFold(hashes[0], hashes[1])) {
-			return a.store.Update(func(s *model.State) error {
+			return a.store.UpdateCoalesced(func(s *model.State) error {
 				for i := range s.Transactions {
 					t := &s.Transactions[i]
 					if t.ID == txID && t.Status == "settling" {
